@@ -1,229 +1,204 @@
 package com.example.zhishu.worker
 
 import android.content.Context
-import androidx.work.BackoffPolicy
-import androidx.work.Constraints
 import androidx.work.CoroutineWorker
-import androidx.work.ExistingWorkPolicy
-import androidx.work.NetworkType
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.example.zhishu.ZhishuApp
-import com.example.zhishu.ai.ModelError
 import com.example.zhishu.ai.pipeline.ChapterPhase
 import com.example.zhishu.di.AppContainer
-import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
-import com.example.zhishu.domain.model.ModelRole
-import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 
-/** 生成阶段。由 UI 显式指定，不再由项目状态反推（B5） */
-enum class GenerationStage {
-    KNOWLEDGE_MAP,
-    STORY_BIBLE,
-    CHAPTERS,
-    SINGLE_CHAPTER,
-
-    /** 一键开讲：知识地图 → 讲述路线 → 首章，串成一次操作（问题4） */
-    ONE_TAP,
-    ;
-
-    val label: String
-        get() = when (this) {
-            KNOWLEDGE_MAP -> "正在梳理知识主干"
-            STORY_BIBLE -> "正在规划讲述路线"
-            CHAPTERS -> "正在生成章节"
-            SINGLE_CHAPTER -> "正在生成本章"
-            ONE_TAP -> "正在准备"
-        }
-}
-
 /**
- * 批量生成时应当处理哪些章节（B3/B5）。
- * 已发布的跳过；待复核 / 测验待补只在用户显式重试时纳入。
+ * 单一阶段的生成 Worker（第二阶段）。
+ *
+ * 一个实例只负责一件事：一次知识梳理、一次路线规划、或者一章正文。
+ * 批量由入队方展开成链（见 [GenerationEnqueuer]），这里不知道也不关心「下一章是谁」。
+ *
+ * 真正调模型的阶段会 [setForeground]：单章要写正文、过核验、出题三次调用，
+ * 加上退避重试，最坏情况能顶到普通 Worker 的执行窗口边上。
  */
-internal fun selectChaptersToGenerate(
-    plans: List<ChapterPlan>,
-    includeNeedsReview: Boolean,
-): List<ChapterPlan> {
-    val retryable = setOf(ChapterStatus.NEEDS_REVIEW, ChapterStatus.QUIZ_FAILED)
-    return plans
-        .filter { plan ->
-            when {
-                plan.status == ChapterStatus.PUBLISHED -> false
-                plan.status in retryable -> includeNeedsReview
-                else -> true
-            }
-        }
-        .sortedBy { it.order }
-}
-
-/**
- * 该异常是否值得让 WorkManager 重试（B4）。
- * 协程取消不走这里（由调用方直接重抛）；配置类错误与业务前置条件失败不重试。
- */
-internal fun isRetryableFailure(e: Throwable): Boolean = when (e) {
-    is CancellationException -> false
-    is ModelError -> e.retryable
-    is IllegalStateException, is IllegalArgumentException -> false
-    else -> true
-}
-
 class GenerationWorker(
     appContext: Context,
     params: WorkerParameters,
 ) : CoroutineWorker(appContext, params) {
 
-    override suspend fun doWork(): Result {
-        val projectId = inputData.getString(KEY_PROJECT_ID) ?: return Result.failure()
-        val stage = inputData.getString(KEY_STAGE)
+    private val container: AppContainer
+        get() = (applicationContext as ZhishuApp).container
+
+    private val projectId: String get() = inputData.getString(KEY_PROJECT_ID).orEmpty()
+
+    private val stage: GenerationStage?
+        get() = inputData.getString(KEY_STAGE)
             ?.let { name -> GenerationStage.entries.firstOrNull { it.name == name } }
-            ?: return Result.failure(workDataOf(KEY_ERROR to "未指定生成阶段"))
-        val chapterId = inputData.getString(KEY_CHAPTER_ID)
-        val includeNeedsReview = inputData.getBoolean(KEY_INCLUDE_NEEDS_REVIEW, false)
-        val container = (applicationContext as ZhishuApp).container
+
+    /**
+     * 会话级进度基数：本 Worker 之前已经完成了多少个工作单元、整条链一共多少个。
+     * 存在 inputData 里而不是内存计数器，所以进程重启后百分比不会跳回去。
+     */
+    private val unitsBefore: Int get() = inputData.getInt(KEY_UNITS_BEFORE, 0)
+    private val unitsTotal: Int get() = inputData.getInt(KEY_UNITS_TOTAL, 0)
+
+    override suspend fun doWork(): Result {
+        val stage = stage ?: return Result.failure(workDataOf(KEY_ERROR to "未指定生成阶段"))
+        val project = container.projectRepository.get(projectId)
+            ?: return Result.failure(workDataOf(KEY_ERROR to "项目不存在"))
+
+        if (stage == GenerationStage.SUMMARY) return summarize(project.title)
+
+        // 缺配置就直接给出可读原因，不要等模型调用失败后静默结束（问题1）。
+        // 检查的角色按本阶段实际要用的算，不再无条件要求三样齐全。
+        missingRoles(stage)?.let { return Result.failure(workDataOf(KEY_ERROR to it)) }
 
         return try {
-            container.projectRepository.get(projectId)
-                ?: return Result.failure(workDataOf(KEY_ERROR to "项目不存在"))
-            // 缺配置就直接给出可读原因，不要等模型调用失败后静默结束（问题1）
-            checkModelConfigured(container, stage)?.let { missing ->
-                return Result.failure(workDataOf(KEY_ERROR to missing))
-            }
+            report(stage.label, unitsBefore, project.title)
             when (stage) {
                 GenerationStage.KNOWLEDGE_MAP -> {
-                    // 知识梳理是一次模型调用，没有可细分的子步骤
-                    val tracker = ProgressTracker(total = 1)
-                    report(stage.label, tracker)
                     container.pipeline.generateKnowledgeMap(projectId).getOrThrow()
-                    tracker.complete()
-                    report(stage.label, tracker)
+                    report(stage.label, unitsBefore + 1, project.title)
                 }
 
                 GenerationStage.STORY_BIBLE -> {
-                    val tracker = ProgressTracker(total = 1)
-                    report(stage.label, tracker)
                     container.pipeline.generateStoryBible(projectId).getOrThrow()
-                    tracker.complete()
-                    report(stage.label, tracker)
+                    report(stage.label, unitsBefore + 1, project.title)
                 }
 
-                GenerationStage.SINGLE_CHAPTER -> {
-                    val id = chapterId
-                        ?: return Result.failure(workDataOf(KEY_ERROR to "未指定章节"))
-                    val tracker = ProgressTracker(total = ChapterPhase.UNITS_PER_CHAPTER)
-                    report(stage.label, tracker)
-                    container.pipeline.generateChapter(projectId, id) { phase ->
-                        report(phase.label, tracker)
-                        tracker.complete()
-                    }.getOrThrow()
-                }
+                GenerationStage.SINGLE_CHAPTER, GenerationStage.FIRST_CHAPTER ->
+                    runChapter(stage, project.title)
 
-                GenerationStage.CHAPTERS -> generateAllChapters(container, projectId, includeNeedsReview)
-
-                GenerationStage.ONE_TAP -> runOneTap(container, projectId)
+                GenerationStage.SUMMARY -> Unit
             }
             Result.success()
         } catch (e: CancellationException) {
-            // 协程取消必须原样抛出，不能当成业务失败重试（B4）
+            // 协程取消必须原样抛出：包装成业务失败会让 WorkManager 以为该重试，
+            // 用户按了取消反而又开始扣费（B4）
+            GenerationNotifier.clearProgress(applicationContext)
             throw e
         } catch (e: Exception) {
-            if (isRetryableFailure(e) && runAttemptCount < MAX_RETRY_ATTEMPTS) {
-                Result.retry()
-            } else {
-                // 达到重试上限也要给出可读原因，避免「一直转圈还在扣费」（问题1）
-                val reason = e.message ?: "生成失败"
-                val detail = if (isRetryableFailure(e) && runAttemptCount >= MAX_RETRY_ATTEMPTS) {
-                    "$reason（已重试 $runAttemptCount 次仍失败，已停止以避免继续消耗额度）"
-                } else {
-                    reason
-                }
-                Result.failure(workDataOf(KEY_ERROR to detail))
-            }
+            failure(e, project.title)
         }
     }
 
+    /** 生成一章。FIRST_CHAPTER 现查「第一个还没写的章节」，不依赖入队时的快照。 */
+    private suspend fun runChapter(stage: GenerationStage, projectTitle: String) {
+        val chapterId = when (stage) {
+            GenerationStage.FIRST_CHAPTER -> container.chapterRepository.getPlans(projectId)
+                .sortedBy { it.order }
+                .firstOrNull { !it.status.isReadable }
+                ?.id
+                // 章节都写完了不算失败，一键开讲到这里就算达成目的
+                ?: return
+            else -> inputData.getString(KEY_CHAPTER_ID)
+                ?: throw IllegalStateException("未指定章节")
+        }
+        val label = inputData.getString(KEY_CHAPTER_LABEL).orEmpty()
+        var done = 0
+        container.pipeline.generateChapter(projectId, chapterId) { phase ->
+            val text = if (label.isBlank()) phase.label else "$label · ${phase.label}"
+            report(text, unitsBefore + done, projectTitle)
+            done += 1
+        }.getOrThrow()
+        report(ChapterPhase.QUIZ.label, unitsBefore + ChapterPhase.UNITS_PER_CHAPTER, projectTitle)
+    }
+
     /**
-     * 把当前阶段与百分比写进 progress，UI 才能显示确定进度条（问题1、问题2）。
+     * 链尾总结：只发一条会话级通知，不调模型。
      *
-     * 百分比按「已完成的工作单元 / 总单元」算，单元边界都是真实事件，
-     * 所以不会出现卡在某个数字上假装还在动的情况。
+     * 走到这里说明前面每一环都成功了——链中任何一环失败，WorkManager 都不会执行到链尾，
+     * 那条「部分完成 / 失败」的通知由失败的那个 Worker 自己发。
      */
-    private suspend fun report(text: String, tracker: ProgressTracker? = null) {
+    private suspend fun summarize(projectTitle: String): Result {
+        val plans = container.chapterRepository.getPlans(projectId)
+        val readable = plans.count { it.status.isReadable }
+        val missingQuiz = plans.count { it.quizState == com.example.zhishu.domain.model.QuizState.FAILED }
+        val detail = buildString {
+            append("已完成 $readable/${plans.size} 章，可以开始读了。")
+            if (missingQuiz > 0) append("其中 $missingQuiz 章的自测题没生成，正文不受影响。")
+        }
+        GenerationNotifier.notifyOutcome(
+            context = applicationContext,
+            projectId = projectId,
+            projectTitle = projectTitle,
+            outcome = GenerationOutcome.COMPLETED,
+            detail = detail,
+        )
+        GenerationNotifier.clearProgress(applicationContext)
+        return Result.success(workDataOf(KEY_OUTCOME to GenerationOutcome.COMPLETED.name))
+    }
+
+    /**
+     * 失败收尾：先判断还要不要重试，确定不再试了才发结果通知。
+     * 退避重试期间不发通知，否则用户会为同一次失败收到好几条。
+     */
+    private suspend fun failure(e: Exception, projectTitle: String): Result {
+        if (isRetryableFailure(e) && runAttemptCount < MAX_RETRY_ATTEMPTS) return Result.retry()
+
+        val reason = e.message ?: "生成失败"
+        val detail = if (isRetryableFailure(e)) {
+            "$reason（已重试 $runAttemptCount 次仍失败，已停止以避免继续消耗额度）"
+        } else {
+            reason
+        }
+        // 已经有章节可读就算「部分完成」，不要把一次尾部失败说成整批失败
+        val readable = container.chapterRepository.getPlans(projectId).count { it.status.isReadable }
+        val outcome = if (readable > 0) GenerationOutcome.PARTIAL else GenerationOutcome.FAILED
+        GenerationNotifier.notifyOutcome(
+            context = applicationContext,
+            projectId = projectId,
+            projectTitle = projectTitle,
+            outcome = outcome,
+            // 通知里只放一句人话，不放完整错误响应
+            detail = if (outcome == GenerationOutcome.PARTIAL) {
+                "已完成 $readable 章可以先读。剩下的没做完：$reason"
+            } else {
+                reason
+            },
+        )
+        GenerationNotifier.clearProgress(applicationContext)
+        return Result.failure(
+            workDataOf(
+                KEY_ERROR to detail,
+                KEY_OUTCOME to outcome.name,
+                // 永久性配置错误在这里标出来，链上后面几章不必再白调一次
+                KEY_PERMANENT to isPermanentConfigFailure(e),
+            ),
+        )
+    }
+
+    /**
+     * 上报阶段与进度，同时刷新前台通知。
+     *
+     * 刷新只发生在阶段边界（正文写完、核验过、题出好），不是每个正文块一次。
+     */
+    private suspend fun report(text: String, completed: Int, projectTitle: String) {
         runCatching {
             setProgress(
                 workDataOf(
                     KEY_PROGRESS to text,
-                    KEY_PROGRESS_COMPLETED to (tracker?.completed ?: 0),
-                    KEY_PROGRESS_TOTAL to (tracker?.total ?: 0),
+                    KEY_PROGRESS_COMPLETED to completed,
+                    KEY_PROGRESS_TOTAL to unitsTotal,
+                    KEY_SESSION to inputData.getString(KEY_SESSION),
+                ),
+            )
+        }
+        // 前台化失败（缺通知权限、系统限制）不能影响生成本身
+        runCatching {
+            setForeground(
+                GenerationNotifier.progressForegroundInfo(
+                    context = applicationContext,
+                    projectId = projectId,
+                    projectTitle = projectTitle,
+                    stageText = text,
+                    completed = completed,
+                    total = unitsTotal,
                 ),
             )
         }
     }
 
-    /** 可变的工作单元计数器。总量在任务开始时就能确定，因此百分比是真实的而非估算。 */
-    private class ProgressTracker(val total: Int) {
-        var completed: Int = 0
-            private set
-
-        fun complete() {
-            if (completed < total) completed += 1
-        }
-    }
-
-    /**
-     * 一键开讲（问题4）：把三步串成一次操作，中途按需跳过已完成的阶段。
-     * 任一阶段失败就停下并把原因抛出，由 UI 展示。
-     *
-     * 进度总量先按「需要做的阶段」算出来，所以百分比从一开始就是准的（问题2）。
-     */
-    private suspend fun runOneTap(container: AppContainer, projectId: String) {
-        val needsMap = container.knowledgeRepository.getByProject(projectId).isEmpty()
-        val needsBible = container.chapterRepository.getPlans(projectId).isEmpty()
-        // 知识梳理、路线规划各算 1 个单元；首章按子步骤算 3 个
-        val total = (if (needsMap) 1 else 0) +
-            (if (needsBible) 1 else 0) +
-            ChapterPhase.UNITS_PER_CHAPTER
-        val tracker = ProgressTracker(total = total)
-
-        if (needsMap) {
-            report(GenerationStage.KNOWLEDGE_MAP.label, tracker)
-            container.pipeline.generateKnowledgeMap(projectId).getOrThrow()
-            tracker.complete()
-        }
-        if (needsBible) {
-            report(GenerationStage.STORY_BIBLE.label, tracker)
-            container.pipeline.generateStoryBible(projectId).getOrThrow()
-            tracker.complete()
-        }
-        val first = container.chapterRepository.getPlans(projectId)
-            .sortedBy { it.order }
-            .firstOrNull { it.status != ChapterStatus.PUBLISHED }
-            ?: return
-        container.pipeline.generateChapter(projectId, first.id) { phase ->
-            report("第 ${first.order} 章 · ${phase.label}", tracker)
-            tracker.complete()
-        }.getOrThrow()
-    }
-
-    /**
-     * 入队后最常见的「点了没反应」其实是没配模型：
-     * 模型调用返回 Auth 错误、Worker 判定不可重试、静默结束，UI 什么也不显示。
-     * 这里提前检查并给出明确文案。
-     */
-    private suspend fun checkModelConfigured(
-        container: AppContainer,
-        stage: GenerationStage,
-    ): String? {
-        val roles = when (stage) {
-            GenerationStage.KNOWLEDGE_MAP -> listOf(ModelRole.FAST)
-            GenerationStage.STORY_BIBLE -> listOf(ModelRole.STORY)
-            else -> listOf(ModelRole.FAST, ModelRole.STORY, ModelRole.VERIFY)
-        }
-        val missing = roles.filter { role ->
+    private suspend fun missingRoles(stage: GenerationStage): String? {
+        val missing = stage.requiredRoles.filter { role ->
             val config = container.settingsRepository.getConfig(role)
             config == null || config.baseUrl.isBlank() || config.modelName.isBlank()
         }
@@ -232,94 +207,37 @@ class GenerationWorker(
             "请到「我的」页填写接口地址、模型名和 API Key。"
     }
 
-    /**
-     * 批量生成：单章失败不终止整批，最后按是否全部失败决定 Worker 结果。
-     * NEEDS_REVIEW / QUIZ_FAILED 只有在用户显式重试时才纳入（B3）。
-     */
-    private suspend fun generateAllChapters(
-        container: AppContainer,
-        projectId: String,
-        includeNeedsReview: Boolean,
-    ) {
-        val plans = selectChaptersToGenerate(
-            plans = container.chapterRepository.getPlans(projectId),
-            includeNeedsReview = includeNeedsReview,
-        )
-        if (plans.isEmpty()) {
-            container.pipeline.refreshProjectStatus(projectId)
-            return
-        }
-
-        var lastError: Throwable? = null
-        var succeeded = 0
-        // 总量 = 章数 × 每章子步骤数，进度条按真实完成的子步骤推进（问题2）
-        val tracker = ProgressTracker(total = plans.size * ChapterPhase.UNITS_PER_CHAPTER)
-        for ((index, plan) in plans.withIndex()) {
-            val prefix = "第 ${plan.order} 章（${index + 1}/${plans.size}）"
-            report(prefix, tracker)
-            val result = container.pipeline.generateChapter(projectId, plan.id) { phase ->
-                report("$prefix · ${phase.label}", tracker)
-                tracker.complete()
-            }
-            if (result.isSuccess) {
-                succeeded += 1
-            } else {
-                val error = result.exceptionOrNull()
-                if (error is CancellationException) throw error
-                lastError = error
-                // 认证、配置类错误继续跑下去毫无意义，直接中断
-                if (error is ModelError && !error.retryable && error !is ModelError.Invalid) break
-            }
-        }
-        container.pipeline.refreshProjectStatus(projectId)
-        if (succeeded == 0 && lastError != null) throw lastError
-    }
-
     companion object {
         const val KEY_PROJECT_ID = "projectId"
         const val KEY_STAGE = "stage"
         const val KEY_CHAPTER_ID = "chapterId"
+        const val KEY_CHAPTER_LABEL = "chapterLabel"
         const val KEY_INCLUDE_NEEDS_REVIEW = "includeNeedsReview"
         const val KEY_ERROR = "error"
+        const val KEY_OUTCOME = "outcome"
+        const val KEY_PERMANENT = "permanent"
+
         /** WorkManager 层的重试上限，防止可重试错误无限退避、持续消耗 API 额度 */
         const val MAX_RETRY_ATTEMPTS = 3
-        /** Worker 通过 setProgress 上报当前阶段文案，UI 订阅 WorkInfo 展示（问题1） */
+
         const val KEY_PROGRESS = "progress"
-        /** 已完成 / 总工作单元数，UI 据此显示百分比与确定进度条（问题2） */
         const val KEY_PROGRESS_COMPLETED = "progressCompleted"
         const val KEY_PROGRESS_TOTAL = "progressTotal"
+
+        /** 会话标识。UI 靠它把当前会话与上一次失败的 WorkInfo 分开（第二阶段） */
+        const val KEY_SESSION = "sessionId"
+        const val KEY_UNITS_BEFORE = "unitsBefore"
+        const val KEY_UNITS_TOTAL = "unitsTotal"
+
         const val UNIQUE_WORK = "generation"
 
+        /** 项目级唯一工作名：不同项目各自生成，不用全局锁 */
         fun uniqueWorkName(projectId: String): String = "$UNIQUE_WORK-$projectId"
 
-        fun enqueue(
-            context: Context,
-            projectId: String,
-            stage: GenerationStage,
-            chapterId: String? = null,
-            includeNeedsReview: Boolean = false,
-        ) {
-            val data = workDataOf(
-                KEY_PROJECT_ID to projectId,
-                KEY_STAGE to stage.name,
-                KEY_CHAPTER_ID to chapterId,
-                KEY_INCLUDE_NEEDS_REVIEW to includeNeedsReview,
-            )
-            val request = OneTimeWorkRequestBuilder<GenerationWorker>()
-                .setInputData(data)
-                .setConstraints(
-                    Constraints.Builder()
-                        .setRequiredNetworkType(NetworkType.CONNECTED)
-                        .build(),
-                )
-                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                .build()
-            WorkManager.getInstance(context).enqueueUniqueWork(
-                uniqueWorkName(projectId),
-                // 用 APPEND_OR_REPLACE 保证连续点击不会互相取消已排队的阶段
-                ExistingWorkPolicy.APPEND_OR_REPLACE,
-                request,
-            )
-        }
+        /** 会话 tag，形如 `gen-session:<uuid>`，同一次入队的所有 WorkRequest 共用 */
+        fun sessionTag(sessionId: String): String = "gen-session:$sessionId"
+
+        internal fun ChapterStatus.isInFlight(): Boolean =
+            this == ChapterStatus.RUNNING || this == ChapterStatus.VERIFYING
     }
 }

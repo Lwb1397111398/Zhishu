@@ -20,6 +20,7 @@ import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.domain.model.ProjectStatus
 import com.example.zhishu.domain.model.Quiz
+import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.ReviewItem
 import com.example.zhishu.domain.model.ReviewStatus
 import com.example.zhishu.domain.model.SourceChunk
@@ -32,6 +33,9 @@ import com.example.zhishu.domain.repository.ReviewRepository
 import com.example.zhishu.domain.repository.SourceRepository
 import com.example.zhishu.domain.repository.StoryBibleRepository
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 
 class PipelineService(
     private val router: ModelRouter,
@@ -226,6 +230,34 @@ class PipelineService(
     ): Result<Unit> {
         val plan = chapterRepository.getPlan(planId)
             ?: return Result.failure(IllegalStateException("章节不存在"))
+        // 取消收尾要知道「进来之前这一章是什么状态、走到哪一步了」（第二阶段）
+        val progress = ChapterAttempt(originalStatus = plan.status)
+        return try {
+            runChapter(projectId, planId, plan, progress, onPhase)
+        } catch (e: CancellationException) {
+            // 取消的收尾必须在不可取消的上下文里做，否则这几条写库自己也会被取消，
+            // 章节就永久卡在 RUNNING / VERIFYING
+            withContext(NonCancellable) { finalizeCancelledChapter(projectId, planId, progress) }
+            throw e
+        }
+    }
+
+    /** 单章生成走到哪一步了。取消与失败收尾都靠它判断该恢复成什么状态。 */
+    private class ChapterAttempt(val originalStatus: ChapterStatus) {
+        /** 新正文块是否已经落库（落库即意味着旧正文已被覆盖） */
+        var bodyWritten: Boolean = false
+
+        /** 正文是否已经发布——发布之后取消就不该再动它了 */
+        var published: Boolean = false
+    }
+
+    private suspend fun runChapter(
+        projectId: String,
+        planId: String,
+        plan: ChapterPlan,
+        progress: ChapterAttempt,
+        onPhase: ProgressReporter,
+    ): Result<Unit> {
         val project = projectRepository.get(projectId)
             ?: return Result.failure(IllegalStateException("项目不存在"))
 
@@ -308,9 +340,12 @@ class PipelineService(
                 sourceRefs = block.sourceRefs.filter { it in validChunkIds }.distinct(),
             )
         }
-        // 重生成时先清掉旧正文，避免同一章正文叠加
+        // 重生成时先清掉旧正文，避免同一章正文叠加。
+        // 顺序很重要：清除发生在新正文已拿到并校验通过之后，
+        // 所以模型调用失败不会让一章已发布的正文凭空消失。
         chapterRepository.clearBlocksForChapter(planId)
         chapterRepository.upsertBlocks(blocks)
+        progress.bodyWritten = true
         chapterRepository.updateStatus(planId, ChapterStatus.VERIFYING)
         onPhase(ChapterPhase.VERIFY)
 
@@ -328,18 +363,11 @@ class PipelineService(
             return Result.failure(IllegalStateException("章节存在 ${verified.issues.size} 个待处理问题"))
         }
 
-        // 正文通过核验，先写草稿态，再确认测验（N2）
-        chapterRepository.updateStatus(planId, ChapterStatus.DRAFT)
-        onPhase(ChapterPhase.QUIZ)
-
-        val quizResult = generateQuiz(projectId, plan, nodes, blocks)
-        if (quizResult.isFailure) {
-            val message = quizResult.exceptionOrNull()?.message ?: "测验生成失败"
-            chapterRepository.updateStatus(planId, ChapterStatus.QUIZ_FAILED, "正文已通过核验，但测验未生成：$message")
-            return Result.failure(quizResult.exceptionOrNull() ?: IllegalStateException(message))
-        }
-
-        // 待核实清单合并模型自报与核验发现，展示给用户去核对权威出处（问题3）
+        // 正文过了核验 —— 到这里这一章就算写成了，先发布再说（第二阶段）。
+        //
+        // 原来的顺序是「核验通过 → 出题 → 出题成功才发布」，出题一失败，
+        // 正文明明写好、核验也过了，章节却停在 QUIZ_FAILED 打不开。
+        // 故事是主流程，测验是可选辅助，两件事不该绑在一个状态上。
         val unverified = (output.unverifiedClaims + verified.unverifiedClaims)
             .map { it.trim() }
             .filter { it.isNotEmpty() }
@@ -354,13 +382,64 @@ class PipelineService(
             unverifiedClaims = unverified,
             note = if (unverified.isEmpty()) "" else "有 ${unverified.size} 处内容建议你核对权威出处",
         )
-        // 推进滚动记忆：runningState 被改写而不是追加，因此长度不随章数增长（问题5）
+        progress.published = true
+        // 推进滚动记忆：runningState 被改写而不是追加，因此长度不随章数增长（问题5）。
+        // 这三步都只依赖「正文通过核验」，与出题成败无关——否则出题失败会让
+        // 下一章续写不上、知识点跳不到正文。
         advanceMemory(bible, output)
-        // 章节发布后回写节点出现章节，并建立首次复习计划（B16/B2）
         writeBackNodeChapters(projectId, planId, blocks)
         scheduleReviews(projectId, blocks)
         refreshProjectStatus(projectId)
+
+        // 自测题是可选产物：出题失败只记在 quizState 上，正文照样能读、下一章照样能生成
+        onPhase(ChapterPhase.QUIZ)
+        val quizResult = generateQuiz(projectId, plan, nodes, blocks)
+        if (quizResult.isSuccess) {
+            chapterRepository.updateQuizState(planId, QuizState.READY)
+        } else {
+            val message = quizResult.exceptionOrNull()?.message ?: "测验生成失败"
+            chapterRepository.updateQuizState(planId, QuizState.FAILED, message)
+        }
         return Result.success(Unit)
+    }
+
+    /**
+     * 取消发生后把这一章收拾干净（第二阶段）。
+     *
+     * 三种情形分别处理，都用条件更新，避免踩坏别的东西：
+     * 用户完全可能在取消动作落地前就重排了一次生成。
+     */
+    private suspend fun finalizeCancelledChapter(
+        projectId: String,
+        planId: String,
+        progress: ChapterAttempt,
+    ) {
+        // 已经发布的不动。正文可读就是可读，取消后面的步骤不该把它收回去。
+        if (progress.published) return
+
+        val note = when {
+            // 正文写进去了但没过核验。注意此时如果原来是已发布章节，
+            // 旧正文已经被新正文替换掉了——这一点必须如实说明，不能假装没发生。
+            progress.bodyWritten && progress.originalStatus == ChapterStatus.PUBLISHED ->
+                "生成已取消。原来的正文已被新生成的正文替换，但新正文尚未完成核验。"
+            progress.bodyWritten -> "生成已取消，正文尚未完成核验。"
+            else -> "生成已取消，可以重新生成。"
+        }
+        val target = when {
+            progress.bodyWritten -> ChapterStatus.NEEDS_REVIEW
+            // 正文一个字都没写进来，原状态是什么就还回什么
+            progress.originalStatus == ChapterStatus.PUBLISHED -> ChapterStatus.PUBLISHED
+            else -> ChapterStatus.QUEUED
+        }
+        chapterRepository.updateStatusIfIn(
+            id = planId,
+            status = target,
+            note = if (target == ChapterStatus.PUBLISHED) "" else note,
+            // 只收拾还停在生成态的章节
+            onlyIf = IN_FLIGHT_STATUSES,
+        )
+        // 项目状态也别卡在 GENERATING
+        refreshProjectStatus(projectId)
     }
 
     /**
@@ -484,11 +563,43 @@ class PipelineService(
         return Result.success(Unit)
     }
 
+    /**
+     * 只重新出题，不碰正文（第二阶段）。
+     *
+     * 「重新生成自测」按钮走这条路：正文已经发布，没有任何理由为了补几道题
+     * 再调一次故事模型重写一遍正文——那既费钱又可能把读过的内容换掉。
+     */
+    suspend fun regenerateQuiz(projectId: String, planId: String): Result<Unit> {
+        val plan = chapterRepository.getPlan(planId)
+            ?: return Result.failure(IllegalStateException("章节不存在"))
+        val blocks = chapterRepository.getBlocks(planId)
+        if (blocks.isEmpty()) {
+            return Result.failure(IllegalStateException("本章还没有正文，先生成正文再出题"))
+        }
+        val allNodes = knowledgeRepository.getByProject(projectId)
+        val nodeIds = (blocks.flatMap { it.knowledgeNodeIds } + plan.nodeIds).distinct()
+        val nodes = nodeIds.mapNotNull { id -> allNodes.firstOrNull { it.id == id } }
+
+        val result = generateQuiz(projectId, plan, nodes, blocks)
+        if (result.isSuccess) {
+            chapterRepository.updateQuizState(planId, QuizState.READY)
+        } else {
+            chapterRepository.updateQuizState(
+                planId,
+                QuizState.FAILED,
+                result.exceptionOrNull()?.message ?: "测验生成失败",
+            )
+        }
+        return result
+    }
+
     suspend fun refreshProjectStatus(projectId: String) {
         val project = projectRepository.get(projectId) ?: return
         val plans = chapterRepository.getPlans(projectId)
         if (plans.isEmpty()) return
-        val allPublished = plans.all { it.status == ChapterStatus.PUBLISHED }
+        // 用 isReadable 而不是 == PUBLISHED：旧库里的 QUIZ_FAILED 正文其实是可读的，
+        // 不该因为缺几道自测题就让整个项目永远显示「生成中」
+        val allPublished = plans.all { it.status.isReadable }
         val target = if (allPublished) ProjectStatus.READY else ProjectStatus.GENERATING
         if (project.status != target) {
             projectRepository.update(project.copy(status = target, updatedAt = clock()))
@@ -630,6 +741,13 @@ class PipelineService(
         }
 
     private companion object {
+        /** 生成中的状态。取消收尾只在章节仍停在这些状态时才动它。 */
+        val IN_FLIGHT_STATUSES = listOf(
+            ChapterStatus.RUNNING,
+            ChapterStatus.VERIFYING,
+            ChapterStatus.DRAFT,
+        )
+
         const val PROMPT_KNOWLEDGE_MAP = "knowledge_map"
         const val PROMPT_KNOWLEDGE_MAP_MODEL = "knowledge_map_model"
         const val PROMPT_STORY_BIBLE = "story_bible"

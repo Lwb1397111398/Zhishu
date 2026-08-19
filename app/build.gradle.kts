@@ -96,6 +96,8 @@ dependencies {
     testImplementation(libs.mockwebserver)
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.core)
+    // 真实 WorkManager 调度行为测试（第二阶段的关键风险就在调度本身）
+    testImplementation(libs.androidx.work.testing)
     // Compose UI 测试跑在 Robolectric 下，用于验证答题状态刷新（N1）
     testImplementation(libs.androidx.ui.test.junit4)
     // ui-test 的传递依赖版本本地缓存中不存在，提升到已缓存版本

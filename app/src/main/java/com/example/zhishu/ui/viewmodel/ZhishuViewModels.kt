@@ -31,7 +31,8 @@ import com.example.zhishu.domain.model.StoryBible
 import com.example.zhishu.search.ParseResult
 import com.example.zhishu.search.SearchHit
 import com.example.zhishu.search.SourceInput
-import com.example.zhishu.worker.GenerationStage
+import com.example.zhishu.worker.EnqueueResult
+import com.example.zhishu.worker.GenerationEnqueuer
 import com.example.zhishu.worker.GenerationWorker
 import java.util.UUID
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -426,20 +427,43 @@ class ProjectDetailViewModel(
     }
 
     fun enqueueKnowledgeMap() {
-        enqueue(GenerationStage.KNOWLEDGE_MAP, message = "已开始梳理知识主干（需要网络）")
+        launchEnqueue("已开始梳理知识主干（需要网络）") {
+            GenerationEnqueuer.knowledgeMap(getApplication(), projectId)
+        }
     }
 
     fun enqueueStoryBible() {
-        enqueue(GenerationStage.STORY_BIBLE, message = "已开始规划讲述路线（需要网络）")
+        launchEnqueue("已开始规划讲述路线（需要网络）") {
+            GenerationEnqueuer.storyBible(getApplication(), projectId)
+        }
     }
 
     fun enqueueChapters() {
-        enqueue(GenerationStage.CHAPTERS, message = "已开始生成未完成的章节（需要网络）")
+        launchEnqueue("已开始生成未完成的章节（需要网络）") {
+            GenerationEnqueuer.chapters(
+                context = getApplication(),
+                projectId = projectId,
+                plans = container.chapterRepository.getPlans(projectId),
+            )
+        }
     }
 
     /** 一键开讲：知识地图 → 讲述路线 → 首章，一次点完（问题4） */
     fun enqueueOneTap() {
-        enqueue(GenerationStage.ONE_TAP, message = "已开始，将依次完成知识梳理、路线规划和第一章")
+        launchEnqueue("已开始，将依次完成知识梳理、路线规划和第一章") {
+            GenerationEnqueuer.oneTap(
+                context = getApplication(),
+                projectId = projectId,
+                needsMap = container.knowledgeRepository.getByProject(projectId).isEmpty(),
+                needsBible = container.chapterRepository.getPlans(projectId).isEmpty(),
+            )
+        }
+    }
+
+    /** 取消本项目的整条生成链，包括还没轮到的章节（第二阶段） */
+    fun cancelGeneration() {
+        GenerationEnqueuer.cancel(getApplication(), projectId)
+        _message.value = "已取消生成。已经写好的章节不受影响。"
     }
 
     /** 切换知识来源模式（问题3）。切换后既有知识地图与章节都失效，需重新生成。 */
@@ -469,33 +493,64 @@ class ProjectDetailViewModel(
 
     /** 单章生成 / 重试，明确指定阶段与章节（B5/B3） */
     fun enqueueChapter(planId: String) {
-        GenerationWorker.enqueue(
-            context = getApplication(),
-            projectId = projectId,
-            stage = GenerationStage.SINGLE_CHAPTER,
-            chapterId = planId,
-        )
-        _message.value = "已开始生成该章节（需要网络）"
+        launchEnqueue("已开始生成该章节（需要网络）") {
+            GenerationEnqueuer.singleChapter(
+                context = getApplication(),
+                projectId = projectId,
+                chapterId = planId,
+                chapterLabel = container.chapterRepository.getPlan(planId)
+                    ?.let { "第 ${it.order} 章" }
+                    .orEmpty(),
+            )
+        }
     }
 
     /** 重新核验并重生成待复核章节（B3） */
     fun retryNeedsReview() {
-        GenerationWorker.enqueue(
-            context = getApplication(),
-            projectId = projectId,
-            stage = GenerationStage.CHAPTERS,
-            includeNeedsReview = true,
-        )
-        _message.value = "已开始重新生成待复核章节"
+        launchEnqueue("已开始重新生成待复核章节") {
+            GenerationEnqueuer.chapters(
+                context = getApplication(),
+                projectId = projectId,
+                plans = container.chapterRepository.getPlans(projectId),
+                includeNeedsReview = true,
+            )
+        }
     }
 
-    private fun enqueue(stage: GenerationStage, message: String) {
-        GenerationWorker.enqueue(
-            context = getApplication(),
-            projectId = projectId,
-            stage = stage,
-        )
-        _message.value = message
+    /**
+     * 只重新出题，不重写正文（第二阶段）。
+     *
+     * 走同步调用而不是 Worker：出题是一次模型调用，用户是在章节卡片上主动点的，
+     * 没必要为它排一条链——更重要的是它绝不会触发正文重生成。
+     */
+    fun regenerateQuiz(planId: String) {
+        viewModelScope.launch {
+            _message.value = "正在重新生成自测题…"
+            val result = container.pipeline.regenerateQuiz(projectId, planId)
+            _message.value = if (result.isSuccess) {
+                "自测题已生成"
+            } else {
+                "自测题仍未生成：${result.exceptionOrNull()?.message ?: "未知原因"}。正文不受影响。"
+            }
+        }
+    }
+
+    /**
+     * 入队并把结果翻译成一句话。
+     *
+     * 「已经在生成了」必须如实说出来——用户连点两下时若还提示「已开始生成」，
+     * 他会以为排了两个任务、正在双倍扣费。
+     */
+    private fun launchEnqueue(startedMessage: String, block: suspend () -> EnqueueResult) {
+        viewModelScope.launch {
+            _message.value = when (val result = runCatching { block() }.getOrNull()) {
+                is EnqueueResult.Started -> startedMessage
+                EnqueueResult.AlreadyRunning ->
+                    "这个项目已经在生成了，没有重复排队，也不会重复消耗额度。"
+                is EnqueueResult.Nothing -> result.reason
+                null -> "排队失败，请重试"
+            }
+        }
     }
 
     fun deleteProject() {

@@ -198,6 +198,7 @@ fun ProjectDetailScreen(
                 state = generation,
                 onRetry = { vm.enqueueOneTap() },
                 onOpenSettings = onOpenSettings,
+                onCancel = { vm.cancelGeneration() },
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
             )
             Box(Modifier.weight(1f)) {

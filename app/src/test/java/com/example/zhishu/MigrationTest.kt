@@ -47,11 +47,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_1_2,
                 AppDatabase.MIGRATION_2_3,
                 AppDatabase.MIGRATION_3_4,
+                AppDatabase.MIGRATION_4_5,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(4, db.openHelper.readableDatabase.version)
+            assertEquals(5, db.openHelper.readableDatabase.version)
 
             // 旧数据保留
             assertEquals("民法基础", db.projectDao().getById("p-1")?.title)
@@ -95,11 +96,15 @@ class MigrationTest {
         createV2Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4)
+            .addMigrations(
+                AppDatabase.MIGRATION_2_3,
+                AppDatabase.MIGRATION_3_4,
+                AppDatabase.MIGRATION_4_5,
+            )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(4, db.openHelper.readableDatabase.version)
+            assertEquals(5, db.openHelper.readableDatabase.version)
             // 旧项目仍在，新列有默认值
             val project = db.projectDao().getById("p-1")
             assertEquals("民法基础", project?.title)
@@ -123,11 +128,11 @@ class MigrationTest {
         createV3Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_3_4)
+            .addMigrations(AppDatabase.MIGRATION_3_4, AppDatabase.MIGRATION_4_5)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(4, db.openHelper.readableDatabase.version)
+            assertEquals(5, db.openHelper.readableDatabase.version)
             // 旧进度行保留，新列取默认值 0
             val old = db.readingProgressDao().getForProject("p-1")
             assertEquals("ch-1", old?.chapterId)

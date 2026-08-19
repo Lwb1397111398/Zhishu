@@ -25,6 +25,7 @@ import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.Quiz
+import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.ReadingProgress
 import com.example.zhishu.domain.model.ReviewItem
 import com.example.zhishu.domain.model.ReviewStatus
@@ -161,6 +162,16 @@ class DefaultChapterRepository(
 
     override suspend fun updateStatus(id: String, status: ChapterStatus, note: String) =
         planDao.updateStatus(id, status, note)
+
+    override suspend fun updateStatusIfIn(
+        id: String,
+        status: ChapterStatus,
+        note: String,
+        onlyIf: List<ChapterStatus>,
+    ): Boolean = planDao.updateStatusIfIn(id, status, note, onlyIf) > 0
+
+    override suspend fun updateQuizState(id: String, state: QuizState, note: String) =
+        planDao.updateQuizState(id, state, note)
 
     override suspend fun markPublished(id: String, summary: String) =
         planDao.updatePublished(id, ChapterStatus.PUBLISHED, summary)

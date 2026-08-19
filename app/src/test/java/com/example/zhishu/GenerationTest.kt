@@ -21,6 +21,7 @@ import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.domain.model.ParseStatus
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.ProjectStatus
+import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.SourceKind
@@ -210,36 +211,44 @@ class GenerationTest {
 
     /** 测验生成失败时不得发布章节（N2） */
     @Test
-    fun generateChapter_quizFails_doesNotPublish() = runBlocking {
+    fun generateChapter_quizFails_stillPublishesBody() = runBlocking {
         seedProjectWithChunk()
         pipeline.generateKnowledgeMap("p-1")
         pipeline.generateStoryBible("p-1")
         fakeRouter.quizJson = """{"questions":[]}"""
         val plan = db.chapterPlanDao().getByProject("p-1").first()
+        // 出题失败不算这一章失败：正文写好了、核验也过了
         val result = pipeline.generateChapter("p-1", plan.id)
-        assertTrue(result.isFailure)
+        assertTrue(result.isSuccess)
         val loaded = db.chapterPlanDao().getById(plan.id)
-        assertEquals(ChapterStatus.QUIZ_FAILED, loaded?.status)
-        assertTrue(loaded?.verificationNote.orEmpty().contains("测验"))
+        assertEquals(ChapterStatus.PUBLISHED, loaded?.status)
+        assertTrue(loaded?.isReadable == true)
+        // 失败只落在测验状态上，正文的核验说明不受污染
+        assertEquals(QuizState.FAILED, loaded?.quizState)
+        assertTrue(loaded?.quizNote.orEmpty().isNotBlank())
         assertTrue(db.quizDao().getByProject("p-1").isEmpty())
+        // 正文块在库里，能读
+        assertTrue(db.chapterBlockDao().getByChapter(plan.id).isNotEmpty())
     }
 
-    /** 题目数量不足最低要求也算失败（N2/N14） */
+    /** 题目数量不足最低要求：仍然只影响测验状态（第二阶段） */
     @Test
-    fun generateChapter_tooFewQuizzes_marksQuizFailed() = runBlocking {
+    fun generateChapter_tooFewQuizzes_marksQuizFailedOnly() = runBlocking {
         seedProjectWithChunk()
         pipeline.generateKnowledgeMap("p-1")
         pipeline.generateStoryBible("p-1")
         fakeRouter.quizJson =
             """{"questions":[{"question":"Q1","type":"TRUE_FALSE","options":["对","错"],"answer":"对","explanation":"e","nodeTitles":["意思表示"]}]}"""
         val plan = db.chapterPlanDao().getByProject("p-1").first()
-        assertTrue(pipeline.generateChapter("p-1", plan.id).isFailure)
-        assertEquals(ChapterStatus.QUIZ_FAILED, db.chapterPlanDao().getById(plan.id)?.status)
+        assertTrue(pipeline.generateChapter("p-1", plan.id).isSuccess)
+        val loaded = db.chapterPlanDao().getById(plan.id)
+        assertEquals(ChapterStatus.PUBLISHED, loaded?.status)
+        assertEquals(QuizState.FAILED, loaded?.quizState)
     }
 
-    /** 题目引用不存在的知识点时应被过滤掉并导致失败（N14） */
+    /** 题目引用不存在的知识点时被过滤掉，同样不拖累正文（第二阶段） */
     @Test
-    fun generateChapter_quizWithUnknownNodes_fails() = runBlocking {
+    fun generateChapter_quizWithUnknownNodes_keepsBodyReadable() = runBlocking {
         seedProjectWithChunk()
         pipeline.generateKnowledgeMap("p-1")
         pipeline.generateStoryBible("p-1")
@@ -251,8 +260,10 @@ class GenerationTest {
             ]}
         """.trimIndent()
         val plan = db.chapterPlanDao().getByProject("p-1").first()
-        assertTrue(pipeline.generateChapter("p-1", plan.id).isFailure)
-        assertEquals(ChapterStatus.QUIZ_FAILED, db.chapterPlanDao().getById(plan.id)?.status)
+        assertTrue(pipeline.generateChapter("p-1", plan.id).isSuccess)
+        val loaded = db.chapterPlanDao().getById(plan.id)
+        assertEquals(ChapterStatus.PUBLISHED, loaded?.status)
+        assertEquals(QuizState.FAILED, loaded?.quizState)
     }
 
     @Test

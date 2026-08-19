@@ -1,7 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      生成一章要连着调三次模型（正文、核验、出题），加上退避重试可能接近普通 Worker
+      的执行窗口，所以真正跑模型的 Worker 会 setForeground。dataSync 对应
+      「代替用户完成一段网络工作」，与实际行为一致。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Android 13 起发通知需要它。被拒绝时生成照常进行，只是收不到通知（第二阶段） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:name=".ZhishuApp"
@@ -20,6 +31,20 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 前台通知上「取消」按钮的落点：取消整条项目级链 -->
+        <receiver
+            android:name=".worker.CancelGenerationReceiver"
+            android:exported="false" />
+
+        <!--
+          WorkManager 自带的前台服务需要显式声明类型，否则 targetSdk 34+ 上
+          setForeground 会抛 MissingForegroundServiceTypeException。
+        -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
     </application>
 
 </manifest>

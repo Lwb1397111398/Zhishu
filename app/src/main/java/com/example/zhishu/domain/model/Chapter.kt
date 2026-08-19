@@ -16,8 +16,40 @@ enum class ChapterStatus {
     FAILED,
     NEEDS_REVIEW,
 
-    /** 正文已核验通过，但测验生成失败，需要重试（N2） */
+    /**
+     * 历史状态：正文已核验通过、测验没出来。
+     *
+     * 第二阶段起不再写入——正文过核验就直接 PUBLISHED，测验成败改由 [ChapterPlan.quizState] 表达。
+     * 但旧库里可能还留着这个值，所以枚举保留，并且在 [isReadable] 里明确算「正文可读」。
+     */
     QUIZ_FAILED,
+    ;
+
+    /**
+     * 正文是否已经可以读。
+     *
+     * 故事是主流程，测验是可选辅助：正文过了核验就该能读，
+     * 不能因为出题这一步失败而把章节变成打不开的状态。
+     */
+    val isReadable: Boolean get() = this == PUBLISHED || this == QUIZ_FAILED
+}
+
+/**
+ * 本章自测题的状态。与 [ChapterStatus] 分开，正文可读性不再受出题影响。
+ *
+ * 单独一列而不是塞进 ChapterStatus：出题失败和正文失败是两件事，
+ * 混在一个枚举里就必然出现「正文好着呢但章节打不开」。
+ */
+@Serializable
+enum class QuizState {
+    /** 还没出过题 */
+    NONE,
+
+    /** 已有可用自测题 */
+    READY,
+
+    /** 出题失败，可单独重试出题，不会重新生成正文 */
+    FAILED,
 }
 
 @Serializable
@@ -55,7 +87,19 @@ data class ChapterPlan(
     /** 无资料模式下模型自报的「需要你去核对权威出处」的断言 */
     @ColumnInfo(defaultValue = "")
     val unverifiedClaims: List<String> = emptyList(),
-)
+    /**
+     * 自测题状态。正文发布与出题解耦后，出题失败只体现在这里（第二阶段）。
+     * 默认 NONE：老数据升级上来时都算「还没出过题」，不影响正文可读。
+     */
+    @ColumnInfo(defaultValue = "NONE")
+    val quizState: QuizState = QuizState.NONE,
+    /** 出题失败原因，给「重新生成自测」按钮旁边显示 */
+    @ColumnInfo(defaultValue = "")
+    val quizNote: String = "",
+) {
+    /** 正文是否已可阅读。测验状态一概不参与判断。 */
+    val isReadable: Boolean get() = status.isReadable
+}
 
 @Serializable
 enum class BlockType {

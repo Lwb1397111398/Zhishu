@@ -11,6 +11,7 @@ import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.Quiz
+import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.ReadingProgress
 import com.example.zhishu.domain.model.ReviewItem
 import com.example.zhishu.domain.model.SourceChunk
@@ -73,6 +74,20 @@ interface ChapterRepository {
     suspend fun upsertPlan(plan: ChapterPlan)
     /** 只写状态与核验说明，由 Pipeline/Worker 使用（N13） */
     suspend fun updateStatus(id: String, status: ChapterStatus, note: String = "")
+
+    /**
+     * 只在章节仍处于 [onlyIf] 之一时改状态，返回是否真的改了（第二阶段）。
+     * 取消收尾用：不能覆盖已经发布的章节，也不能踩坏用户随后重新排的那次生成。
+     */
+    suspend fun updateStatusIfIn(
+        id: String,
+        status: ChapterStatus,
+        note: String,
+        onlyIf: List<ChapterStatus>,
+    ): Boolean
+
+    /** 只写自测题状态，不触碰正文状态（第二阶段：正文可读性与测验解耦） */
+    suspend fun updateQuizState(id: String, state: QuizState, note: String = "")
     suspend fun markPublished(id: String, summary: String)
     /** 发布并写入滚动记忆，供下一章续写（问题5） */
     suspend fun markPublished(

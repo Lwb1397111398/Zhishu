@@ -40,6 +40,8 @@ fun GenerationBanner(
     state: GenerationUiState,
     onRetry: (() -> Unit)? = null,
     onOpenSettings: (() -> Unit)? = null,
+    /** 取消整条生成链。排队中、运行中、等待重试都能点（第二阶段） */
+    onCancel: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     AnimatedVisibility(visible = state.busy || state.hasError) {
@@ -51,13 +53,17 @@ fun GenerationBanner(
                 modifier = modifier,
             )
         } else {
-            RunningBanner(state = state, modifier = modifier)
+            RunningBanner(state = state, onCancel = onCancel, modifier = modifier)
         }
     }
 }
 
 @Composable
-private fun RunningBanner(state: GenerationUiState, modifier: Modifier) {
+private fun RunningBanner(
+    state: GenerationUiState,
+    onCancel: (() -> Unit)?,
+    modifier: Modifier,
+) {
     // 百分比变化时平滑过渡，避免数字与条子突然跳一大段
     val animatedProgress by animateFloatAsState(
         targetValue = state.percent / 100f,
@@ -119,10 +125,16 @@ private fun RunningBanner(state: GenerationUiState, modifier: Modifier) {
                 )
             }
             Spacer(Modifier.height(8.dp))
-            Text(
-                "生成在后台进行，可以离开这个页面。完成后章节状态会自动更新。",
-                style = MaterialTheme.typography.bodySmall,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "生成在后台进行，可以离开这个页面。完成后章节状态会自动更新。",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.weight(1f),
+                )
+                if (onCancel != null) {
+                    TextButton(onClick = onCancel) { Text("取消") }
+                }
+            }
         }
     }
 }

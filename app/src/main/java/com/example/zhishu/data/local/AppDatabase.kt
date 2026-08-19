@@ -58,7 +58,7 @@ import com.example.zhishu.search.SearchTokenizer
         ModelConfig::class,
         StoryBible::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -233,9 +233,37 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v4 → v5：正文发布与测验解耦（第二阶段：生成任务可靠性）。
+         *
+         * chapters 增加 quizState / quizNote 两列。原来「出题成功才 PUBLISHED」，
+         * 出题一失败章节就停在 QUIZ_FAILED，正文明明写好核验也过了却不算可读——
+         * 这与「故事是主流程、测验是可选辅助」相反。现在正文过核验即 PUBLISHED，
+         * 出题成败只落在 quizState 上。
+         *
+         * 已有的 QUIZ_FAILED 章节顺手扶正：状态改成 PUBLISHED（正文本来就通过了核验），
+         * quizState 记 FAILED，原来的核验说明搬到 quizNote。数据不丢，只是各归各位。
+         */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE chapters ADD COLUMN quizState TEXT NOT NULL DEFAULT 'NONE'")
+                db.execSQL("ALTER TABLE chapters ADD COLUMN quizNote TEXT NOT NULL DEFAULT ''")
+                // 有题的章节标 READY，让「重新生成自测」按钮不会对已有题的章节乱提示
+                db.execSQL(
+                    "UPDATE chapters SET quizState = 'READY' " +
+                        "WHERE id IN (SELECT DISTINCT chapterId FROM quizzes)",
+                )
+                // 历史 QUIZ_FAILED：正文可读，失败信息移到测验列
+                db.execSQL(
+                    "UPDATE chapters SET quizNote = verificationNote, verificationNote = '', " +
+                        "quizState = 'FAILED', status = 'PUBLISHED' WHERE status = 'QUIZ_FAILED'",
+                )
+            }
+        }
+
         fun build(context: Context): AppDatabase =
             Room.databaseBuilder(context.applicationContext, AppDatabase::class.java, DATABASE_NAME)
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                 .build()
     }
 }
