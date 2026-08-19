@@ -90,16 +90,6 @@ interface ChapterRepository {
 
     /** 只写自测题状态，不触碰正文状态（第二阶段：正文可读性与测验解耦） */
     suspend fun updateQuizState(id: String, state: QuizState, note: String = "")
-    suspend fun markPublished(id: String, summary: String)
-    /** 发布并写入滚动记忆，供下一章续写（问题5） */
-    suspend fun markPublished(
-        id: String,
-        summary: String,
-        carryOver: String,
-        coveredTitles: List<String>,
-        unverifiedClaims: List<String>,
-        note: String = "",
-    )
     /** 只写用户可编辑字段，由 UI 使用（N13） */
     suspend fun updateEditableFields(
         id: String,
@@ -166,7 +156,7 @@ interface ChapterRepository {
      * 原子切换：版本置 PUBLISHED、同章旧版本置 ABANDONED、章节 activeVersionId 指过来，
      * 并同步章节的展示元数据。一个事务，要么全成要么全不成。
      */
-    suspend fun publishVersionAtomically(version: ChapterVersion, carryOver: String, now: Long)
+    suspend fun publishVersionAtomically(version: ChapterVersion, now: Long)
 
     /** 导入备份用：整批写入版本行 */
     suspend fun upsertVersions(versions: List<ChapterVersion>)

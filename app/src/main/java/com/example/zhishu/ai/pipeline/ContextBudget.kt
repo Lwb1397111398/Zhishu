@@ -1,6 +1,7 @@
 package com.example.zhishu.ai.pipeline
 
 import com.example.zhishu.domain.model.ChapterPlan
+import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.StoryBible
 
 /**
@@ -18,7 +19,7 @@ import com.example.zhishu.domain.model.StoryBible
  * | 人物档案 | 6 行 | 否 |
  * | 全书主线 throughLine | 12 行 | 否 |
  * | 累积状态 runningState | 700 | 否，每章**改写**而不是追加 |
- * | 上一章 carryOver | 200 | 否，只取最近一章 |
+ * | 上一章结尾状态 endingState | 200 | 否，只取最近一章的当前版本 |
  * | 已讲知识点标题 | 60 个 | 否，超出后只留最近的 |
  * | 未回收悬念 | 6 条 | 否 |
  *
@@ -82,12 +83,22 @@ internal object ContextBudget {
     }
 
     /**
-     * 上一章的处境。优先用模型写的 [ChapterPlan.carryOver]（自足、150 字内），
-     * 退回 summary，都没有就说明这是第一章。
+     * 上一章结束时的处境（第三阶段 3B）。
+     *
+     * 只认上一章**当前 active version** 的 [ChapterVersion.endingState]：
+     * 一章可能被重生成过好几版，结尾各不相同，只有读者真的读到的那一版才算前情。
+     *
+     * [version] 为 null 意味着上一章还没有可读正文——跳章生成时会这样。
+     * 这时候必须明说「没有上一章结尾」，让模型只靠累积状态接续；
+     * 含糊地给一句空话，模型就会自己编一个上一章结尾出来。
      */
-    fun carryOverOf(previous: ChapterPlan?): String {
+    fun previousEndingState(previous: ChapterPlan?, version: ChapterVersion?): String {
         if (previous == null) return "这是第一章，还没有前情。"
-        val text = previous.carryOver.ifBlank { previous.summary }
+        if (version == null) {
+            return "上一章还没有写出正文。请只依据上面的「故事已经走到哪里」接续，" +
+                "不要虚构上一章发生过什么。"
+        }
+        val text = version.endingState.ifBlank { version.summary }
         return clamp(text, CARRY_OVER_LIMIT).ifBlank { "上一章尚无摘要。" }
     }
 }

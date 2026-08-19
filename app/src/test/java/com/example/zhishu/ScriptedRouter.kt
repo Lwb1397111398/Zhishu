@@ -27,6 +27,14 @@ internal class ScriptedRouter : ModelRouter {
     val calls = mutableListOf<Phase>()
 
     /**
+     * 每个阶段最后一次收到的用户提示词（第三阶段 3B）。
+     *
+     * 用来断言「喂给模型的前情到底是哪一段」——上一章结尾状态、本章开头钩子、
+     * 下一章的口子，这几样从哪来是 3B 的全部意义，只能从提示词里验。
+     */
+    val lastPrompts = mutableMapOf<Phase, String>()
+
+    /**
      * 每个阶段开始前的观察点（第三阶段 3A）。
      *
      * 用来断言「重生成期间章节不会短暂变得不可读」——这种时序性质只能在生成还没结束时看，
@@ -64,6 +72,7 @@ internal class ScriptedRouter : ModelRouter {
             else -> error("没有匹配的测试数据: ${request.user.take(40)}")
         }
         calls += phase
+        lastPrompts[phase] = request.user
         onPhase?.invoke(phase)
         if (phase == cancelAt) throw CancellationException("用户取消")
         if (phase == failAt) return Result.failure(failWith)
@@ -88,18 +97,26 @@ internal class ScriptedRouter : ModelRouter {
         const val BIBLE_JSON =
             """{"world":"滨海市","characters":[{"name":"林默","role":"主角","description":"律师"}],""" +
                 """"conflict":"遗产纠纷","style":"悬疑","chapters":[""" +
-                """{"order":1,"title":"第一章","plotGoal":"引出遗嘱","learningGoals":["意思表示"],"nodeTitles":["意思表示"],"wordTarget":1000},""" +
-                """{"order":2,"title":"第二章","plotGoal":"庭审","learningGoals":["意思表示"],"nodeTitles":["意思表示"],"wordTarget":1000}]}"""
+                """{"order":1,"title":"第一章","plotGoal":"引出遗嘱","learningGoals":["意思表示"],""" +
+                """"nodeTitles":["意思表示"],"wordTarget":1000,"openingHook":"从一封律师函开始"},""" +
+                """{"order":2,"title":"第二章","plotGoal":"庭审","learningGoals":["意思表示"],""" +
+                """"nodeTitles":["意思表示"],"wordTarget":1000,"openingHook":"庭审当天的清晨"}]}"""
     }
 }
 
 /** 阶段标记 prompt，与 GenerationTest 同一套约定 */
-internal class TaggedPromptProvider : PromptProvider {
+internal class TaggedPromptProvider(
+    /**
+     * 章节模板。默认只有阶段标记；需要断言「喂进去的前情是哪一段」时
+     * 传一个带占位符的模板进来（第三阶段 3B）。
+     */
+    private val chapterTemplate: String = "[[CHAPTER]]",
+) : PromptProvider {
     private val map = mapOf(
         "knowledge_map" to "[[MAP]]",
         "knowledge_map_model" to "[[MAP]]",
         "story_bible" to "[[BIBLE]]",
-        "chapter" to "[[CHAPTER]]",
+        "chapter" to chapterTemplate,
         "verify" to "[[VERIFY]]",
         "verify_model" to "[[VERIFY]]",
         "quiz" to "[[QUIZ]]",

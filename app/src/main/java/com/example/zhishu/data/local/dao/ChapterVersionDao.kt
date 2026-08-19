@@ -82,11 +82,13 @@ interface ChapterVersionDao {
      * 章节的展示元数据（摘要、已覆盖知识点、待核实清单）跟着一起换，
      * 否则会出现「正文是新的，摘要还是旧的」。quizState 归零是因为
      * 旧版本的题问的是被替换掉的情节，不能算作新正文的自测题。
+     *
+     * 注意这里**不写 chapters.carryOver**：结尾状态属于这一版正文，
+     * 存在 chapter_versions.endingState 上（3B）。
      */
     @Transaction
     suspend fun publishVersion(
         version: ChapterVersion,
-        carryOver: String,
         updatedAt: Long,
     ) {
         upsert(version.copy(status = ChapterVersionStatus.PUBLISHED, updatedAt = updatedAt))
@@ -101,7 +103,6 @@ interface ChapterVersionDao {
             versionId = version.id,
             status = ChapterStatus.PUBLISHED,
             summary = version.summary,
-            carryOver = carryOver,
             coveredTitles = version.coveredTitles,
             unverifiedClaims = version.unverifiedClaims,
             note = version.verificationNote,
@@ -129,7 +130,7 @@ interface ChapterVersionDao {
 
     @Query(
         "UPDATE chapters SET activeVersionId = :versionId, status = :status, summary = :summary, " +
-            "carryOver = :carryOver, coveredTitles = :coveredTitles, unverifiedClaims = :unverifiedClaims, " +
+            "coveredTitles = :coveredTitles, unverifiedClaims = :unverifiedClaims, " +
             "verificationNote = :note, quizState = :quizState, quizNote = '' WHERE id = :chapterId",
     )
     suspend fun activateVersion(
@@ -137,7 +138,6 @@ interface ChapterVersionDao {
         versionId: String,
         status: ChapterStatus,
         summary: String,
-        carryOver: String,
         coveredTitles: List<String>,
         unverifiedClaims: List<String>,
         note: String,

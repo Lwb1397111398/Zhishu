@@ -68,26 +68,4 @@ interface ChapterPlanDao {
     /** 只写测验状态，正文状态一概不碰——出题失败不该让正文变得打不开（第二阶段） */
     @Query("UPDATE chapters SET quizState = :state, quizNote = :note WHERE id = :id")
     suspend fun updateQuizState(id: String, state: QuizState, note: String)
-
-    @Query("UPDATE chapters SET status = :status, summary = :summary, verificationNote = '' WHERE id = :id")
-    suspend fun updatePublished(id: String, status: ChapterStatus, summary: String)
-
-    /**
-     * 章节发布时一并写入滚动记忆字段（问题5）。
-     * carryOver / coveredTitles 供下一章使用，unverifiedClaims 供无资料模式提示用户核对。
-     */
-    @Query(
-        "UPDATE chapters SET status = :status, summary = :summary, carryOver = :carryOver, " +
-            "coveredTitles = :coveredTitles, unverifiedClaims = :unverifiedClaims, " +
-            "verificationNote = :note WHERE id = :id",
-    )
-    suspend fun updatePublishedWithMemory(
-        id: String,
-        status: ChapterStatus,
-        summary: String,
-        carryOver: String,
-        coveredTitles: List<String>,
-        unverifiedClaims: List<String>,
-        note: String,
-    )
 }

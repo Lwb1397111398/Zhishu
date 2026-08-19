@@ -311,7 +311,16 @@ class TransferManager(private val container: AppContainer) {
 
         val versionIds = versions.map { it.id }.toSet()
         return VersionedChapters(
-            plans = plans.map { it.copy(activeVersionId = activeVersionOf[it.id]) },
+            plans = plans.map { plan ->
+                plan.copy(
+                    activeVersionId = activeVersionOf[plan.id],
+                    // v4 及更早的备份没有 openingHook：未发布章节的 carryOver 装的就是开头钩子，
+                    // 按 v6→v7 的同一条规则补上（3B）
+                    openingHook = plan.openingHook.ifBlank {
+                        if (plan.isReadable) "" else plan.carryOver
+                    },
+                )
+            },
             versions = versions,
             blocks = blocks.map { block ->
                 if (block.versionId.isBlank() || block.versionId !in versionIds) {
@@ -338,6 +347,8 @@ class TransferManager(private val container: AppContainer) {
         },
         title = plan.title,
         summary = plan.summary,
+        // 旧备份里 carryOver 是双重语义列：已发布章节装的是结尾状态，
+        // 未发布章节装的是开头钩子。只有前者能搬进版本（3B 的迁移规则）
         endingState = if (plan.isReadable) plan.carryOver else "",
         coveredTitles = plan.coveredTitles,
         unverifiedClaims = plan.unverifiedClaims,

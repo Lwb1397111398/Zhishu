@@ -240,7 +240,8 @@ class GenerationCancellationTest {
         val node = db.knowledgeNodeDao().getByProject("p-1").first { it.title == "意思表示" }
         assertTrue(planId in node.chapterIds)
         assertTrue(db.storyBibleDao().get("p-1")?.runningState.orEmpty().isNotBlank())
-        assertTrue(db.chapterPlanDao().getById(planId)?.carryOver.orEmpty().isNotBlank())
+        // 结尾状态存在当前版本上，不再写章节的 carryOver 列（第三阶段 3B）
+        assertTrue(db.chapterVersionDao().getActive(planId)?.endingState.orEmpty().isNotBlank())
     }
 
     /** 正文核验不过时仍然是 NEEDS_REVIEW，解耦没有把真正的正文问题也放过 */

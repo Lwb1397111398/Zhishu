@@ -177,26 +177,6 @@ class DefaultChapterRepository(
     override suspend fun updateQuizState(id: String, state: QuizState, note: String) =
         planDao.updateQuizState(id, state, note)
 
-    override suspend fun markPublished(id: String, summary: String) =
-        planDao.updatePublished(id, ChapterStatus.PUBLISHED, summary)
-
-    override suspend fun markPublished(
-        id: String,
-        summary: String,
-        carryOver: String,
-        coveredTitles: List<String>,
-        unverifiedClaims: List<String>,
-        note: String,
-    ) = planDao.updatePublishedWithMemory(
-        id = id,
-        status = ChapterStatus.PUBLISHED,
-        summary = summary,
-        carryOver = carryOver,
-        coveredTitles = coveredTitles,
-        unverifiedClaims = unverifiedClaims,
-        note = note,
-    )
-
     override suspend fun updateEditableFields(
         id: String,
         title: String,
@@ -285,9 +265,8 @@ class DefaultChapterRepository(
 
     override suspend fun publishVersionAtomically(
         version: ChapterVersion,
-        carryOver: String,
         now: Long,
-    ) = versionDao.publishVersion(version, carryOver, now)
+    ) = versionDao.publishVersion(version, now)
 
     override suspend fun upsertVersions(versions: List<ChapterVersion>) =
         versionDao.upsertAll(versions)

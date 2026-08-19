@@ -51,11 +51,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_3_4,
                 AppDatabase.MIGRATION_4_5,
                 AppDatabase.MIGRATION_5_6,
+                AppDatabase.MIGRATION_6_7,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(6, db.openHelper.readableDatabase.version)
+            assertEquals(7, db.openHelper.readableDatabase.version)
 
             // 旧数据保留
             assertEquals("民法基础", db.projectDao().getById("p-1")?.title)
@@ -104,11 +105,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_3_4,
                 AppDatabase.MIGRATION_4_5,
                 AppDatabase.MIGRATION_5_6,
+                AppDatabase.MIGRATION_6_7,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(6, db.openHelper.readableDatabase.version)
+            assertEquals(7, db.openHelper.readableDatabase.version)
             // 旧项目仍在，新列有默认值
             val project = db.projectDao().getById("p-1")
             assertEquals("民法基础", project?.title)
@@ -136,11 +138,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_3_4,
                 AppDatabase.MIGRATION_4_5,
                 AppDatabase.MIGRATION_5_6,
+                AppDatabase.MIGRATION_6_7,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(6, db.openHelper.readableDatabase.version)
+            assertEquals(7, db.openHelper.readableDatabase.version)
             // 旧进度行保留，新列取默认值 0
             val old = db.readingProgressDao().getForProject("p-1")
             assertEquals("ch-1", old?.chapterId)
@@ -176,11 +179,15 @@ class MigrationTest {
         createV4Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_4_5, AppDatabase.MIGRATION_5_6)
+            .addMigrations(
+                AppDatabase.MIGRATION_4_5,
+                AppDatabase.MIGRATION_5_6,
+                AppDatabase.MIGRATION_6_7,
+            )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(6, db.openHelper.readableDatabase.version)
+            assertEquals(7, db.openHelper.readableDatabase.version)
 
             // ch-1 有题：标 READY，状态不动
             val withQuiz = db.chapterPlanDao().getById("ch-1")
@@ -222,11 +229,11 @@ class MigrationTest {
         createV5Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_5_6)
+            .addMigrations(AppDatabase.MIGRATION_5_6, AppDatabase.MIGRATION_6_7)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(6, db.openHelper.readableDatabase.version)
+            assertEquals(7, db.openHelper.readableDatabase.version)
 
             // 每个现有章节都有一个初始版本，一章不落
             assertEquals(1, db.chapterVersionDao().countByChapter("ch-1"))
@@ -275,6 +282,47 @@ class MigrationTest {
             assertEquals("b-1", db.readingProgressDao().getForProject("p-1")?.blockId)
             assertEquals(1, db.quizDao().getByProject("p-1").size)
             assertEquals("ch-1-v1", db.quizDao().getByProject("p-1").first().versionId)
+            assertEquals(1, db.quizDao().getActiveByChapter("ch-1").size)
+        } finally {
+            db.close()
+        }
+    }
+
+    /**
+     * v6 → v7：拆开 carryOver 的双重语义。
+     *
+     * 一次性把当年那个「靠章节状态猜含义」的规则固化下来：
+     * 未发布章节的 carryOver 是开头钩子，已发布章节的 carryOver 是结尾状态。
+     */
+    @Test
+    fun migrate6To7_splitsCarryOverSemantics() = runBlocking {
+        createV6Database()
+
+        val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_6_7)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            assertEquals(7, db.openHelper.readableDatabase.version)
+
+            // 已发布章节：carryOver 是结尾状态，落在当前版本上；openingHook 留空
+            val published = db.chapterPlanDao().getById("ch-1")
+            assertEquals("", published?.openingHook)
+            assertEquals("房子归属仍未决", db.chapterVersionDao().getActive("ch-1")?.endingState)
+
+            // 未发布章节：carryOver 是开头钩子，搬进 openingHook；不当成结尾状态
+            val queued = db.chapterPlanDao().getById("ch-3")
+            assertEquals("开场：法庭外的雨", queued?.openingHook)
+            assertEquals("", db.chapterVersionDao().getById("ch-3-v1")?.endingState)
+
+            // 历史列保留，数据没被删——只是不再读也不再写
+            assertEquals("房子归属仍未决", published?.carryOver)
+            assertEquals("开场：法庭外的雨", queued?.carryOver)
+
+            // 正文、进度、测验一条不少
+            assertEquals(1, db.chapterBlockDao().countByProject("p-1"))
+            assertEquals(1, db.chapterBlockDao().getActiveBlocks("ch-1").size)
+            assertEquals("b-1", db.readingProgressDao().getForProject("p-1")?.blockId)
             assertEquals(1, db.quizDao().getActiveByChapter("ch-1").size)
         } finally {
             db.close()
@@ -394,26 +442,7 @@ class MigrationTest {
     private fun createV5Database() {
         val callback = object : SupportSQLiteOpenHelper.Callback(5) {
             override fun onCreate(db: SupportSQLiteDatabase) {
-                V1_SCHEMA.forEach(db::execSQL)
-                V1_SEED.forEach(db::execSQL)
-                db.execSQL(
-                    "INSERT INTO chapters VALUES ('ch-2','p-1',2,'第二章','','[]','[]',1200," +
-                        "'QUIZ_FAILED','摘要','正文已通过核验，但测验未生成：题目不足')",
-                )
-                db.execSQL(
-                    "INSERT INTO chapters VALUES ('ch-3','p-1',3,'第三章','','[]','[]',1200,'QUEUED','','')",
-                )
-                AppDatabase.MIGRATION_1_2.migrate(db)
-                AppDatabase.MIGRATION_2_3.migrate(db)
-                AppDatabase.MIGRATION_3_4.migrate(db)
-                AppDatabase.MIGRATION_4_5.migrate(db)
-                // carryOver 的双重语义：已发布章节里它是结尾状态，未发布章节里它是开头钩子
-                db.execSQL("UPDATE chapters SET carryOver = '房子归属仍未决' WHERE id = 'ch-1'")
-                db.execSQL("UPDATE chapters SET carryOver = '开场：法庭外的雨' WHERE id = 'ch-3'")
-                db.execSQL(
-                    "INSERT INTO reading_progress (id, projectId, chapterId, blockId, charOffset, " +
-                        "updatedAt, blockOffset) VALUES ('p-1','p-1','ch-1','b-1',0,1,24)",
-                )
+                seedV5(db)
             }
 
             override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
@@ -425,6 +454,50 @@ class MigrationTest {
                 .build(),
         )
         helper.writableDatabase.use { it.version = 5 }
+        helper.close()
+    }
+
+    /** v5 库的内容：v1 结构 + 依次执行 1→2、2→3、3→4、4→5，外加三种章节与块级阅读进度 */
+    private fun seedV5(db: SupportSQLiteDatabase) {
+        V1_SCHEMA.forEach(db::execSQL)
+        V1_SEED.forEach(db::execSQL)
+        db.execSQL(
+            "INSERT INTO chapters VALUES ('ch-2','p-1',2,'第二章','','[]','[]',1200," +
+                "'QUIZ_FAILED','摘要','正文已通过核验，但测验未生成：题目不足')",
+        )
+        db.execSQL(
+            "INSERT INTO chapters VALUES ('ch-3','p-1',3,'第三章','','[]','[]',1200,'QUEUED','','')",
+        )
+        AppDatabase.MIGRATION_1_2.migrate(db)
+        AppDatabase.MIGRATION_2_3.migrate(db)
+        AppDatabase.MIGRATION_3_4.migrate(db)
+        AppDatabase.MIGRATION_4_5.migrate(db)
+        // carryOver 的双重语义：已发布章节里它是结尾状态，未发布章节里它是开头钩子
+        db.execSQL("UPDATE chapters SET carryOver = '房子归属仍未决' WHERE id = 'ch-1'")
+        db.execSQL("UPDATE chapters SET carryOver = '开场：法庭外的雨' WHERE id = 'ch-3'")
+        db.execSQL(
+            "INSERT INTO reading_progress (id, projectId, chapterId, blockId, charOffset, " +
+                "updatedAt, blockOffset) VALUES ('p-1','p-1','ch-1','b-1',0,1,24)",
+        )
+    }
+
+    /** 造出一个真正的 v6 库：v5 库 + 执行 5→6，版本号置为 6。 */
+    private fun createV6Database() {
+        val callback = object : SupportSQLiteOpenHelper.Callback(6) {
+            override fun onCreate(db: SupportSQLiteDatabase) {
+                seedV5(db)
+                AppDatabase.MIGRATION_5_6.migrate(db)
+            }
+
+            override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+        }
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(dbName)
+                .callback(callback)
+                .build(),
+        )
+        helper.writableDatabase.use { it.version = 6 }
         helper.close()
     }
 

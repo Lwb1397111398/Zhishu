@@ -76,8 +76,21 @@ data class ChapterPlan(
     @ColumnInfo(defaultValue = "")
     val derivationChain: String = "",
     /**
-     * 上一章结束时的世界状态：人物处境、已埋伏笔、留给本章的悬念。
-     * 生成时只喂这一段而不是全部前文，让每章上下文恒定（问题5）。
+     * 本章开始时如何承接前文（第三阶段 3B）。
+     *
+     * 属于「计划」：规划讲述路线时定下，重生成正文不会改它。
+     * 与之相对，「本章结束后的故事状态」属于**具体那一版正文**，存在
+     * [ChapterVersion.endingState] 上——重生成出来的结尾会变，
+     * 只有当前 active version 的结尾才能当作后续章节的上下文。
+     */
+    @ColumnInfo(defaultValue = "")
+    val openingHook: String = "",
+    /**
+     * 历史字段：曾经同时表示两件事——规划期存「下一章的开头钩子」，
+     * 发布后存「本章结束后的故事状态」。同一列两种含义，读的时候只能靠章节状态去猜。
+     *
+     * 第三阶段 3B 起彻底拆开：开头钩子 → [openingHook]，结尾状态 → [ChapterVersion.endingState]。
+     * 这一列不再读也不再写，只留着不破坏旧数据。
      */
     @ColumnInfo(defaultValue = "")
     val carryOver: String = "",

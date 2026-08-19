@@ -181,8 +181,8 @@ class PipelineService(
                 wordTarget = chapter.wordTarget.coerceIn(MIN_WORDS, MAX_WORDS),
                 status = ChapterStatus.QUEUED,
                 derivationChain = chapter.derivationChain,
-                // 开头/结尾钩子存进 carryOver 的规划位，正文阶段读取后再被实际处境覆盖
-                carryOver = chapter.openingHook,
+                // 开头钩子存进它自己的列。规划期与发布期不再共用一列（3B）
+                openingHook = chapter.openingHook,
                 coveredTitles = emptyList(),
             )
         }
@@ -314,23 +314,29 @@ class PipelineService(
         val plans = chapterRepository.getPlans(projectId)
         val previous = plans.firstOrNull { it.order == plan.order - 1 }
         val next = plans.firstOrNull { it.order == plan.order + 1 }
+        // 上一章的前情只认它**当前版本**的结尾状态（3B）。
+        // 上一章还没写出来时这里是 null，提示词会明说「没有上一章」而不是让模型自己编一个。
+        val previousEnding = previous?.let { chapterRepository.getActiveVersion(it.id) }
 
         // 上下文只由固定预算的几段构成，与已生成章数无关（问题5）
         val prompt = prompts.load(PROMPT_CHAPTER)
             .replace("{derivationChain}", ContextBudget.orNone(plan.derivationChain.ifBlank { plan.plotGoal }))
-            .replace("{closingHook}", ContextBudget.orNone(next?.carryOver.orEmpty()))
+            // 本章要留的口子 = 下一章**计划里**的开头钩子。
+            // 绝不能用下一章已经写出来的结尾——那是后面发生的事，
+            // 重生成本章时拿它当收尾提示等于让本章去衔接一个还不该存在的未来（3B）
+            .replace("{closingHook}", ContextBudget.orNone(next?.openingHook.orEmpty()))
             .replace("{world}", ContextBudget.orNone(bible.world))
             .replace("{style}", ContextBudget.orNone(bible.style.ifBlank { project.effectiveGenre }))
             .replace("{characters}", ContextBudget.formatCharacters(bible.characters))
             .replace("{throughLine}", ContextBudget.formatThroughLine(bible.throughLine))
             .replace("{runningState}", ContextBudget.orNone(bible.runningState))
-            .replace("{carryOver}", ContextBudget.carryOverOf(previous))
+            .replace("{previousEndingState}", ContextBudget.previousEndingState(previous, previousEnding))
             .replace("{coveredTitles}", ContextBudget.formatCovered(bible.coveredTitles))
             .replace("{openThreads}", ContextBudget.formatList(bible.openThreads, ContextBudget.OPEN_THREAD_LIMIT))
             .replace("{chapterTitle}", plan.title)
             .replace("{plotGoal}", plan.plotGoal)
             .replace("{learningGoals}", plan.learningGoals.joinToString("；"))
-            .replace("{openingHook}", ContextBudget.orNone(plan.carryOver))
+            .replace("{openingHook}", ContextBudget.orNone(plan.openingHook))
             .replace("{nodes}", formatNodesWithDerivation(nodes))
             .replace("{sourceSection}", sourceSection(modelKnowledge, chunks))
             .replace("{wordTarget}", plan.wordTarget.toString())
@@ -432,9 +438,6 @@ class PipelineService(
                     "有 ${unverified.size} 处内容建议你核对权威出处"
                 },
             ),
-            // chapters.carryOver 继续写，保持与既有续写逻辑一致；
-            // 「开头钩子 / 结尾状态」这两种语义由 3B 彻底拆开
-            carryOver = endingState,
             now = clock(),
         )
         attempt.published = true

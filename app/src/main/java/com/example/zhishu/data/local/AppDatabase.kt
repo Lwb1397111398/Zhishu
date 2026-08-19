@@ -61,7 +61,7 @@ import com.example.zhishu.search.SearchTokenizer
         ModelConfig::class,
         StoryBible::class,
     ],
-    version = 6,
+    version = 7,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -346,12 +346,54 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v6 → v7：拆开 carryOver 的双重语义（第三阶段 3B）。
+         *
+         * 这一列原来同时装两样东西：章节还没发布时装「本章的开头钩子」，
+         * 发布之后被改写成「本章结束后的故事状态」。同一列两种含义，
+         * 读的时候只能靠章节状态去猜——猜错的后果是把开头钩子当成上一章的结尾喂给模型。
+         *
+         * 现在按用途各归各位：
+         * - 开头钩子属于「计划」→ chapters.openingHook（重生成正文不会改它）
+         * - 结尾状态属于「某一版正文」→ chapter_versions.endingState（3A 已建好）
+         *
+         * 迁移规则就是把当年那个猜法固化下来，只做一次：
+         * 未发布章节的 carryOver 是开头钩子，已发布章节的 carryOver 是结尾状态。
+         */
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE chapters ADD COLUMN openingHook TEXT NOT NULL DEFAULT ''")
+
+                // 未发布：carryOver 装的是开头钩子
+                db.execSQL(
+                    "UPDATE chapters SET openingHook = carryOver " +
+                        "WHERE status NOT IN ('PUBLISHED', 'QUIZ_FAILED')",
+                )
+                // 已发布：carryOver 装的是结尾状态，落到当前版本上。
+                // v5→v6 已经搬过一次，这里只补 endingState 还空着的（例如手工导入的数据），
+                // 不覆盖版本自己写好的结尾
+                db.execSQL(
+                    "UPDATE chapter_versions SET endingState = COALESCE(" +
+                        "(SELECT chapters.carryOver FROM chapters WHERE chapters.id = chapter_versions.chapterId), '') " +
+                        "WHERE endingState = '' AND id IN (SELECT activeVersionId FROM chapters WHERE activeVersionId IS NOT NULL)",
+                )
+                // carryOver 列保留不动：不再读也不再写，但旧数据一个字都不删
+            }
+        }
+
         /** 迁移出来的初始版本 ID 后缀。测试与导入兼容逻辑共用同一个约定。 */
         const val INITIAL_VERSION_SUFFIX = "-v1"
 
         fun build(context: Context): AppDatabase =
             Room.databaseBuilder(context.applicationContext, AppDatabase::class.java, DATABASE_NAME)
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                .addMigrations(
+                    MIGRATION_1_2,
+                    MIGRATION_2_3,
+                    MIGRATION_3_4,
+                    MIGRATION_4_5,
+                    MIGRATION_5_6,
+                    MIGRATION_6_7,
+                )
                 .build()
     }
 }

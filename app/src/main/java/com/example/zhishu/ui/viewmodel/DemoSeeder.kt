@@ -31,6 +31,16 @@ object DemoSeeder {
 
     private fun demoVersionId(chapterId: String) = "$chapterId-v1"
 
+    /**
+     * 各章结尾状态。存在版本上而不是章节上（第三阶段 3B）：
+     * 结尾属于「具体这一版正文」，重生成后会变。
+     */
+    private val DEMO_ENDING_STATES = mapOf(
+        "c1" to "林晓继承了姑母半套房，另一半属于一个她没听说过的人。",
+        "c2" to "发现一份三年前的遗嘱，可姑母那时已患阿尔茨海默病，效力存疑。",
+        "c3" to "遗嘱被判无效，房子按法定继承处理，故事收束。",
+    )
+
     suspend fun seed(container: AppContainer) {
         if (container.projectRepository.get(PROJECT_ID) != null) return
         val now = System.currentTimeMillis()
@@ -144,7 +154,6 @@ object DemoSeeder {
                 nodeIds = listOf("n-inheritance", "n-estate"),
                 wordTarget = 1200, status = ChapterStatus.PUBLISHED, summary = "主角收到律师函，遗产继承故事开场。",
                 derivationChain = "人去世，财产不能悬空 → 于是有了继承 → 但要先划清什么算遗产",
-                carryOver = "林晓继承了姑母半套房，另一半属于一个她没听说过的人。",
                 coveredTitles = listOf("继承", "遗产范围"),
             ),
             ChapterPlan(
@@ -154,7 +163,6 @@ object DemoSeeder {
                 nodeIds = listOf("n-will", "n-legal"),
                 wordTarget = 1200, status = ChapterStatus.PUBLISHED, summary = "发现遗嘱，遗嘱效力成为悬念。",
                 derivationChain = "法律尊重死者意愿 → 于是允许遗嘱 → 但遗嘱有瑕疵时要判断效力",
-                carryOver = "发现一份三年前的遗嘱，可姑母那时已患阿尔茨海默病，效力存疑。",
                 coveredTitles = listOf("遗嘱继承"),
             ),
             ChapterPlan(
@@ -164,7 +172,6 @@ object DemoSeeder {
                 nodeIds = listOf("n-legal", "n-estate"),
                 wordTarget = 1200, status = ChapterStatus.PUBLISHED, summary = "庭审定音，知识闭环。",
                 derivationChain = "遗嘱被判无效 → 回到法定继承 → 按顺序确定谁能拿",
-                carryOver = "遗嘱被判无效，房子按法定继承处理，故事收束。",
                 coveredTitles = listOf("法定继承", "遗产范围"),
             ),
         )
@@ -181,7 +188,7 @@ object DemoSeeder {
                     status = ChapterVersionStatus.PUBLISHED,
                     title = plan.title,
                     summary = plan.summary,
-                    endingState = plan.carryOver,
+                    endingState = DEMO_ENDING_STATES[plan.id].orEmpty(),
                     coveredTitles = plan.coveredTitles,
                     createdAt = now,
                     updatedAt = now,
