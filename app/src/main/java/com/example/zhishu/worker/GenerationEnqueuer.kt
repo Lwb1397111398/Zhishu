@@ -72,13 +72,13 @@ object GenerationEnqueuer {
 
     /** 只梳理知识主干 */
     suspend fun knowledgeMap(context: Context, projectId: String): EnqueueResult =
-        enqueueChain(context, projectId) { session ->
+        enqueueChain(context, projectId, modelStages = 1) { session ->
             listOf(simpleRequest(projectId, GenerationStage.KNOWLEDGE_MAP, session, 0, UNITS_SIMPLE_STAGE))
         }
 
     /** 只规划讲述路线 */
     suspend fun storyBible(context: Context, projectId: String): EnqueueResult =
-        enqueueChain(context, projectId) { session ->
+        enqueueChain(context, projectId, modelStages = 1) { session ->
             listOf(simpleRequest(projectId, GenerationStage.STORY_BIBLE, session, 0, UNITS_SIMPLE_STAGE))
         }
 
@@ -88,7 +88,7 @@ object GenerationEnqueuer {
         projectId: String,
         chapterId: String,
         chapterLabel: String = "",
-    ): EnqueueResult = enqueueChain(context, projectId) { session ->
+    ): EnqueueResult = enqueueChain(context, projectId, modelStages = 1) { session ->
         listOf(
             chapterRequest(
                 projectId = projectId,
@@ -117,7 +117,7 @@ object GenerationEnqueuer {
             return EnqueueResult.Nothing("没有需要生成的章节，所有章节都已完成")
         }
         val total = targets.size * ChapterPhase.UNITS_PER_CHAPTER
-        return enqueueChain(context, projectId) { session ->
+        return enqueueChain(context, projectId, modelStages = targets.size) { session ->
             targets.mapIndexed { index, plan ->
                 chapterRequest(
                     projectId = projectId,
@@ -146,7 +146,8 @@ object GenerationEnqueuer {
         val total = (if (needsMap) UNITS_SIMPLE_STAGE else 0) +
             (if (needsBible) UNITS_SIMPLE_STAGE else 0) +
             ChapterPhase.UNITS_PER_CHAPTER
-        return enqueueChain(context, projectId) { session ->
+        val stages = (if (needsMap) 1 else 0) + (if (needsBible) 1 else 0) + 1
+        return enqueueChain(context, projectId, modelStages = stages) { session ->
             buildList {
                 var before = 0
                 if (needsMap) {
@@ -181,6 +182,8 @@ object GenerationEnqueuer {
     private suspend fun enqueueChain(
         context: Context,
         projectId: String,
+        /** 这条链上真正要调模型的步数，用来给用户显示「几步」。链尾收尾不算。 */
+        modelStages: Int,
         build: (session: String) -> List<OneTimeWorkRequest>,
     ): EnqueueResult {
         if (isActive(context, projectId)) return EnqueueResult.AlreadyRunning
@@ -200,8 +203,7 @@ object GenerationEnqueuer {
         )
         requests.drop(1).forEach { continuation = continuation.then(it) }
         continuation.enqueue().result.await()
-        // 步数不含链尾的 SUMMARY，那一步不调模型
-        return EnqueueResult.Started(requests.count { it.isModelStage() })
+        return EnqueueResult.Started(modelStages)
     }
 
     private fun simpleRequest(
@@ -283,9 +285,6 @@ object GenerationEnqueuer {
         // 长任务会 setForeground，加急配额用完时退回普通排队即可
         .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
         .build()
-
-    private fun OneTimeWorkRequest.isModelStage(): Boolean =
-        workSpec.input.getString(GenerationWorker.KEY_STAGE) != GenerationStage.SUMMARY.name
 }
 
 /**

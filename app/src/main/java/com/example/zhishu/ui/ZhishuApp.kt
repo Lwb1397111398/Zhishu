@@ -11,6 +11,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -71,11 +72,21 @@ private val topTabs = listOf(
 )
 
 @Composable
-fun ZhishuRoot() {
+fun ZhishuRoot(
+    /** 点通知进来时要直接打开的项目（第二阶段）。为空就走正常首页。 */
+    initialProjectId: String? = null,
+) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
     val showBottomBar = topTabs.any { it.route == currentRoute }
+
+    // 只在这一次进入时跳一次，之后用户自己怎么导航就不再干预
+    LaunchedEffect(initialProjectId) {
+        if (!initialProjectId.isNullOrBlank()) {
+            navController.navigate(Routes.project(initialProjectId))
+        }
+    }
 
     Scaffold(
         bottomBar = {

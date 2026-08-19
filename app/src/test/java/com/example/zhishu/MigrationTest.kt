@@ -157,6 +157,51 @@ class MigrationTest {
         }
     }
 
+    /**
+     * v4 → v5：正文发布与测验解耦。
+     *
+     * 断言三件事：新列建出来了、有题的章节标成 READY、
+     * 历史 QUIZ_FAILED 被扶正成「正文可读 + 测验失败」而不是丢掉。
+     */
+    @Test
+    fun migrate4To5_decouplesQuizStateFromChapterStatus() = runBlocking {
+        createV4Database()
+
+        val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_4_5)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            assertEquals(5, db.openHelper.readableDatabase.version)
+
+            // ch-1 有题：标 READY，状态不动
+            val withQuiz = db.chapterPlanDao().getById("ch-1")
+            assertEquals(com.example.zhishu.domain.model.ChapterStatus.PUBLISHED, withQuiz?.status)
+            assertEquals(com.example.zhishu.domain.model.QuizState.READY, withQuiz?.quizState)
+
+            // ch-2 是历史 QUIZ_FAILED：正文其实通过了核验，现在明确算可读
+            val quizFailed = db.chapterPlanDao().getById("ch-2")
+            assertEquals(com.example.zhishu.domain.model.ChapterStatus.PUBLISHED, quizFailed?.status)
+            assertEquals(com.example.zhishu.domain.model.QuizState.FAILED, quizFailed?.quizState)
+            assertTrue(quizFailed?.isReadable == true)
+            // 原来的失败说明搬进 quizNote，没被丢掉
+            assertEquals("正文已通过核验，但测验未生成：题目不足", quizFailed?.quizNote)
+            assertEquals("", quizFailed?.verificationNote)
+
+            // ch-3 还没生成：默认 NONE，不受影响
+            val queued = db.chapterPlanDao().getById("ch-3")
+            assertEquals(com.example.zhishu.domain.model.ChapterStatus.QUEUED, queued?.status)
+            assertEquals(com.example.zhishu.domain.model.QuizState.NONE, queued?.quizState)
+
+            // v4 的阅读进度与正文数据都还在，备份导入导出读的就是这些表
+            assertEquals("b-1", db.readingProgressDao().getForProject("p-1")?.blockId)
+            assertEquals(1, db.chapterBlockDao().countByProject("p-1"))
+            assertEquals(1, db.quizDao().getByProject("p-1").size)
+        } finally {
+            db.close()
+        }
+    }
+
     private fun createV1Database() {
         val callback = object : SupportSQLiteOpenHelper.Callback(1) {
             override fun onCreate(db: SupportSQLiteDatabase) {
@@ -222,6 +267,44 @@ class MigrationTest {
                 .build(),
         )
         helper.writableDatabase.use { it.version = 3 }
+        helper.close()
+    }
+
+    /**
+     * 造出一个真正的 v4 库：v1 结构 + 依次执行 1→2、2→3、3→4，版本号置为 4。
+     * 额外塞进三种章节：有题的、历史 QUIZ_FAILED 的、还没生成的。
+     */
+    private fun createV4Database() {
+        val callback = object : SupportSQLiteOpenHelper.Callback(4) {
+            override fun onCreate(db: SupportSQLiteDatabase) {
+                V1_SCHEMA.forEach(db::execSQL)
+                V1_SEED.forEach(db::execSQL)
+                db.execSQL(
+                    "INSERT INTO chapters VALUES ('ch-2','p-1',2,'第二章','','[]','[]',1200," +
+                        "'QUIZ_FAILED','摘要','正文已通过核验，但测验未生成：题目不足')",
+                )
+                db.execSQL(
+                    "INSERT INTO chapters VALUES ('ch-3','p-1',3,'第三章','','[]','[]',1200,'QUEUED','','')",
+                )
+                AppDatabase.MIGRATION_1_2.migrate(db)
+                AppDatabase.MIGRATION_2_3.migrate(db)
+                AppDatabase.MIGRATION_3_4.migrate(db)
+                // v4 的块级阅读进度
+                db.execSQL(
+                    "INSERT INTO reading_progress (id, projectId, chapterId, blockId, charOffset, " +
+                        "updatedAt, blockOffset) VALUES ('p-1','p-1','ch-1','b-1',0,1,24)",
+                )
+            }
+
+            override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+        }
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(dbName)
+                .callback(callback)
+                .build(),
+        )
+        helper.writableDatabase.use { it.version = 4 }
         helper.close()
     }
 

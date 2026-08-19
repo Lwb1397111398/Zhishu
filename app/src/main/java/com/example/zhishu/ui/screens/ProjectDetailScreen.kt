@@ -78,6 +78,7 @@ import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.ParseStatus
+import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.SourceMode
 import com.example.zhishu.domain.model.StoryBible
@@ -86,6 +87,7 @@ import com.example.zhishu.ui.common.ConfirmDialog
 import com.example.zhishu.ui.common.EmptyState
 import com.example.zhishu.ui.common.GenerationBanner
 import com.example.zhishu.ui.common.InfoRow
+import com.example.zhishu.ui.common.RequestNotificationPermissionWhenGenerating
 import com.example.zhishu.ui.common.SOURCE_MIME_TYPES
 import com.example.zhishu.ui.common.SourceKindChip
 import com.example.zhishu.ui.common.SourceTextDialog
@@ -152,6 +154,9 @@ fun ProjectDetailScreen(
             vm.consumeMessage()
         }
     }
+
+    // 刚开始生成时才问通知权限，此刻这个请求才讲得通（第二阶段）
+    RequestNotificationPermissionWhenGenerating(generating = generation.busy)
 
     Scaffold(
         topBar = {
@@ -810,10 +815,9 @@ private fun OutlineTab(
 ) {
     var editPlan by remember { mutableStateOf<ChapterPlan?>(null) }
     var showGenre by remember { mutableStateOf(false) }
-    val published = plans.count { it.status == ChapterStatus.PUBLISHED }
-    val needsAttention = plans.count {
-        it.status == ChapterStatus.NEEDS_REVIEW || it.status == ChapterStatus.QUIZ_FAILED
-    }
+    // 进度按「正文可读」算，不因为缺自测题就少算一章
+    val published = plans.count { it.isReadable }
+    val needsAttention = plans.count { it.status == ChapterStatus.NEEDS_REVIEW }
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         if (plans.isEmpty()) {
@@ -888,6 +892,7 @@ private fun OutlineTab(
                         onGenerate = { vm.enqueueChapter(plan.id) },
                         onRead = { onOpenReader(plan.id, null) },
                         onQuiz = { onOpenQuiz(plan.id) },
+                        onRegenerateQuiz = { vm.regenerateQuiz(plan.id) },
                     )
                 }
             }
@@ -1070,14 +1075,17 @@ private fun ChapterPlanCard(
     onGenerate: () -> Unit,
     onRead: () -> Unit,
     onQuiz: () -> Unit,
+    /** 只重新出题，不重写正文（第二阶段） */
+    onRegenerateQuiz: () -> Unit,
 ) {
-    val canRead = plan.status == ChapterStatus.PUBLISHED ||
+    // 可读性只看正文状态。QUIZ_FAILED 是旧库里的值，正文其实是通过核验的
+    val canRead = plan.isReadable ||
         plan.status == ChapterStatus.NEEDS_REVIEW ||
-        plan.status == ChapterStatus.QUIZ_FAILED ||
         plan.status == ChapterStatus.DRAFT
-    val canQuiz = plan.status == ChapterStatus.PUBLISHED
+    val canQuiz = plan.isReadable && plan.quizState == QuizState.READY
+    // 补题不该走「重新生成章节」，那会连正文一起重写
+    val quizMissing = plan.isReadable && plan.quizState == QuizState.FAILED
     val needsRetry = plan.status == ChapterStatus.NEEDS_REVIEW ||
-        plan.status == ChapterStatus.QUIZ_FAILED ||
         plan.status == ChapterStatus.FAILED
     Card(modifier = Modifier.padding(vertical = 6.dp)) {
         Column(Modifier.padding(12.dp)) {
@@ -1133,7 +1141,18 @@ private fun ChapterPlanCard(
                     color = MaterialTheme.colorScheme.tertiary,
                 )
             }
+            // 正文与测验是两件事：正文好着呢，只是自测没出来（第二阶段）
+            if (quizMissing) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "正文已完成，自测暂未生成，不影响阅读",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             // 展示核验说明，用户才知道为什么待复核（B3）
+            // 核验说明只讲正文的问题。出题失败的原因单独放在 quizNote 里，
+            // 免得「测验没出来」被当成「正文有问题」
             if (plan.verificationNote.isNotBlank()) {
                 Spacer(Modifier.height(6.dp))
                 Surface(
@@ -1153,6 +1172,8 @@ private fun ChapterPlanCard(
                 TextButton(onClick = onEdit) { Text("编辑") }
                 if (canRead) TextButton(onClick = onRead) { Text("阅读") }
                 if (canQuiz) TextButton(onClick = onQuiz) { Text("测验") }
+                // 补题只调出题阶段，绝不重写正文
+                if (quizMissing) TextButton(onClick = onRegenerateQuiz) { Text("重新生成自测") }
                 TextButton(onClick = onGenerate) {
                     Text(if (needsRetry) "重新生成" else "生成")
                 }

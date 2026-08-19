@@ -136,7 +136,8 @@ fun ChapterStatusChip(status: ChapterStatus) {
         ChapterStatus.PUBLISHED -> Triple("已发布", Color(0xFF2E7D32), Color(0xFFE8F5E9))
         ChapterStatus.FAILED -> Triple("失败", MaterialTheme.colorScheme.errorContainer, MaterialTheme.colorScheme.onErrorContainer)
         ChapterStatus.NEEDS_REVIEW -> Triple("待复核", Color(0xFF9A6200), Color(0xFFFFF3D6))
-        ChapterStatus.QUIZ_FAILED -> Triple("测验待补", Color(0xFF9A6200), Color(0xFFFFF3D6))
+        // 旧库里的状态：正文其实已通过核验，只是缺自测题，所以按「已发布」显示
+        ChapterStatus.QUIZ_FAILED -> Triple("已发布", Color(0xFF2E7D32), Color(0xFFE8F5E9))
     }
     StatusChip(label, container, content)
 }

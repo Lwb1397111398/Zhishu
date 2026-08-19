@@ -1,6 +1,7 @@
 package com.example.zhishu.worker
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -115,6 +116,9 @@ internal object GenerationNotifier {
      * [GenerationOutcome.CANCELLED] 不发通知：用户自己按的取消，不需要再被告知一次，
      * 更不能在取消之后弹一条「生成失败」。
      */
+    // 权限在下面第一行就用 canPostNotifications 检查过了；lint 不做跨函数分析所以看不见。
+    // 即便如此 notify 仍然包在 runCatching 里，被系统拒掉也不会把生成拖崩。
+    @SuppressLint("MissingPermission")
     fun notifyOutcome(
         context: Context,
         projectId: String,
