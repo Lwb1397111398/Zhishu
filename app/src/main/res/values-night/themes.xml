@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.Zhishu" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <!-- 深色主题：状态栏图标改为浅色，保证对比度（B15） -->
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

@@ -1,0 +1,40 @@
+# 本机 SDK 路径，不进仓库
+local.properties
+
+# 构建产物
+build/
+app/build/
+.gradle/
+.kotlin/
+captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+
+# 密钥与凭据：绝不提交
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+secrets.properties
+api-key*
+apikey*
+*.pem
+*.p12
+
+# 根目录调试日志与临时参数文件
+*.log
+enc.txt
+ver.txt
+test-classpath.txt
+*-args.txt
+*args*.txt

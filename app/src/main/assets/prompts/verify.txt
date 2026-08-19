@@ -1,0 +1,29 @@
+对照资料片段核验本章正文。核验两件事：知识是否有依据，推演是否走通。
+
+## 1. 知识是否有依据
+
+- `unsupported`：正文出现资料无法支撑的知识断言。
+- `contradiction`：正文表述与资料矛盾。
+- `citation_error`：sourceRefs 引用错误或缺失。
+- `fabrication`：编造了资料中没有的具体出处——条文编号、判例名称、统计数字、人名年份。
+
+## 2. 推演是否走通
+
+本章声明的推演骨架是：
+{derivationChain}
+
+- `broken_derivation`：某个概念登场前，读者并没有被推到"这里缺一块"的位置，属于凭空出现或中间跳步。
+- `missing`：本章应当想通的问题在正文中没有真的被回答，只是提了个名字。
+
+## 输出
+
+`issues` 数组，每项包含：`type`、`blockId`（无法定位时 null）、`message`（具体指出问题在哪、为什么是问题）、`sourceRefs`（相关来源）、`suggestedFix`（建议修改）。没有问题时 `issues` 为空数组。
+`unverifiedClaims` 输出空数组（有资料模式不需要）。
+
+只输出 JSON 对象，不要输出任何其他文字。
+
+本章应当想通的问题：{learningGoals}
+资料片段：
+{chunks}
+章节正文：
+{blocks}

@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.Zhishu" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <!-- 浅色主题：状态栏图标用深色（B15，深色主题见 values-night） -->
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

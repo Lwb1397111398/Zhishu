@@ -1,0 +1,4 @@
+<resources>
+    <!-- 与图标图形所处的黑底同色，自适应图标被任何形状蒙版裁切后都不露边 -->
+    <color name="ic_launcher_background">#060602</color>
+</resources>
