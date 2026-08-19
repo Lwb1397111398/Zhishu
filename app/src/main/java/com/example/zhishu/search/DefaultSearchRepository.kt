@@ -17,8 +17,10 @@ class DefaultSearchRepository(
         if (normalized.isEmpty()) return emptyList()
 
         val hits = mutableListOf<SearchHit>()
-        // 一次取出全项目正文，供知识点命中定位到「讲这个知识点的那一块」
-        val blocksByChapter = chapterBlockDao.getByProject(projectId).groupBy { it.chapterId }
+        // 一次取出全项目**当前版本**正文，供知识点命中定位到「讲这个知识点的那一块」。
+        // 必须是 active 版本：重生成过的章节还留着旧版本正文，
+        // 拿旧块当锚点会把用户送到一段已经不存在的文字上（第三阶段 3A）
+        val blocksByChapter = chapterBlockDao.getActiveBlocksByProject(projectId).groupBy { it.chapterId }
 
         knowledgeNodeDao.searchExactTitle(projectId, normalized).forEach { node ->
             val anchor = anchorFor(node, blocksByChapter)
@@ -56,7 +58,8 @@ class DefaultSearchRepository(
 
         val match = SearchTokenizer.matchQuery(normalized)
         if (match != null) {
-            chapterBlockDao.searchByProjectMatch(projectId, match).forEach { block ->
+            // 只搜当前版本正文：旧版本的块仍在 FTS 索引里，但读者已经看不到那段文字
+            chapterBlockDao.searchActiveByProjectMatch(projectId, match).forEach { block ->
                 hits += SearchHit(
                     id = block.id,
                     kind = SearchHitKind.CHAPTER_BLOCK,

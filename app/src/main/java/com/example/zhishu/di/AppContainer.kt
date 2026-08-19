@@ -44,7 +44,11 @@ class AppContainer(context: Context) {
         gapDao = database.knowledgeGapDao(),
         conflictDao = database.knowledgeConflictDao(),
     )
-    val chapterRepository: ChapterRepository = DefaultChapterRepository(database.chapterPlanDao(), database.chapterBlockDao())
+    val chapterRepository: ChapterRepository = DefaultChapterRepository(
+        planDao = database.chapterPlanDao(),
+        blockDao = database.chapterBlockDao(),
+        versionDao = database.chapterVersionDao(),
+    )
     val storyBibleRepository: StoryBibleRepository = DefaultStoryBibleRepository(database.storyBibleDao())
     val quizRepository: QuizRepository = DefaultQuizRepository(database.quizDao(), database.answerRecordDao())
     val reviewRepository: ReviewRepository = DefaultReviewRepository(database.reviewItemDao())

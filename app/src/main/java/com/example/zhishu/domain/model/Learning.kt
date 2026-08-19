@@ -22,12 +22,19 @@ enum class ReviewStatus {
 @Serializable
 @Entity(
     tableName = "quizzes",
-    indices = [Index("projectId"), Index("chapterId")],
+    indices = [Index("projectId"), Index("chapterId"), Index("versionId")],
 )
 data class Quiz(
     @PrimaryKey val id: String,
     val projectId: String,
     val chapterId: String,
+    /**
+     * 出这道题时依据的正文版本（第三阶段 3A）。
+     *
+     * 不绑版本的话，重生成正文之后旧题会挂在新正文上——题目问的是已经不存在的情节。
+     * 空串表示历史数据（旧备份导入时会被补成当前版本），此时按章节走。
+     */
+    @ColumnInfo(defaultValue = "") val versionId: String = "",
     val order: Int,
     val question: String,
     val type: QuizType,

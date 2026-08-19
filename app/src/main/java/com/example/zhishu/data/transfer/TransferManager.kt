@@ -2,10 +2,14 @@ package com.example.zhishu.data.transfer
 
 import android.content.Context
 import android.net.Uri
+import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.di.AppContainer
 import com.example.zhishu.domain.model.AnswerRecord
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
+import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.ChapterVersion
+import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.Quiz
@@ -35,6 +39,7 @@ class TransferManager(private val container: AppContainer) {
             val chunks = mutableListOf<SourceChunk>()
             val knowledge = mutableListOf<KnowledgeNode>()
             val plans = mutableListOf<ChapterPlan>()
+            val versions = mutableListOf<ChapterVersion>()
             val blocks = mutableListOf<ChapterBlock>()
             val quizzes = mutableListOf<Quiz>()
             val reviews = mutableListOf<ReviewItem>()
@@ -48,6 +53,9 @@ class TransferManager(private val container: AppContainer) {
                 knowledge += container.knowledgeRepository.getByProject(project.id)
                 val projectPlans = container.chapterRepository.getPlans(project.id)
                 plans += projectPlans
+                // 版本行与全部历史正文都导出：只导 active 版本的话，
+                // 恢复出来的库就再也没有「上一版正文」可查了（第三阶段 3A）
+                versions += container.chapterRepository.getVersionsByProject(project.id)
                 projectPlans.forEach { plan -> blocks += container.chapterRepository.getBlocks(plan.id) }
                 val projectQuizzes = container.quizRepository.getByProject(project.id)
                 quizzes += projectQuizzes
@@ -73,6 +81,7 @@ class TransferManager(private val container: AppContainer) {
             entries["chunks.json"] = json.encodeToString(chunks)
             entries["knowledge.json"] = json.encodeToString(knowledge)
             entries["chapters.json"] = json.encodeToString(plans)
+            entries["chapter_versions.json"] = json.encodeToString(versions)
             entries["blocks.json"] = json.encodeToString(blocks)
             entries["quizzes.json"] = json.encodeToString(quizzes)
             entries["answers.json"] = json.encodeToString(answers)
@@ -191,7 +200,7 @@ class TransferManager(private val container: AppContainer) {
         val plans = decodeList<ChapterPlan>(files, "chapters.json")
             .filter { it.projectId in projectIds }
         val planProject = plans.associate { it.id to it.projectId }
-        val blocks = decodeList<ChapterBlock>(files, "blocks.json")
+        val rawBlocks = decodeList<ChapterBlock>(files, "blocks.json")
             .filter { it.chapterId in planProject.keys }
             .map { block ->
                 if (block.projectId.isBlank()) {
@@ -200,9 +209,32 @@ class TransferManager(private val container: AppContainer) {
                     block
                 }
             }
+        // 旧备份（v3 及更早）里没有版本信息，这里按与 v5→v6 迁移完全相同的规则补齐（3A）
+        val versioned = normalizeVersions(
+            plans = plans,
+            imported = decodeList<ChapterVersion>(files, "chapter_versions.json")
+                .filter { it.chapterId in planProject.keys }
+                .map { version ->
+                    if (version.projectId.isBlank()) {
+                        version.copy(projectId = planProject[version.chapterId].orEmpty())
+                    } else {
+                        version
+                    }
+                },
+            blocks = rawBlocks,
+        )
         val planIds = planProject.keys
         val quizzes = decodeList<Quiz>(files, "quizzes.json")
             .filter { it.projectId in projectIds && it.chapterId in planIds }
+            // 未绑定版本或指向不存在版本的历史题，绑到该章当前版本上，
+            // 否则它们会跟着以后任何一次重生成的新正文一起显示
+            .map { quiz ->
+                if (quiz.versionId.isBlank() || quiz.versionId !in versioned.versionIds) {
+                    quiz.copy(versionId = versioned.activeVersionOf[quiz.chapterId].orEmpty())
+                } else {
+                    quiz
+                }
+            }
         val quizIds = quizzes.map { it.id }.toSet()
         // 一题一条记录，去重后再写，符合唯一索引约束（N12）
         val answers = decodeList<AnswerRecord>(files, "answers.json")
@@ -223,8 +255,9 @@ class TransferManager(private val container: AppContainer) {
             sources = sources,
             chunks = chunks,
             knowledge = knowledge,
-            plans = plans,
-            blocks = blocks,
+            plans = versioned.plans,
+            versions = versioned.versions,
+            blocks = versioned.blocks,
             quizzes = quizzes,
             answers = answers,
             reviews = reviews,
@@ -233,6 +266,94 @@ class TransferManager(private val container: AppContainer) {
         )
     }
 
+    /**
+     * 把导入进来的数据整理成「每章至少一个版本、每块都属于某个版本、
+     * 章节指针只指向真的存在且已发布的版本」（第三阶段 3A）。
+     *
+     * 三种输入都要处理：
+     * - v4 备份：自带版本行，原样保留，只校验指针合法；
+     * - v1～v3 备份：完全没有版本概念，为每章补一个初始版本，规则与 v5→v6 迁移一致；
+     * - 手工改坏的备份：blocks 指向不存在的版本、章节指向没发布的版本，一律纠正到当前版本。
+     *
+     * 纠正而不是丢弃：正文一个块都不删，只是重新挂对。
+     */
+    private fun normalizeVersions(
+        plans: List<ChapterPlan>,
+        imported: List<ChapterVersion>,
+        blocks: List<ChapterBlock>,
+    ): VersionedChapters {
+        val now = System.currentTimeMillis()
+        val byChapter = imported.groupBy { it.chapterId }
+        val versions = mutableListOf<ChapterVersion>()
+        val activeVersionOf = mutableMapOf<String, String>()
+        val fallbackVersionOf = mutableMapOf<String, String>()
+
+        plans.forEach { plan ->
+            val existing = byChapter[plan.id].orEmpty().sortedBy { it.versionNumber }
+            val chapterVersions = existing.ifEmpty {
+                listOf(initialVersionFor(plan, now))
+            }
+            versions += chapterVersions
+            // 兜底版本：优先已发布的那一个，否则最后一个。孤儿正文块挂到它上面
+            val fallback = chapterVersions.lastOrNull { it.status == ChapterVersionStatus.PUBLISHED }
+                ?: chapterVersions.last()
+            fallbackVersionOf[plan.id] = fallback.id
+
+            // 指针只认「存在 + 已发布」的版本；否则按章节可读性重新决定
+            val declared = chapterVersions.firstOrNull {
+                it.id == plan.activeVersionId && it.status == ChapterVersionStatus.PUBLISHED
+            }
+            val resolved = declared
+                ?: chapterVersions.lastOrNull { it.status == ChapterVersionStatus.PUBLISHED }
+                    ?.takeIf { plan.isReadable }
+            if (resolved != null) activeVersionOf[plan.id] = resolved.id
+        }
+
+        val versionIds = versions.map { it.id }.toSet()
+        return VersionedChapters(
+            plans = plans.map { it.copy(activeVersionId = activeVersionOf[it.id]) },
+            versions = versions,
+            blocks = blocks.map { block ->
+                if (block.versionId.isBlank() || block.versionId !in versionIds) {
+                    block.copy(versionId = fallbackVersionOf[block.chapterId].orEmpty())
+                } else {
+                    block
+                }
+            },
+            versionIds = versionIds,
+            activeVersionOf = activeVersionOf,
+        )
+    }
+
+    /** 旧备份补出来的初始版本。endingState 只在章节可读时才取 carryOver（未发布时它装的是开头钩子） */
+    private fun initialVersionFor(plan: ChapterPlan, now: Long): ChapterVersion = ChapterVersion(
+        id = plan.id + AppDatabase.INITIAL_VERSION_SUFFIX,
+        chapterId = plan.id,
+        projectId = plan.projectId,
+        versionNumber = 1,
+        status = when {
+            plan.isReadable -> ChapterVersionStatus.PUBLISHED
+            plan.status == ChapterStatus.VERIFYING -> ChapterVersionStatus.VERIFYING
+            else -> ChapterVersionStatus.DRAFT
+        },
+        title = plan.title,
+        summary = plan.summary,
+        endingState = if (plan.isReadable) plan.carryOver else "",
+        coveredTitles = plan.coveredTitles,
+        unverifiedClaims = plan.unverifiedClaims,
+        verificationNote = plan.verificationNote,
+        createdAt = now,
+        updatedAt = now,
+    )
+
+    private class VersionedChapters(
+        val plans: List<ChapterPlan>,
+        val versions: List<ChapterVersion>,
+        val blocks: List<ChapterBlock>,
+        val versionIds: Set<String>,
+        val activeVersionOf: Map<String, String>,
+    )
+
     /** 单事务内先清理同项目历史数据再写入，避免残留旧子数据（B14/N7） */
     private suspend fun writeAtomically(payload: ImportPayload) {
         container.inTransaction {
@@ -240,6 +361,7 @@ class TransferManager(private val container: AppContainer) {
                 container.sourceRepository.deleteByProject(project.id)
                 container.knowledgeRepository.clearForProject(project.id)
                 container.chapterRepository.clearBlocksForProject(project.id)
+                container.chapterRepository.clearVersionsForProject(project.id)
                 container.chapterRepository.clearPlansForProject(project.id)
                 container.quizRepository.deleteByProject(project.id)
                 container.reviewRepository.clearForProject(project.id)
@@ -256,6 +378,8 @@ class TransferManager(private val container: AppContainer) {
             }
             if (payload.knowledge.isNotEmpty()) container.knowledgeRepository.upsertAll(payload.knowledge)
             if (payload.plans.isNotEmpty()) container.chapterRepository.upsertPlans(payload.plans)
+            // 版本行先于正文块写入，保证「块 → 版本 → 章节」这条链在事务内始终自洽
+            if (payload.versions.isNotEmpty()) container.chapterRepository.upsertVersions(payload.versions)
             if (payload.blocks.isNotEmpty()) container.chapterRepository.upsertBlocks(payload.blocks)
             if (payload.quizzes.isNotEmpty()) container.quizRepository.upsertAll(payload.quizzes)
             payload.answers.forEach { container.quizRepository.recordAnswer(it) }
@@ -274,6 +398,7 @@ class TransferManager(private val container: AppContainer) {
         val chunks: List<SourceChunk>,
         val knowledge: List<KnowledgeNode>,
         val plans: List<ChapterPlan>,
+        val versions: List<ChapterVersion>,
         val blocks: List<ChapterBlock>,
         val quizzes: List<Quiz>,
         val answers: List<AnswerRecord>,
@@ -283,9 +408,9 @@ class TransferManager(private val container: AppContainer) {
     )
 
     companion object {
-        // v3：备份内加入 story_bibles.json（故事总纲 + 滚动记忆）。
-        // 仍能读 v1/v2 备份——缺失的文件按空列表处理。
-        const val FORMAT_VERSION = 3
+        // v4：备份内加入 chapter_versions.json，blocks / quizzes 带 versionId（第三阶段 3A）。
+        // 仍能读 v1～v3 备份——缺失的版本信息按「每章一个初始版本」补齐。
+        const val FORMAT_VERSION = 4
         const val MAX_ENTRIES = 64
         const val MAX_ENTRY_BYTES = 32 * 1024 * 1024
         const val MAX_TOTAL_BYTES = 128L * 1024 * 1024

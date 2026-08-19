@@ -10,6 +10,7 @@ import com.example.zhishu.domain.model.AnswerRecord
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.GENRE_AUTO
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
@@ -58,6 +59,7 @@ private fun now(): Long = System.currentTimeMillis()
 internal suspend fun deleteProjectCompletely(container: AppContainer, projectId: String) {
     container.inTransaction {
         container.chapterRepository.clearBlocksForProject(projectId)
+        container.chapterRepository.clearVersionsForProject(projectId)
         container.chapterRepository.clearPlansForProject(projectId)
         container.storyBibleRepository.clearForProject(projectId)
         container.quizRepository.deleteByProject(projectId)
@@ -314,7 +316,9 @@ class ProjectDetailViewModel(
         plans: List<ChapterPlan>,
     ): Map<String, List<ChapterAnchor>> {
         if (plans.isEmpty()) return emptyMap()
-        val blocksByChapter = container.chapterRepository.getBlocksByProject(projectId)
+        // 只取当前版本正文：重生成过的章节还留着旧版本的块，
+        // 拿它们当锚点会把用户送到一段已经看不到的文字上（第三阶段 3A）
+        val blocksByChapter = container.chapterRepository.getActiveBlocksByProject(projectId)
             .groupBy { it.chapterId }
         val result = mutableMapOf<String, MutableList<ChapterAnchor>>()
         plans.sortedBy { it.order }.forEach { plan ->
@@ -339,6 +343,43 @@ class ProjectDetailViewModel(
     val generation: StateFlow<GenerationUiState> =
         WorkManager.getInstance(app).observeGeneration(projectId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), GenerationUiState())
+
+    /**
+     * 章节 ID → 最近一次「重新生成没成功」的说明（第三阶段 3A）。
+     *
+     * 3A 之后重生成失败不再改动章节状态——旧正文照样可读，这是对的。
+     * 但如果什么都不说，用户点了重新生成、等了半天、页面一动不动，会以为是自己没点上。
+     * 所以问题绑在新版本上，由这里单独读出来展示，而不是去覆盖当前发布版本的核验说明。
+     */
+    val failedRegenerations: StateFlow<Map<String, String>> =
+        plans.map { buildFailedRegenerationNotes(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
+
+    private suspend fun buildFailedRegenerationNotes(
+        plans: List<ChapterPlan>,
+    ): Map<String, String> {
+        // 只对「有可读正文」的章节报。没有可读正文时问题已经写在章节的核验说明里了，
+        // 再报一遍等于同一件事说两次
+        val readable = plans.filter { it.isReadable && it.activeVersionId != null }
+        if (readable.isEmpty()) return emptyMap()
+        val versions = container.chapterRepository.getVersionsByProject(projectId)
+        return readable.mapNotNull { plan ->
+            val active = versions.firstOrNull { it.id == plan.activeVersionId }
+                ?: return@mapNotNull null
+            val latestFailure = versions
+                .filter {
+                    it.chapterId == plan.id &&
+                        it.status == ChapterVersionStatus.ABANDONED &&
+                        it.verificationNote.isNotBlank() &&
+                        // 只报比当前版本更新的尝试。比它旧的作废版本是正常历史，
+                        // 那是「后来重生成成功了」，不该再报失败
+                        it.versionNumber > active.versionNumber
+                }
+                .maxByOrNull { it.versionNumber }
+                ?: return@mapNotNull null
+            plan.id to latestFailure.verificationNote
+        }.toMap()
+    }
 
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message
@@ -571,7 +612,7 @@ class ReaderViewModel(
     val chapter = MutableStateFlow<ChapterPlan?>(null)
     val project = MutableStateFlow<Project?>(null)
     val blocks: StateFlow<List<ChapterBlock>> =
-        container.chapterRepository.observeBlocks(chapterId)
+        container.chapterRepository.observeActiveBlocks(chapterId)
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     private val _nodes = MutableStateFlow<List<KnowledgeNode>>(emptyList())
@@ -581,9 +622,9 @@ class ReaderViewModel(
     val prevChapterId = MutableStateFlow<String?>(null)
     val nextChapterId = MutableStateFlow<String?>(null)
 
-    /** 本章自测题数：0 时不显示「自测」按钮，但绝不阻塞继续读下一章 */
+    /** 本章自测题数：0 时不显示「自测」按钮，但绝不阻塞继续读下一章。只数当前版本的题（3A） */
     val quizCount: StateFlow<Int> =
-        container.quizRepository.observeByChapter(chapterId)
+        container.quizRepository.observeActiveByChapter(chapterId)
             .map { it.size }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
@@ -642,7 +683,7 @@ class QuizViewModel(
 
     val chapter = MutableStateFlow<ChapterPlan?>(null)
     val quizzes: StateFlow<List<Quiz>> =
-        container.quizRepository.observeByChapter(chapterId)
+        container.quizRepository.observeActiveByChapter(chapterId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _selections = MutableStateFlow<Map<String, String>>(emptyMap())
@@ -668,7 +709,7 @@ class QuizViewModel(
 
     /** 从数据库恢复答题历史，重新进入页面不会重复计分（N12） */
     private suspend fun restoreAnswers() {
-        val existing = container.quizRepository.getByChapter(chapterId)
+        val existing = container.quizRepository.getActiveByChapter(chapterId)
         val records = container.quizRepository.getAnswers(existing.map { it.id })
         if (records.isEmpty()) return
         _answers.value = records.associate { it.quizId to it.isCorrect }

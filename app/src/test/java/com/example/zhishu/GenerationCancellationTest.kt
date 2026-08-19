@@ -12,6 +12,7 @@ import com.example.zhishu.data.local.repo.DefaultReviewRepository
 import com.example.zhishu.data.local.repo.DefaultSourceRepository
 import com.example.zhishu.data.local.repo.DefaultStoryBibleRepository
 import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.ParseStatus
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.ProjectStatus
@@ -66,7 +67,7 @@ class GenerationCancellationTest {
                 gapDao = db.knowledgeGapDao(),
                 conflictDao = db.knowledgeConflictDao(),
             ),
-            chapterRepository = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao()),
+            chapterRepository = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao(), db.chapterVersionDao()),
             storyBibleRepository = DefaultStoryBibleRepository(db.storyBibleDao()),
             quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
             reviewRepository = DefaultReviewRepository(db.reviewItemDao()),
@@ -112,18 +113,19 @@ class GenerationCancellationTest {
     }
 
     /**
-     * 重生成一个已发布章节、在核验阶段取消：旧正文已经被新正文替换掉了。
+     * 重生成一个已发布章节、在核验阶段取消：**旧正文完好无损**（第三阶段 3A）。
      *
-     * 这件事不能靠改个状态糊过去——说明里必须写明「原正文已被替换」，
-     * 否则用户以为章节还是原来那篇。
+     * 这条测试是 3A 的核心断言，也是第二阶段那句「原正文已被新生成的正文替换」的终结：
+     * 新正文写在独立版本上，指针没切过去，取消之后读者手里的正文一个字都没变。
      */
     @Test
-    fun cancelDuringVerify_onPublishedChapter_admitsBodyWasReplaced() = runBlocking {
+    fun cancelDuringVerify_onPublishedChapter_keepsOldBodyReadable() = runBlocking {
         val planId = seedThroughBible()
         // 先正常生成一遍，让它发布
         assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
         assertEquals(ChapterStatus.PUBLISHED, db.chapterPlanDao().getById(planId)?.status)
-        val oldText = db.chapterBlockDao().getByChapter(planId).first().text
+        val oldVersionId = db.chapterPlanDao().getById(planId)?.activeVersionId
+        val oldText = db.chapterBlockDao().getActiveBlocks(planId).first().text
 
         // 再生成一次，这次在核验阶段取消
         router.chapterJson = router.chapterJson.replace("老人立下遗嘱，子女各怀心思。", "改写后的开头。")
@@ -131,10 +133,19 @@ class GenerationCancellationTest {
         runCatching { pipeline.generateChapter("p-1", planId) }
 
         val plan = db.chapterPlanDao().getById(planId)
-        assertEquals(ChapterStatus.NEEDS_REVIEW, plan?.status)
-        assertTrue(plan?.verificationNote.orEmpty().contains("已被新生成的正文替换"))
-        // 如实反映：库里确实已经是新正文了
-        assertNotEquals(oldText, db.chapterBlockDao().getByChapter(planId).first().text)
+        // 章节照样是已发布、照样可读，指针也没动
+        assertEquals(ChapterStatus.PUBLISHED, plan?.status)
+        assertTrue(plan?.isReadable == true)
+        assertEquals(oldVersionId, plan?.activeVersionId)
+        assertEquals(oldText, db.chapterBlockDao().getActiveBlocks(planId).first().text)
+
+        // 被取消的那一版留在库里、标成作废，正文块也没删——可查，但读者看不到
+        val abandoned = db.chapterVersionDao().getByChapter(planId)
+            .single { it.id != oldVersionId }
+        assertEquals(ChapterVersionStatus.ABANDONED, abandoned.status)
+        assertTrue(abandoned.verificationNote.contains("已取消"))
+        assertTrue(db.chapterBlockDao().getByVersion(abandoned.id).isNotEmpty())
+        assertNotEquals(oldText, db.chapterBlockDao().getByVersion(abandoned.id).first().text)
     }
 
     /** 要求 5：发布之后才取消（出题阶段）→ 已发布内容与状态一概不动 */

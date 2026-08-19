@@ -4,6 +4,8 @@ import com.example.zhishu.domain.model.AnswerRecord
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.ChapterVersion
+import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
@@ -112,6 +114,63 @@ interface ChapterRepository {
     suspend fun getBlocksByProject(projectId: String): List<ChapterBlock>
     suspend fun countBlocks(projectId: String): Int
     suspend fun upsertBlocks(blocks: List<ChapterBlock>)
+
+    // --- 正文版本化（第三阶段 3A）---
+    //
+    // 命名刻意区分「当前正文」与「全部历史版本」：
+    // observeActiveBlocks / getActiveBlocks 是读者看到的那一版，
+    // getBlocks / getBlocksByProject 是含历史版本的全部正文，只用于导出和按章清理。
+
+    /** 阅读器订阅这一条：只吐当前 activeVersion 的正文块 */
+    fun observeActiveBlocks(chapterId: String): Flow<List<ChapterBlock>>
+
+    /** 当前 activeVersion 的正文块。没有 activeVersion 时是空列表 */
+    suspend fun getActiveBlocks(chapterId: String): List<ChapterBlock>
+
+    /** 指定版本的正文块，与章节当前指针无关。核验新版本时用 */
+    suspend fun getBlocksByVersion(versionId: String): List<ChapterBlock>
+
+    /** 全项目当前版本正文。知识点跳转锚点只能落在读者看得到的那一版上 */
+    suspend fun getActiveBlocksByProject(projectId: String): List<ChapterBlock>
+
+    suspend fun getActiveVersion(chapterId: String): ChapterVersion?
+    suspend fun getVersion(versionId: String): ChapterVersion?
+    suspend fun getVersions(chapterId: String): List<ChapterVersion>
+    suspend fun getVersionsByProject(projectId: String): List<ChapterVersion>
+
+    /**
+     * 建一个新的草稿版本并返回它。versionNumber 由已有版本自动递增。
+     * 只建行不改指针——新版本此刻对读者完全不可见。
+     */
+    suspend fun insertDraftVersion(
+        chapterId: String,
+        projectId: String,
+        title: String,
+        now: Long,
+    ): ChapterVersion
+
+    suspend fun updateVersionStatus(
+        versionId: String,
+        status: ChapterVersionStatus,
+        note: String = "",
+        now: Long,
+    )
+
+    /**
+     * 放弃一个还没发布的版本（核验失败 / 用户取消收尾）。
+     * 已经发布的版本一律不动——那会让整章正文从阅读器里消失。返回是否真的改了。
+     */
+    suspend fun abandonVersionIfPending(versionId: String, note: String, now: Long): Boolean
+
+    /**
+     * 原子切换：版本置 PUBLISHED、同章旧版本置 ABANDONED、章节 activeVersionId 指过来，
+     * 并同步章节的展示元数据。一个事务，要么全成要么全不成。
+     */
+    suspend fun publishVersionAtomically(version: ChapterVersion, carryOver: String, now: Long)
+
+    /** 导入备份用：整批写入版本行 */
+    suspend fun upsertVersions(versions: List<ChapterVersion>)
+    suspend fun clearVersionsForProject(projectId: String)
 }
 
 /** 故事总纲与滚动记忆（问题5）。一个项目一行。 */
@@ -133,9 +192,20 @@ interface StoryBibleRepository {
 interface QuizRepository {
     fun observeByChapter(chapterId: String): Flow<List<Quiz>>
     suspend fun getByChapter(chapterId: String): List<Quiz>
+
+    /**
+     * 只取当前正文版本的题（第三阶段 3A）。
+     * 旧版本的题留在库里但不显示——它们问的是已经被替换掉的情节。
+     */
+    fun observeActiveByChapter(chapterId: String): Flow<List<Quiz>>
+    suspend fun getActiveByChapter(chapterId: String): List<Quiz>
+
     suspend fun getByProject(projectId: String): List<Quiz>
     suspend fun upsertAll(quizzes: List<Quiz>)
     suspend fun deleteByChapter(chapterId: String)
+
+    /** 换掉某个版本的题，别的版本一律保留（第三阶段 3A） */
+    suspend fun deleteForVersion(chapterId: String, versionId: String)
     suspend fun recordAnswer(record: AnswerRecord)
     suspend fun countCorrect(quizId: String): Int
     /** 已有答题记录，用于恢复页面状态并保证幂等计分（N12） */

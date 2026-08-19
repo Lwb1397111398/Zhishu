@@ -815,6 +815,8 @@ private fun OutlineTab(
 ) {
     var editPlan by remember { mutableStateOf<ChapterPlan?>(null) }
     var showGenre by remember { mutableStateOf(false) }
+    // 重新生成失败的说明按章节取，绑在新版本上而不是覆盖当前正文的核验说明（3A）
+    val failedRegenerations by vm.failedRegenerations.collectAsState()
     // 进度按「正文可读」算，不因为缺自测题就少算一章
     val published = plans.count { it.isReadable }
     val needsAttention = plans.count { it.status == ChapterStatus.NEEDS_REVIEW }
@@ -888,6 +890,7 @@ private fun OutlineTab(
                 items(plans, key = { it.id }) { plan ->
                     ChapterPlanCard(
                         plan = plan,
+                        failedRegeneration = failedRegenerations[plan.id],
                         onEdit = { editPlan = plan },
                         onGenerate = { vm.enqueueChapter(plan.id) },
                         onRead = { onOpenReader(plan.id, null) },
@@ -1071,6 +1074,8 @@ internal val GENRE_OPTIONS = listOf(
 @Composable
 private fun ChapterPlanCard(
     plan: ChapterPlan,
+    /** 最近一次重新生成失败的说明。旧正文仍然可读，所以这条只是提示而不是错误状态（3A） */
+    failedRegeneration: String?,
     onEdit: () -> Unit,
     onGenerate: () -> Unit,
     onRead: () -> Unit,
@@ -1164,6 +1169,23 @@ private fun ChapterPlanCard(
                         plan.verificationNote,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.padding(8.dp),
+                    )
+                }
+            }
+            // 重新生成没成功时如实说一句：正文还是原来那一版（第三阶段 3A）。
+            // 用中性底色而不是错误红——这一章本身好着呢，只是新写的那一版没通过
+            if (!failedRegeneration.isNullOrBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        "上次重新生成没有通过，正文仍是此前那一版（可继续阅读）。\n$failedRegeneration",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(8.dp),
                     )
                 }

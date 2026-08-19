@@ -6,6 +6,8 @@ import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
+import com.example.zhishu.domain.model.ChapterVersion
+import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.ParseStatus
 import com.example.zhishu.domain.model.Project
@@ -31,6 +33,10 @@ import org.robolectric.annotation.Config
 class SearchTest {
 
     private lateinit var db: AppDatabase
+
+    private companion object {
+        const val VERSION_ID = "ch-1-v1"
+    }
 
     @Before
     fun setUp() {
@@ -122,6 +128,7 @@ class SearchTest {
             ChapterBlock(
                 id = "bulk-$index",
                 chapterId = "ch-1",
+                versionId = VERSION_ID,
                 projectId = "p-1",
                 order = index + 1,
                 text = "第${index}段：合同订立与履行的一般规则说明。",
@@ -130,6 +137,7 @@ class SearchTest {
         } + ChapterBlock(
             id = "needle",
             chapterId = "ch-1",
+            versionId = VERSION_ID,
             projectId = "p-1",
             order = 9999,
             text = "本段唯一提到表见代理的效力认定。",
@@ -152,11 +160,14 @@ class SearchTest {
         assertEquals(1, hits.count { it.kind == SearchHitKind.CHAPTER_BLOCK })
         assertEquals("needle", hits.first { it.kind == SearchHitKind.CHAPTER_BLOCK }.id)
 
-        // 查询计划应命中 FTS 虚拟表，而不是扫描 chapter_blocks
+        // 查询计划应命中 FTS 虚拟表，而不是扫描 chapter_blocks。
+        // 3A 之后多了一层 chapters 连接（只搜当前版本），仍然不能退化成全表扫描
         val plan = queryPlan(
             "SELECT chapter_blocks.* FROM chapter_block_fts " +
                 "JOIN chapter_blocks ON chapter_blocks.id = chapter_block_fts.blockId " +
+                "JOIN chapters ON chapters.id = chapter_blocks.chapterId " +
                 "WHERE chapter_block_fts.projectId = 'p-1' AND chapter_block_fts.body MATCH '\"表见 见代 代理\"' " +
+                "AND chapter_blocks.versionId = chapters.activeVersionId " +
                 "ORDER BY chapter_blocks.[order] LIMIT 50",
         )
         assertTrue("查询计划未使用 FTS：$plan", plan.contains("chapter_block_fts"))
@@ -223,13 +234,33 @@ class SearchTest {
             ),
         )
         db.chapterPlanDao().upsert(
-            ChapterPlan(id = "ch-1", projectId = "p-1", order = 1, title = "遗嘱风波"),
+            ChapterPlan(
+                id = "ch-1",
+                projectId = "p-1",
+                order = 1,
+                title = "遗嘱风波",
+                // 搜索只命中 active version 的正文，所以测试数据也得有版本指针（3A）
+                activeVersionId = VERSION_ID,
+            ),
+        )
+        db.chapterVersionDao().upsert(
+            ChapterVersion(
+                id = VERSION_ID,
+                chapterId = "ch-1",
+                projectId = "p-1",
+                versionNumber = 1,
+                status = ChapterVersionStatus.PUBLISHED,
+                title = "遗嘱风波",
+                createdAt = now,
+                updatedAt = now,
+            ),
         )
         db.chapterBlockDao().upsertAll(
             listOf(
                 ChapterBlock(
                     id = "b-1",
                     chapterId = "ch-1",
+                    versionId = VERSION_ID,
                     projectId = "p-1",
                     order = 0,
                     text = "老人立下遗嘱后，子女们为遗产分配争执不休。",

@@ -7,6 +7,10 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.core.app.ApplicationProvider
+import com.example.zhishu.domain.model.ChapterPlan
+import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.ChapterVersion
+import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.Quiz
 import com.example.zhishu.domain.model.QuizType
 import com.example.zhishu.ui.screens.QuizScreen
@@ -33,16 +37,42 @@ class QuizScreenTest {
     val composeRule = createComposeRule()
 
     private val chapterId = "ui-chapter"
+    private val versionId = "ui-chapter-v1"
 
     @Before
     fun seedQuiz() = runBlocking {
         val container = ApplicationProvider.getApplicationContext<ZhishuApp>().container
+        // 自测题按「章节 + 正文版本」取，所以章节行和版本行都要有（第三阶段 3A）
+        container.chapterRepository.upsertPlan(
+            ChapterPlan(
+                id = chapterId,
+                projectId = "ui-project",
+                order = 1,
+                title = "遗产的开始",
+                status = ChapterStatus.PUBLISHED,
+                activeVersionId = versionId,
+            ),
+        )
+        container.chapterRepository.upsertVersions(
+            listOf(
+                ChapterVersion(
+                    id = versionId,
+                    chapterId = chapterId,
+                    projectId = "ui-project",
+                    versionNumber = 1,
+                    status = ChapterVersionStatus.PUBLISHED,
+                    createdAt = 1L,
+                    updatedAt = 1L,
+                ),
+            ),
+        )
         container.quizRepository.upsertAll(
             listOf(
                 Quiz(
                     id = "ui-q1",
                     projectId = "ui-project",
                     chapterId = chapterId,
+                    versionId = versionId,
                     order = 0,
                     question = "继承从什么时候开始？",
                     type = QuizType.CASE,

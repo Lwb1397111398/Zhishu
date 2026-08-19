@@ -5,6 +5,8 @@ import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.ChapterVersion
+import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.ParseStatus
 import com.example.zhishu.domain.model.Project
@@ -26,6 +28,8 @@ object DemoSeeder {
 
     /** sourceRefs 保存的是片段 ID，与流水线约定一致（B19） */
     private const val CHUNK_ID = "demo-chunk-1"
+
+    private fun demoVersionId(chapterId: String) = "$chapterId-v1"
 
     suspend fun seed(container: AppContainer) {
         if (container.projectRepository.get(PROJECT_ID) != null) return
@@ -164,7 +168,26 @@ object DemoSeeder {
                 coveredTitles = listOf("法定继承", "遗产范围"),
             ),
         )
-        container.chapterRepository.upsertPlans(plans)
+        // 演示数据也走版本化（第三阶段 3A）：每章一个已发布版本，
+        // 章节指针指向它。否则阅读器按 activeVersionId 查不到任何正文
+        container.chapterRepository.upsertPlans(plans.map { it.copy(activeVersionId = demoVersionId(it.id)) })
+        container.chapterRepository.upsertVersions(
+            plans.map { plan ->
+                ChapterVersion(
+                    id = demoVersionId(plan.id),
+                    chapterId = plan.id,
+                    projectId = PROJECT_ID,
+                    versionNumber = 1,
+                    status = ChapterVersionStatus.PUBLISHED,
+                    title = plan.title,
+                    summary = plan.summary,
+                    endingState = plan.carryOver,
+                    coveredTitles = plan.coveredTitles,
+                    createdAt = now,
+                    updatedAt = now,
+                )
+            },
+        )
 
         val blocks = listOf(
             ChapterBlock(id = "c1b1", chapterId = "c1", projectId = PROJECT_ID, order = 0, blockType = BlockType.STORY,
@@ -198,7 +221,7 @@ object DemoSeeder {
                 text = "遗嘱因立嘱人无行为能力而无效，房子最终按法定继承处理。林晓和姑母的护工相视一笑——遗产从来不只是财产，更是一段被记住的关系。",
                 knowledgeNodeIds = listOf("n-legal", "n-estate")),
         )
-        container.chapterRepository.upsertBlocks(blocks)
+        container.chapterRepository.upsertBlocks(blocks.map { it.copy(versionId = demoVersionId(it.chapterId)) })
 
         container.quizRepository.upsertAll(
             listOf(
@@ -218,7 +241,7 @@ object DemoSeeder {
                     question = "第一顺序继承人存在时，第二顺序继承人能否继承？", type = QuizType.TRUE_FALSE,
                     options = listOf("能", "不能"),
                     answer = "不能", explanation = "继承开始后由第一顺序继承人继承，第二顺序不继承。", nodeIds = listOf("n-legal")),
-            ),
+            ).map { it.copy(versionId = demoVersionId(it.chapterId)) },
         )
 
         container.progressRepository.save(

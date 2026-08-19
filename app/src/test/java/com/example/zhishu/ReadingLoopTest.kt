@@ -9,6 +9,8 @@ import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.ChapterVersion
+import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.ProjectStatus
@@ -118,8 +120,8 @@ class ReadingLoopTest {
     @Test
     fun nodeAnchors_pointToFirstTaggedBlockOfEachWrittenChapter() = runBlocking {
         seed()
-        val chapterRepo = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao())
-        val blocksByChapter = chapterRepo.getBlocksByProject("p-1").groupBy { it.chapterId }
+        val chapterRepo = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao(), db.chapterVersionDao())
+        val blocksByChapter = chapterRepo.getActiveBlocksByProject("p-1").groupBy { it.chapterId }
 
         // ch-3 只有计划、没有正文，不该出现在锚点里
         assertEquals(setOf("ch-1", "ch-2"), blocksByChapter.keys)
@@ -179,8 +181,8 @@ class ReadingLoopTest {
     @Test
     fun blockIds_areUniqueWithinChapter() = runBlocking {
         seed()
-        val chapterRepo = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao())
-        val blocks = chapterRepo.getBlocks("ch-2")
+        val chapterRepo = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao(), db.chapterVersionDao())
+        val blocks = chapterRepo.getActiveBlocks("ch-2")
         assertTrue(blocks.isNotEmpty())
         assertEquals(blocks.size, blocks.map { it.id }.distinct().size)
     }
@@ -227,6 +229,7 @@ class ReadingLoopTest {
                     order = 1,
                     title = "深夜的律师函",
                     status = ChapterStatus.PUBLISHED,
+                    activeVersionId = "ch-1-v1",
                 ),
                 ChapterPlan(
                     id = "ch-2",
@@ -235,8 +238,9 @@ class ReadingLoopTest {
                     title = "尘封的遗嘱",
                     status = ChapterStatus.PUBLISHED,
                     nodeIds = listOf("n-will", "n-legal"),
+                    activeVersionId = "ch-2-v1",
                 ),
-                // 只有计划、还没写正文：不应产生跳转锚点
+                // 只有计划、还没写正文：不应产生跳转锚点，也没有 active version
                 ChapterPlan(
                     id = "ch-3",
                     projectId = "p-1",
@@ -247,11 +251,26 @@ class ReadingLoopTest {
                 ),
             ),
         )
+        // 阅读与搜索都只认 active version 的正文（3A）
+        db.chapterVersionDao().upsertAll(
+            listOf("ch-1", "ch-2").map { chapterId ->
+                ChapterVersion(
+                    id = "$chapterId-v1",
+                    chapterId = chapterId,
+                    projectId = "p-1",
+                    versionNumber = 1,
+                    status = ChapterVersionStatus.PUBLISHED,
+                    createdAt = 1L,
+                    updatedAt = 1L,
+                )
+            },
+        )
         db.chapterBlockDao().upsertAll(
             listOf(
                 ChapterBlock(
                     id = "b-1a",
                     chapterId = "ch-1",
+                    versionId = "ch-1-v1",
                     projectId = "p-1",
                     order = 0,
                     text = "深夜十一点，林晓收到一封律师函。",
@@ -260,6 +279,7 @@ class ReadingLoopTest {
                 ChapterBlock(
                     id = "b-2a",
                     chapterId = "ch-2",
+                    versionId = "ch-2-v1",
                     projectId = "p-1",
                     order = 0,
                     text = "旧皮箱夹层里有一封信，要把房子留给护工。",
@@ -269,6 +289,7 @@ class ReadingLoopTest {
                 ChapterBlock(
                     id = "b-2b",
                     chapterId = "ch-2",
+                    versionId = "ch-2-v1",
                     projectId = "p-1",
                     order = 1,
                     text = "姑母三年前就患上了阿尔茨海默病，这份遗嘱是否有效成了悬念。",

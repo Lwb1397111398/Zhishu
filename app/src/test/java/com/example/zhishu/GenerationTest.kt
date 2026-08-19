@@ -29,6 +29,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -68,7 +69,7 @@ class GenerationTest {
                 gapDao = db.knowledgeGapDao(),
                 conflictDao = db.knowledgeConflictDao(),
             ),
-            chapterRepository = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao()),
+            chapterRepository = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao(), db.chapterVersionDao()),
             storyBibleRepository = DefaultStoryBibleRepository(db.storyBibleDao()),
             quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
             reviewRepository = DefaultReviewRepository(db.reviewItemDao()),
@@ -294,17 +295,30 @@ class GenerationTest {
         assertEquals(ChapterStatus.FAILED, db.chapterPlanDao().getById(plan.id)?.status)
     }
 
-    /** 重复生成同一章不会叠加正文 */
+    /**
+     * 重复生成同一章不会叠加正文——阅读器里始终只有一版。
+     *
+     * 第三阶段 3A 起旧版本的块保留在库里（可追溯、可回查），
+     * 所以「不叠加」要按 active version 断言，而不是按 chapterId 数总数。
+     */
     @Test
-    fun regenerateChapter_replacesBlocks() = runBlocking {
+    fun regenerateChapter_replacesActiveBlocksAndKeepsOldVersion() = runBlocking {
         seedProjectWithChunk()
         pipeline.generateKnowledgeMap("p-1")
         pipeline.generateStoryBible("p-1")
         val plan = db.chapterPlanDao().getByProject("p-1").first()
         pipeline.generateChapter("p-1", plan.id)
-        val firstCount = db.chapterBlockDao().getByChapter(plan.id).size
+        val firstVersion = db.chapterPlanDao().getById(plan.id)?.activeVersionId
+        val firstCount = db.chapterBlockDao().getActiveBlocks(plan.id).size
+
         pipeline.generateChapter("p-1", plan.id)
-        assertEquals(firstCount, db.chapterBlockDao().getByChapter(plan.id).size)
+        // 读者看到的仍然只有一版正文
+        assertEquals(firstCount, db.chapterBlockDao().getActiveBlocks(plan.id).size)
+        // 指针换到了新版本，旧版本的正文块一个都没被删
+        val secondVersion = db.chapterPlanDao().getById(plan.id)?.activeVersionId
+        assertNotEquals(firstVersion, secondVersion)
+        assertEquals(firstCount * 2, db.chapterBlockDao().getByChapter(plan.id).size)
+        assertEquals(firstCount, db.chapterBlockDao().getByVersion(firstVersion.orEmpty()).size)
     }
 
     @Test

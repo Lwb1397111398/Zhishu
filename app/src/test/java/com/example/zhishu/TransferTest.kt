@@ -6,17 +6,23 @@ import com.example.zhishu.data.transfer.TransferManager
 import com.example.zhishu.di.AppContainer
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.ChapterVersion
+import com.example.zhishu.domain.model.ChapterVersionStatus
+import com.example.zhishu.domain.model.ModelConfig
+import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.ui.viewmodel.DemoSeeder
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -192,6 +198,177 @@ class TransferTest {
             zip.closeEntry()
         }
         assertFalse(transfer.import(app, Uri.fromFile(file)).isSuccess)
+    }
+
+    /**
+     * 版本化数据的往返（第三阶段 3A）：
+     * 版本行、每块的 versionId、章节的 activeVersionId 三者关系恢复后必须自洽。
+     */
+    @Test
+    fun exportThenImport_roundTripsChapterVersions() = runBlocking {
+        DemoSeeder.seed(container)
+        val projectId = firstProjectId()
+        // 造一个「有历史版本」的章节：c1 多一版作废正文
+        container.chapterRepository.upsertVersions(
+            listOf(
+                ChapterVersion(
+                    id = "c1-v0",
+                    chapterId = "c1",
+                    projectId = projectId,
+                    versionNumber = 0,
+                    status = ChapterVersionStatus.ABANDONED,
+                    title = "旧版",
+                    createdAt = 1L,
+                    updatedAt = 1L,
+                ),
+            ),
+        )
+        container.chapterRepository.upsertBlocks(
+            listOf(
+                ChapterBlock(
+                    id = "c1-v0-b1",
+                    chapterId = "c1",
+                    versionId = "c1-v0",
+                    projectId = projectId,
+                    order = 0,
+                    text = "被替换掉的第一版正文",
+                ),
+            ),
+        )
+        val activeBefore = container.chapterRepository.getPlan("c1")?.activeVersionId
+
+        val file = File(workDir, "versions.zip")
+        val uri = Uri.fromFile(file)
+        assertTrue(transfer.export(app, uri).isSuccess)
+        assertTrue(transfer.import(app, uri).isSuccess)
+
+        // 两个版本都回来了，指针还是原来那个
+        val versions = container.chapterRepository.getVersions("c1")
+        assertEquals(2, versions.size)
+        assertEquals(activeBefore, container.chapterRepository.getPlan("c1")?.activeVersionId)
+        // 导入不会把旧版本正文当成当前正文
+        val active = container.chapterRepository.getActiveBlocks("c1")
+        assertTrue(active.none { it.id == "c1-v0-b1" })
+        assertTrue(active.all { it.versionId == activeBefore })
+        // 旧版本的正文块也没丢
+        assertEquals(1, container.chapterRepository.getBlocksByVersion("c1-v0").size)
+        // 自测题绑定的是当前版本
+        assertTrue(container.quizRepository.getActiveByChapter("c1").isNotEmpty())
+    }
+
+    /**
+     * 旧备份（formatVersion 3，完全没有版本概念）仍然可以导入：
+     * 每章补一个初始版本，正文可读的章节指针补上，正文一块不丢。
+     */
+    @Test
+    fun import_legacyBackupWithoutVersions_buildsInitialVersions() = runBlocking {
+        val file = File(workDir, "legacy.zip")
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun put(name: String, body: String) {
+                zip.putNextEntry(ZipEntry(name))
+                zip.write(body.toByteArray())
+                zip.closeEntry()
+            }
+            put("manifest.json", """{"app":"zhishu","formatVersion":3,"exportedAt":0,"projects":1}""")
+            put(
+                "projects.json",
+                """[{"id":"legacy-p","title":"旧档","topic":"t","baseline":"b","depth":"d",""" +
+                    """"dailyMinutes":10,"targetDays":7,"genre":"悬疑","status":"READY","createdAt":1,"updatedAt":1}]""",
+            )
+            put(
+                "chapters.json",
+                """[{"id":"lc-1","projectId":"legacy-p","order":1,"title":"第一章","status":"PUBLISHED",""" +
+                    """"summary":"摘要","carryOver":"结尾留了个悬念"},""" +
+                    """{"id":"lc-2","projectId":"legacy-p","order":2,"title":"第二章","status":"QUEUED",""" +
+                    """"carryOver":"开场钩子"}]""",
+            )
+            put(
+                "blocks.json",
+                """[{"id":"lb-1","chapterId":"lc-1","order":0,"text":"旧备份里的正文","blockType":"STORY"}]""",
+            )
+            put(
+                "quizzes.json",
+                """[{"id":"lq-1","projectId":"legacy-p","chapterId":"lc-1","order":0,"question":"问？",""" +
+                    """"type":"TRUE_FALSE","options":["对","错"],"answer":"对"}]""",
+            )
+        }
+        assertTrue(transfer.import(app, Uri.fromFile(file)).isSuccess)
+
+        // 已发布章节：补出的初始版本是 PUBLISHED，指针指上，正文立刻能读
+        val published = container.chapterRepository.getPlan("lc-1")
+        assertEquals("lc-1-v1", published?.activeVersionId)
+        assertEquals(
+            ChapterVersionStatus.PUBLISHED,
+            container.chapterRepository.getVersion("lc-1-v1")?.status,
+        )
+        // 已发布章节的 carryOver 是结尾状态，可以搬进版本
+        assertEquals("结尾留了个悬念", container.chapterRepository.getVersion("lc-1-v1")?.endingState)
+        val active = container.chapterRepository.getActiveBlocks("lc-1")
+        assertEquals(1, active.size)
+        assertEquals("lb-1", active.first().id)
+        assertEquals("lc-1-v1", active.first().versionId)
+        // 旧题也绑到了初始版本，不会跟着以后的新正文显示
+        assertEquals(1, container.quizRepository.getActiveByChapter("lc-1").size)
+        assertEquals("lc-1-v1", container.quizRepository.getByChapter("lc-1").first().versionId)
+
+        // 没发布的章节：版本是草稿、指针留空，carryOver 不当成结尾状态
+        val queued = container.chapterRepository.getPlan("lc-2")
+        assertNull(queued?.activeVersionId)
+        val draft = container.chapterRepository.getVersion("lc-2-v1")
+        assertEquals(ChapterVersionStatus.DRAFT, draft?.status)
+        assertEquals("", draft?.endingState)
+    }
+
+    /** 备份里从来不含 API Key，版本化之后也一样 */
+    @Test
+    fun export_neverContainsApiKey() = runBlocking {
+        DemoSeeder.seed(container)
+        container.settingsRepository.saveConfig(
+            ModelConfig(
+                role = ModelRole.STORY.name,
+                baseUrl = "https://example.com/v1",
+                modelName = "test-model",
+                keyRef = "enc:super-secret-key",
+            ),
+        )
+        val file = File(workDir, "nokey.zip")
+        assertTrue(transfer.export(app, Uri.fromFile(file)).isSuccess)
+
+        val names = mutableListOf<String>()
+        val text = StringBuilder()
+        ZipInputStream(file.inputStream()).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                names += entry.name
+                text.append(zip.readBytes().toString(Charsets.UTF_8))
+                zip.closeEntry()
+                entry = zip.nextEntry
+            }
+        }
+        assertTrue("chapter_versions.json" in names)
+        assertTrue(names.none { it.contains("model") || it.contains("config") })
+        assertFalse(text.contains("super-secret-key"))
+        assertFalse(text.contains("keyRef"))
+    }
+
+    /** formatVersion 必须递增，且旧版本仍然读得进来 */
+    @Test
+    fun manifest_declaresVersionFour() = runBlocking {
+        DemoSeeder.seed(container)
+        val file = File(workDir, "manifest.zip")
+        assertTrue(transfer.export(app, Uri.fromFile(file)).isSuccess)
+        assertEquals(4, TransferManager.FORMAT_VERSION)
+
+        var manifest = ""
+        ZipInputStream(file.inputStream()).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                if (entry.name == "manifest.json") manifest = zip.readBytes().toString(Charsets.UTF_8)
+                zip.closeEntry()
+                entry = zip.nextEntry
+            }
+        }
+        assertTrue(manifest.contains("\"formatVersion\": 4"))
     }
 
     private suspend fun firstProjectId(): String =

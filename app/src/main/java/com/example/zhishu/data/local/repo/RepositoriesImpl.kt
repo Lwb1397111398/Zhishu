@@ -3,6 +3,7 @@ package com.example.zhishu.data.local.repo
 import com.example.zhishu.data.local.dao.AnswerRecordDao
 import com.example.zhishu.data.local.dao.ChapterBlockDao
 import com.example.zhishu.data.local.dao.ChapterPlanDao
+import com.example.zhishu.data.local.dao.ChapterVersionDao
 import com.example.zhishu.data.local.dao.KnowledgeConflictDao
 import com.example.zhishu.data.local.dao.KnowledgeGapDao
 import com.example.zhishu.data.local.dao.KnowledgeNodeDao
@@ -18,6 +19,8 @@ import com.example.zhishu.domain.model.AnswerRecord
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.ChapterVersion
+import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
@@ -146,6 +149,7 @@ class DefaultKnowledgeRepository(
 class DefaultChapterRepository(
     private val planDao: ChapterPlanDao,
     private val blockDao: ChapterBlockDao,
+    private val versionDao: ChapterVersionDao,
 ) : ChapterRepository {
     override fun observePlans(projectId: String): Flow<List<ChapterPlan>> =
         planDao.observeByProject(projectId)
@@ -213,6 +217,91 @@ class DefaultChapterRepository(
     override suspend fun countBlocks(projectId: String): Int = blockDao.countByProject(projectId)
 
     override suspend fun upsertBlocks(blocks: List<ChapterBlock>) = blockDao.upsertAll(blocks)
+
+    // --- 正文版本化（第三阶段 3A）---
+
+    override fun observeActiveBlocks(chapterId: String): Flow<List<ChapterBlock>> =
+        blockDao.observeActiveBlocks(chapterId)
+
+    override suspend fun getActiveBlocks(chapterId: String): List<ChapterBlock> =
+        blockDao.getActiveBlocks(chapterId)
+
+    override suspend fun getBlocksByVersion(versionId: String): List<ChapterBlock> =
+        blockDao.getByVersion(versionId)
+
+    override suspend fun getActiveBlocksByProject(projectId: String): List<ChapterBlock> =
+        blockDao.getActiveBlocksByProject(projectId)
+
+    override suspend fun getActiveVersion(chapterId: String): ChapterVersion? =
+        versionDao.getActive(chapterId)
+
+    override suspend fun getVersion(versionId: String): ChapterVersion? = versionDao.getById(versionId)
+
+    override suspend fun getVersions(chapterId: String): List<ChapterVersion> =
+        versionDao.getByChapter(chapterId)
+
+    override suspend fun getVersionsByProject(projectId: String): List<ChapterVersion> =
+        versionDao.getByProject(projectId)
+
+    override suspend fun insertDraftVersion(
+        chapterId: String,
+        projectId: String,
+        title: String,
+        now: Long,
+    ): ChapterVersion {
+        val next = versionDao.maxVersionNumber(chapterId) + 1
+        val version = ChapterVersion(
+            id = "$chapterId-v$next",
+            chapterId = chapterId,
+            projectId = projectId,
+            versionNumber = next,
+            status = ChapterVersionStatus.DRAFT,
+            title = title,
+            createdAt = now,
+            updatedAt = now,
+        )
+        versionDao.upsert(version)
+        return version
+    }
+
+    override suspend fun updateVersionStatus(
+        versionId: String,
+        status: ChapterVersionStatus,
+        note: String,
+        now: Long,
+    ) = versionDao.updateStatus(versionId, status, note, now)
+
+    override suspend fun abandonVersionIfPending(
+        versionId: String,
+        note: String,
+        now: Long,
+    ): Boolean = versionDao.updateStatusIfIn(
+        id = versionId,
+        status = ChapterVersionStatus.ABANDONED,
+        note = note,
+        updatedAt = now,
+        onlyIf = PENDING_VERSION_STATUSES,
+    ) > 0
+
+    override suspend fun publishVersionAtomically(
+        version: ChapterVersion,
+        carryOver: String,
+        now: Long,
+    ) = versionDao.publishVersion(version, carryOver, now)
+
+    override suspend fun upsertVersions(versions: List<ChapterVersion>) =
+        versionDao.upsertAll(versions)
+
+    override suspend fun clearVersionsForProject(projectId: String) =
+        versionDao.deleteByProject(projectId)
+
+    private companion object {
+        /** 还没发布的版本状态。取消与核验失败收尾只动这些。 */
+        val PENDING_VERSION_STATUSES = listOf(
+            ChapterVersionStatus.DRAFT,
+            ChapterVersionStatus.VERIFYING,
+        )
+    }
 }
 
 class DefaultStoryBibleRepository(private val dao: StoryBibleDao) : StoryBibleRepository {
@@ -240,11 +329,20 @@ class DefaultQuizRepository(
 
     override suspend fun getByChapter(chapterId: String): List<Quiz> = quizDao.getByChapter(chapterId)
 
+    override fun observeActiveByChapter(chapterId: String): Flow<List<Quiz>> =
+        quizDao.observeActiveByChapter(chapterId)
+
+    override suspend fun getActiveByChapter(chapterId: String): List<Quiz> =
+        quizDao.getActiveByChapter(chapterId)
+
     override suspend fun getByProject(projectId: String): List<Quiz> =
         quizDao.getByProject(projectId)
 
     override suspend fun upsertAll(quizzes: List<Quiz>) = quizDao.upsertAll(quizzes)
     override suspend fun deleteByChapter(chapterId: String) = quizDao.deleteByChapter(chapterId)
+
+    override suspend fun deleteForVersion(chapterId: String, versionId: String) =
+        quizDao.deleteForVersion(chapterId, versionId)
     override suspend fun recordAnswer(record: AnswerRecord) = answerDao.upsert(record)
     override suspend fun countCorrect(quizId: String): Int = answerDao.countCorrect(quizId)
 

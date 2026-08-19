@@ -10,6 +10,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import com.example.zhishu.data.local.dao.AnswerRecordDao
 import com.example.zhishu.data.local.dao.ChapterBlockDao
 import com.example.zhishu.data.local.dao.ChapterPlanDao
+import com.example.zhishu.data.local.dao.ChapterVersionDao
 import com.example.zhishu.data.local.dao.KnowledgeConflictDao
 import com.example.zhishu.data.local.dao.KnowledgeGapDao
 import com.example.zhishu.data.local.dao.KnowledgeNodeDao
@@ -25,6 +26,7 @@ import com.example.zhishu.domain.model.AnswerRecord
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterBlockFts
 import com.example.zhishu.domain.model.ChapterPlan
+import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
@@ -49,6 +51,7 @@ import com.example.zhishu.search.SearchTokenizer
         KnowledgeGap::class,
         KnowledgeConflict::class,
         ChapterPlan::class,
+        ChapterVersion::class,
         ChapterBlock::class,
         ChapterBlockFts::class,
         Quiz::class,
@@ -58,7 +61,7 @@ import com.example.zhishu.search.SearchTokenizer
         ModelConfig::class,
         StoryBible::class,
     ],
-    version = 5,
+    version = 6,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -70,6 +73,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun knowledgeGapDao(): KnowledgeGapDao
     abstract fun knowledgeConflictDao(): KnowledgeConflictDao
     abstract fun chapterPlanDao(): ChapterPlanDao
+    abstract fun chapterVersionDao(): ChapterVersionDao
     abstract fun chapterBlockDao(): ChapterBlockDao
     abstract fun quizDao(): QuizDao
     abstract fun answerRecordDao(): AnswerRecordDao
@@ -261,9 +265,93 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v5 → v6：正文版本化（第三阶段 3A）。
+         *
+         * 第二阶段留下的最大风险是重生成会**就地覆盖**已发布正文：清旧块、写新块，
+         * 随后核验不过或用户取消，旧正文就再也回不来了。现在每次生成写一个独立版本，
+         * 只有核验通过才把 chapters.activeVersionId 指过去。
+         *
+         * 本次迁移做四件事，一个字的正文都不删：
+         *
+         * 1. 建 chapter_versions 表；
+         * 2. 为**每个**现有章节建一个初始版本 v1（id 用 `章节id-v1`，可追溯、不需要随机数）；
+         * 3. 现有正文块、自测题全部绑定到这个初始版本；
+         * 4. 正文可读的章节把 activeVersionId 指向 v1，未发布的章节留 NULL。
+         *
+         * 初始版本的 endingState 只在章节可读时才从 carryOver 复制：未发布章节的 carryOver
+         * 装的是「开头钩子」而不是「结尾状态」（这个双重语义由 3B 彻底拆掉），
+         * 现在先别把开头钩子错当成结尾状态搬进版本表。
+         */
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `chapter_versions` (" +
+                        "`id` TEXT NOT NULL, `chapterId` TEXT NOT NULL, " +
+                        "`projectId` TEXT NOT NULL DEFAULT '', `versionNumber` INTEGER NOT NULL, " +
+                        "`status` TEXT NOT NULL, `title` TEXT NOT NULL, `summary` TEXT NOT NULL, " +
+                        "`endingState` TEXT NOT NULL, `coveredTitles` TEXT NOT NULL, " +
+                        "`unverifiedClaims` TEXT NOT NULL, `verificationNote` TEXT NOT NULL, " +
+                        "`createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`id`))",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chapter_versions_chapterId` " +
+                        "ON `chapter_versions` (`chapterId`)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chapter_versions_chapterId_status` " +
+                        "ON `chapter_versions` (`chapterId`, `status`)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chapter_versions_projectId` " +
+                        "ON `chapter_versions` (`projectId`)",
+                )
+
+                db.execSQL("ALTER TABLE chapters ADD COLUMN activeVersionId TEXT")
+                db.execSQL("ALTER TABLE chapter_blocks ADD COLUMN versionId TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE quizzes ADD COLUMN versionId TEXT NOT NULL DEFAULT ''")
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_chapter_blocks_versionId` " +
+                        "ON `chapter_blocks` (`versionId`)",
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_quizzes_versionId` ON `quizzes` (`versionId`)")
+
+                // 每章一个初始版本。章节状态映射到版本状态：正文可读的算 PUBLISHED，
+                // 卡在核验的算 VERIFYING，其余（含还没生成的 QUEUED）都算 DRAFT。
+                val now = System.currentTimeMillis()
+                db.execSQL(
+                    "INSERT INTO chapter_versions (" +
+                        "id, chapterId, projectId, versionNumber, status, title, summary, endingState, " +
+                        "coveredTitles, unverifiedClaims, verificationNote, createdAt, updatedAt) " +
+                        "SELECT id || '$INITIAL_VERSION_SUFFIX', id, projectId, 1, " +
+                        "CASE WHEN status IN ('PUBLISHED', 'QUIZ_FAILED') THEN 'PUBLISHED' " +
+                        "WHEN status = 'VERIFYING' THEN 'VERIFYING' ELSE 'DRAFT' END, " +
+                        "title, summary, " +
+                        "CASE WHEN status IN ('PUBLISHED', 'QUIZ_FAILED') THEN carryOver ELSE '' END, " +
+                        "coveredTitles, unverifiedClaims, verificationNote, ?, ? FROM chapters",
+                    arrayOf(now, now),
+                )
+
+                // 现有正文与自测题都属于这个初始版本
+                db.execSQL("UPDATE chapter_blocks SET versionId = chapterId || '$INITIAL_VERSION_SUFFIX'")
+                db.execSQL("UPDATE quizzes SET versionId = chapterId || '$INITIAL_VERSION_SUFFIX'")
+
+                // 只有正文可读的章节才有 active version；未发布的留 NULL，
+                // 否则阅读器会打开一段还没过核验的正文
+                db.execSQL(
+                    "UPDATE chapters SET activeVersionId = id || '$INITIAL_VERSION_SUFFIX' " +
+                        "WHERE status IN ('PUBLISHED', 'QUIZ_FAILED')",
+                )
+            }
+        }
+
+        /** 迁移出来的初始版本 ID 后缀。测试与导入兼容逻辑共用同一个约定。 */
+        const val INITIAL_VERSION_SUFFIX = "-v1"
+
         fun build(context: Context): AppDatabase =
             Room.databaseBuilder(context.applicationContext, AppDatabase::class.java, DATABASE_NAME)
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                 .build()
     }
 }

@@ -26,6 +26,14 @@ internal class ScriptedRouter : ModelRouter {
     /** 记录实际被调用过的阶段，用来断言「测验重试没有再生成正文」 */
     val calls = mutableListOf<Phase>()
 
+    /**
+     * 每个阶段开始前的观察点（第三阶段 3A）。
+     *
+     * 用来断言「重生成期间章节不会短暂变得不可读」——这种时序性质只能在生成还没结束时看，
+     * 生成完再查库是看不出来的。
+     */
+    var onPhase: (suspend (Phase) -> Unit)? = null
+
     enum class Phase { MAP, BIBLE, CHAPTER, VERIFY, QUIZ }
 
     var chapterJson: String =
@@ -56,6 +64,7 @@ internal class ScriptedRouter : ModelRouter {
             else -> error("没有匹配的测试数据: ${request.user.take(40)}")
         }
         calls += phase
+        onPhase?.invoke(phase)
         if (phase == cancelAt) throw CancellationException("用户取消")
         if (phase == failAt) return Result.failure(failWith)
 

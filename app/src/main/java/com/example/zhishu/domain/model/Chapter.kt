@@ -96,6 +96,14 @@ data class ChapterPlan(
     /** 出题失败原因，给「重新生成自测」按钮旁边显示 */
     @ColumnInfo(defaultValue = "")
     val quizNote: String = "",
+    /**
+     * 当前对读者生效的正文版本（第三阶段 3A）。
+     *
+     * 阅读、搜索、知识点跳转一律走这个指针，而不是按 chapterId 直接捞全部正文块——
+     * 否则重生成过的章节会把新旧两版正文混在一起显示。
+     * 为 null 表示这一章还没有任何通过核验的正文。
+     */
+    val activeVersionId: String? = null,
 ) {
     /** 正文是否已可阅读。测验状态一概不参与判断。 */
     val isReadable: Boolean get() = status.isReadable
@@ -116,11 +124,19 @@ enum class BlockType {
 @Serializable
 @Entity(
     tableName = "chapter_blocks",
-    indices = [Index("chapterId"), Index("projectId")],
+    indices = [Index("chapterId"), Index("projectId"), Index("versionId")],
 )
 data class ChapterBlock(
     @PrimaryKey val id: String,
     val chapterId: String,
+    /**
+     * 这一块属于哪个正文版本（第三阶段 3A）。
+     *
+     * chapterId 保留是为了「删章节连带删正文」这类按章操作仍然直接可用，
+     * 但**读取正文一律按 versionId**：一章可能有好几版正文，
+     * 按 chapterId 捞出来的是全部历史，不是当前正文。
+     */
+    @ColumnInfo(defaultValue = "") val versionId: String = "",
     /** 冗余保存项目 ID，使删除项目时可直接清理正文（N6） */
     @ColumnInfo(defaultValue = "") val projectId: String = "",
     val order: Int,

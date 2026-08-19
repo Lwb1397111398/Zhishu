@@ -44,9 +44,46 @@ interface ChapterBlockDao {
     @Query("SELECT * FROM chapter_blocks WHERE chapterId = :chapterId ORDER BY [order]")
     suspend fun getByChapter(chapterId: String): List<ChapterBlock>
 
+    // --- 当前版本正文（第三阶段 3A）---
+    //
+    // 阅读器、知识点跳转、搜索一律走这几条。按 chapterId 直接查出来的是**全部历史版本**，
+    // 重生成过的章节会把两版正文叠在一起显示，所以那几条只留给按章清理和导出用。
+
+    @Query(
+        "SELECT chapter_blocks.* FROM chapter_blocks " +
+            "JOIN chapters ON chapters.id = chapter_blocks.chapterId " +
+            "WHERE chapter_blocks.chapterId = :chapterId " +
+            "AND chapter_blocks.versionId = chapters.activeVersionId " +
+            "ORDER BY chapter_blocks.[order]",
+    )
+    fun observeActiveBlocks(chapterId: String): Flow<List<ChapterBlock>>
+
+    @Query(
+        "SELECT chapter_blocks.* FROM chapter_blocks " +
+            "JOIN chapters ON chapters.id = chapter_blocks.chapterId " +
+            "WHERE chapter_blocks.chapterId = :chapterId " +
+            "AND chapter_blocks.versionId = chapters.activeVersionId " +
+            "ORDER BY chapter_blocks.[order]",
+    )
+    suspend fun getActiveBlocks(chapterId: String): List<ChapterBlock>
+
+    /** 某个版本的正文，与章节当前指针无关。核验新版本、导出历史时用 */
+    @Query("SELECT * FROM chapter_blocks WHERE versionId = :versionId ORDER BY [order]")
+    suspend fun getByVersion(versionId: String): List<ChapterBlock>
+
     /** 全项目正文，用于建立「知识点 → 所属章节的哪一块」的跳转锚点 */
     @Query("SELECT * FROM chapter_blocks WHERE projectId = :projectId ORDER BY chapterId, [order]")
     suspend fun getByProject(projectId: String): List<ChapterBlock>
+
+    /** 全项目当前版本正文。跳转锚点只能落在读者真的看得到的那一版上 */
+    @Query(
+        "SELECT chapter_blocks.* FROM chapter_blocks " +
+            "JOIN chapters ON chapters.id = chapter_blocks.chapterId " +
+            "WHERE chapter_blocks.projectId = :projectId " +
+            "AND chapter_blocks.versionId = chapters.activeVersionId " +
+            "ORDER BY chapter_blocks.chapterId, chapter_blocks.[order]",
+    )
+    suspend fun getActiveBlocksByProject(projectId: String): List<ChapterBlock>
 
     @Transaction
     suspend fun deleteByChapter(chapterId: String) {
@@ -84,6 +121,22 @@ interface ChapterBlockDao {
             "ORDER BY chapter_blocks.[order] LIMIT 50",
     )
     suspend fun searchByProjectMatch(projectId: String, match: String): List<ChapterBlock>
+
+    /**
+     * 只搜当前版本正文（第三阶段 3A）。
+     *
+     * 被放弃的版本仍留在 FTS 索引里（正文块一个都不删），靠这里的 versionId 条件过滤掉——
+     * 否则搜索会命中一段读者已经看不到的旧正文，点进去还落不到任何位置。
+     */
+    @Query(
+        "SELECT chapter_blocks.* FROM chapter_block_fts " +
+            "JOIN chapter_blocks ON chapter_blocks.id = chapter_block_fts.blockId " +
+            "JOIN chapters ON chapters.id = chapter_blocks.chapterId " +
+            "WHERE chapter_block_fts.projectId = :projectId AND chapter_block_fts.body MATCH :match " +
+            "AND chapter_blocks.versionId = chapters.activeVersionId " +
+            "ORDER BY chapter_blocks.[order] LIMIT 50",
+    )
+    suspend fun searchActiveByProjectMatch(projectId: String, match: String): List<ChapterBlock>
 
     @Query("SELECT COUNT(*) FROM chapter_blocks WHERE projectId = :projectId")
     suspend fun countByProject(projectId: String): Int
