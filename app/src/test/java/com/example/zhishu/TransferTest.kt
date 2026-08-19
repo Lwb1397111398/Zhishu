@@ -353,11 +353,11 @@ class TransferTest {
 
     /** formatVersion 必须递增，且旧版本仍然读得进来 */
     @Test
-    fun manifest_declaresVersionFour() = runBlocking {
+    fun manifest_declaresCurrentFormatVersion() = runBlocking {
         DemoSeeder.seed(container)
         val file = File(workDir, "manifest.zip")
         assertTrue(transfer.export(app, Uri.fromFile(file)).isSuccess)
-        assertEquals(4, TransferManager.FORMAT_VERSION)
+        assertEquals(5, TransferManager.FORMAT_VERSION)
 
         var manifest = ""
         ZipInputStream(file.inputStream()).use { zip ->
@@ -368,7 +368,33 @@ class TransferTest {
                 entry = zip.nextEntry
             }
         }
-        assertTrue(manifest.contains("\"formatVersion\": 4"))
+        assertTrue(manifest.contains("\"formatVersion\": 5"))
+    }
+
+    /** 分卷字段能导出也能恢复（第三阶段 3C） */
+    @Test
+    fun exportThenImport_roundTripsVolumeFields() = runBlocking {
+        DemoSeeder.seed(container)
+        val projectId = firstProjectId()
+        // 把 c3 挪到第二卷，并记下卷信息
+        val c3 = container.chapterRepository.getPlan("c3")!!
+        container.chapterRepository.upsertPlan(
+            c3.copy(volumeIndex = 1, volumeTitle = "第二卷", volumeGoal = "讲清法定继承"),
+        )
+        container.storyBibleRepository.save(
+            container.storyBibleRepository.get(projectId)!!.copy(currentVolumeIndex = 1),
+        )
+
+        val file = File(workDir, "volumes.zip")
+        assertTrue(transfer.export(app, Uri.fromFile(file)).isSuccess)
+        assertTrue(transfer.import(app, Uri.fromFile(file)).isSuccess)
+
+        val restored = container.chapterRepository.getPlan("c3")
+        assertEquals(1, restored?.volumeIndex)
+        assertEquals("第二卷", restored?.volumeTitle)
+        assertEquals("讲清法定继承", restored?.volumeGoal)
+        assertEquals(0, container.chapterRepository.getPlan("c1")?.volumeIndex)
+        assertEquals(1, container.storyBibleRepository.get(projectId)?.currentVolumeIndex)
     }
 
     private suspend fun firstProjectId(): String =

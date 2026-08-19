@@ -6,7 +6,9 @@ import com.example.zhishu.ai.ModelRouter
 import com.example.zhishu.ai.PromptProvider
 import com.example.zhishu.ai.jsonDecoder
 import com.example.zhishu.ai.outputs.ChapterOutput
+import com.example.zhishu.ai.outputs.ChapterPlanDto
 import com.example.zhishu.ai.outputs.KnowledgeMapOutput
+import com.example.zhishu.ai.outputs.NextVolumeOutput
 import com.example.zhishu.ai.outputs.OutputValidators
 import com.example.zhishu.ai.outputs.QuizSetOutput
 import com.example.zhishu.ai.outputs.StoryBibleOutput
@@ -140,8 +142,25 @@ class PipelineService(
         val nodes = knowledgeRepository.getByProject(projectId)
         if (nodes.isEmpty()) return Result.failure(IllegalStateException("知识地图为空"))
 
-        val existing = storyBibleRepository.get(projectId)
-        // 章数按知识点规模推荐：一章承载一整条演进链，宁少而厚（问题7）
+        // 已经有可读正文时不允许整本重新规划（第三阶段 3C）。
+        //
+        // 原来这里直接 clearBlocksForProject + clearPlansForProject，
+        // 用户在知识地图页点一下「重新生成」就把读过的章节全删了。
+        // 已发布内容不会因为重新规划而丢失——这是第三阶段的底线，
+        // 所以这条路直接堵死，改由「继续下一卷」往后接。
+        val existing = chapterRepository.getPlans(projectId)
+        if (existing.any { it.isReadable }) {
+            return Result.failure(
+                IllegalStateException(
+                    "这个项目已经有写好的章节了，不能整本重新规划（那会删掉你读过的内容）。" +
+                        "想往后讲就用「继续下一卷」。",
+                ),
+            )
+        }
+
+        val bible = storyBibleRepository.get(projectId)
+        // 首次只规划一卷。让模型一次想出整个主题的所有章节，越往后越糊，
+        // 而且用户根本还没读到那儿（3C）
         val suggested = suggestChapterCount(nodes.size)
 
         val prompt = prompts.load(PROMPT_STORY_BIBLE)
@@ -149,10 +168,10 @@ class PipelineService(
             .replace("{topic}", project.topic)
             .replace("{goal}", project.title)
             .replace("{baseline}", project.baseline)
-            .replace("{chapterHint}", "$suggested 章左右（可在 ${suggested - 1}-${suggested + 2} 之间调整）")
+            .replace("{chapterHint}", "$suggested 章左右（不要超过 $VOLUME_MAX_CHAPTERS 章）")
             .replace("{wordHint}", "${project.wordTargetPerChapter}")
             .replace("{nodes}", formatNodesWithDerivation(nodes))
-            .replace("{chains}", formatChains(existing?.throughLine.orEmpty()))
+            .replace("{chains}", formatChains(bible?.throughLine.orEmpty()))
 
         val raw = router.generate(
             role = ModelRole.STORY,
@@ -184,11 +203,17 @@ class PipelineService(
                 // 开头钩子存进它自己的列。规划期与发布期不再共用一列（3B）
                 openingHook = chapter.openingHook,
                 coveredTitles = emptyList(),
+                // 首次规划出来的都是第一卷（3C）
+                volumeIndex = FIRST_VOLUME,
+                volumeTitle = "第一卷",
+                volumeGoal = output.conflict,
             )
-        }
+            // 卷内章数硬上限：模型多给了也只收前 VOLUME_MAX_CHAPTERS 章，
+            // 剩下的知识点留给续卷，而不是一次摊平
+        }.take(VOLUME_MAX_CHAPTERS)
 
-        // TODO(3C)：这里清空已发布正文的行为要改成「只重新规划还没开始的部分」。
-        // 版本行必须一起清，否则会留下指向已删章节的孤儿版本
+        // 这里没有已发布章节（上面已经拦过），清理是安全的：
+        // 清掉的只是上一次规划出来、还一个字都没写的章节计划
         chapterRepository.clearVersionsForProject(projectId)
         chapterRepository.clearBlocksForProject(projectId)
         chapterRepository.clearPlansForProject(projectId)
@@ -209,6 +234,7 @@ class PipelineService(
                 runningState = "",
                 coveredTitles = emptyList(),
                 openThreads = emptyList(),
+                currentVolumeIndex = FIRST_VOLUME,
                 updatedAt = clock(),
             ),
         )
@@ -223,9 +249,158 @@ class PipelineService(
         return Result.success(Unit)
     }
 
-    /** 一章承载一整条演进链，所以章数远少于知识点数（问题7） */
+    /**
+     * 一卷内的章数。一章承载一整条演进链，所以章数远少于知识点数（问题7）；
+     * 上限是「一次规划的量」而不是「全书上限」——后续内容由续卷接（3C）。
+     */
     internal fun suggestChapterCount(nodeCount: Int): Int =
-        (nodeCount / NODES_PER_CHAPTER).coerceIn(MIN_CHAPTERS, MAX_CHAPTERS)
+        (nodeCount / NODES_PER_CHAPTER).coerceIn(VOLUME_MIN_CHAPTERS, VOLUME_MAX_CHAPTERS)
+
+    /**
+     * 能不能规划下一卷（第三阶段 3C）。
+     *
+     * 两个条件：当前卷全部可读了，而且知识地图里还有没讲到的节点。
+     * 当前卷没写完就续卷会打乱故事顺序——读者还没读到那儿，
+     * 而新卷的开场必须接上「上一章的结尾」，那个结尾此刻还不存在。
+     */
+    suspend fun nextVolumeAvailability(projectId: String): NextVolumeAvailability {
+        val plans = chapterRepository.getPlans(projectId)
+        if (plans.isEmpty()) return NextVolumeAvailability.NoPlanYet
+        val currentVolume = plans.maxOf { it.volumeIndex }
+        val currentVolumeChapters = plans.filter { it.volumeIndex == currentVolume }
+        if (currentVolumeChapters.any { !it.isReadable }) {
+            return NextVolumeAvailability.CurrentVolumeUnfinished(
+                remaining = currentVolumeChapters.count { !it.isReadable },
+            )
+        }
+        val pending = pendingNodeTitles(projectId, plans)
+        return if (pending.isEmpty()) {
+            // 主线讲完了。仍然可以继续，但要和「继续主线」明确区分开，
+            // 否则模型会被无止境地要求「再来一卷」
+            NextVolumeAvailability.MainLineDone
+        } else {
+            NextVolumeAvailability.CanContinue(pendingCount = pending.size)
+        }
+    }
+
+    /**
+     * 规划下一卷（第三阶段 3C）。
+     *
+     * 只往后加章节：已发布章节一个字不改、正文一块不删、order 一律接在现有章节之后。
+     * 上下文同样是有限的几段——绝不把历史正文重新塞进模型。
+     * 规划失败时什么都不写，不留半成品章节计划。
+     */
+    suspend fun generateNextVolume(projectId: String): Result<Unit> {
+        val project = projectRepository.get(projectId)
+            ?: return Result.failure(IllegalStateException("项目不存在"))
+        val plans = chapterRepository.getPlans(projectId)
+        if (plans.isEmpty()) {
+            return Result.failure(IllegalStateException("还没有讲述路线，先规划第一卷"))
+        }
+        val currentVolume = plans.maxOf { it.volumeIndex }
+        val unfinished = plans.filter { it.volumeIndex == currentVolume && !it.isReadable }
+        if (unfinished.isNotEmpty()) {
+            return Result.failure(
+                IllegalStateException("当前这一卷还有 ${unfinished.size} 章没写完，先把它读完再往下讲"),
+            )
+        }
+
+        val allNodes = knowledgeRepository.getByProject(projectId)
+        if (allNodes.isEmpty()) return Result.failure(IllegalStateException("知识地图为空"))
+        val pendingTitles = pendingNodeTitles(projectId, plans)
+        val pendingNodes = allNodes.filter { it.title in pendingTitles }
+        val bible = storyBibleRepository.get(projectId) ?: StoryBible(projectId = projectId)
+        // 上一章的结尾只取它当前版本的（3B）；没有就明说，不伪造
+        val lastChapter = plans.maxByOrNull { it.order }
+        val lastEnding = lastChapter?.let { chapterRepository.getActiveVersion(it.id) }
+
+        val suggested = suggestChapterCount(pendingNodes.size.coerceAtLeast(1))
+        val prompt = prompts.load(PROMPT_NEXT_VOLUME)
+            .replace("{topic}", project.topic)
+            .replace("{goal}", project.title)
+            .replace("{baseline}", project.baseline)
+            .replace("{currentVolume}", "${currentVolume + 1}")
+            .replace("{chapterHint}", "$suggested 章（不要超过 $VOLUME_MAX_CHAPTERS 章）")
+            .replace("{wordHint}", "${project.wordTargetPerChapter}")
+            .replace("{runningState}", ContextBudget.orNone(bible.runningState))
+            .replace("{lastEndingState}", ContextBudget.previousEndingState(lastChapter, lastEnding))
+            .replace("{openThreads}", ContextBudget.formatList(bible.openThreads, ContextBudget.OPEN_THREAD_LIMIT))
+            .replace("{coveredTitles}", ContextBudget.formatCovered(bible.coveredTitles))
+            .replace("{pendingNodes}", formatNodesWithDerivation(pendingNodes))
+
+        val raw = router.generate(
+            role = ModelRole.STORY,
+            request = ModelRequest(
+                role = ModelRole.STORY,
+                system = SYSTEM_NEXT_VOLUME,
+                user = prompt,
+                jsonMode = true,
+            ),
+            decoder = jsonDecoder(NextVolumeOutput.serializer()),
+        ).getOrElse { return Result.failure(it) }
+
+        val titleToId = allNodes.associate { it.title to it.id }
+        val output = OutputValidators.validateNextVolume(
+            output = raw,
+            knownNodeTitles = titleToId.keys,
+            pendingNodeTitles = pendingTitles,
+            maxChapters = VOLUME_MAX_CHAPTERS,
+        ).getOrElse { return Result.failure(it) }
+
+        // order 从现有最大值往后排，绝不与已有章节冲突
+        val nextOrder = plans.maxOf { it.order } + 1
+        val newVolume = currentVolume + 1
+        val added = output.chapters.mapIndexed { index, chapter ->
+            ChapterPlan(
+                id = idFactory(),
+                projectId = projectId,
+                order = nextOrder + index,
+                title = chapter.title,
+                plotGoal = chapter.plotGoal,
+                learningGoals = chapter.learningGoals,
+                nodeIds = chapter.nodeTitles.mapNotNull { titleToId[it.trim()] }.distinct(),
+                wordTarget = chapter.wordTarget.coerceIn(MIN_WORDS, MAX_WORDS),
+                status = ChapterStatus.QUEUED,
+                derivationChain = chapter.derivationChain,
+                openingHook = chapter.openingHook,
+                volumeIndex = newVolume,
+                volumeTitle = chapter.volumeTitleOr(output.volumeTitle, newVolume),
+                volumeGoal = output.volumeGoal,
+            )
+        }
+        // 只 upsert 新章节。不 clear 任何东西——这是「往后接」，不是「重新规划」
+        chapterRepository.upsertPlans(added)
+        storyBibleRepository.save(
+            bible.copy(
+                currentVolumeIndex = newVolume,
+                // 新卷的主线追加进全书主线，续写时模型才知道后面还有这一段
+                throughLine = (bible.throughLine + "第${newVolume + 1}卷：${output.volumeGoal}")
+                    .takeLast(ContextBudget.THROUGH_LINE_LIMIT * 2),
+                updatedAt = clock(),
+            ),
+        )
+        refreshProjectStatus(projectId)
+        return Result.success(Unit)
+    }
+
+    private fun ChapterPlanDto.volumeTitleOr(fallback: String, volumeIndex: Int): String =
+        fallback.ifBlank { "第${volumeIndex + 1}卷" }
+
+    /**
+     * 还没被任何章节安排到的知识点标题。
+     *
+     * 只看章节计划里的 nodeIds 与已发布章节实际讲到的标题：
+     * 「安排过但还没写」也算已安排，否则续卷会把当前卷正要讲的东西再排一遍。
+     */
+    private suspend fun pendingNodeTitles(projectId: String, plans: List<ChapterPlan>): Set<String> {
+        val allNodes = knowledgeRepository.getByProject(projectId)
+        val plannedIds = plans.flatMap { it.nodeIds }.toSet()
+        val coveredTitles = plans.flatMap { it.coveredTitles }.map { it.trim() }.toSet()
+        return allNodes
+            .filter { it.id !in plannedIds && it.title.trim() !in coveredTitles }
+            .map { it.title }
+            .toSet()
+    }
 
     suspend fun generateChapter(
         projectId: String,
@@ -837,6 +1012,7 @@ class PipelineService(
         const val PROMPT_KNOWLEDGE_MAP = "knowledge_map"
         const val PROMPT_KNOWLEDGE_MAP_MODEL = "knowledge_map_model"
         const val PROMPT_STORY_BIBLE = "story_bible"
+        const val PROMPT_NEXT_VOLUME = "next_volume"
         const val PROMPT_CHAPTER = "chapter"
         const val PROMPT_VERIFY = "verify"
         const val PROMPT_VERIFY_MODEL = "verify_model"
@@ -846,6 +1022,8 @@ class PipelineService(
         const val SYSTEM_MAP_MODEL =
             "你在整理一门学科的演进主干，知识由你自己提供。宁可承认不确定，也不要编造具体出处。"
         const val SYSTEM_BIBLE = "你在设计一条讲述路线，让学科沿着它自己长出来。"
+        const val SYSTEM_NEXT_VOLUME =
+            "你在给一条已经开讲的讲述路线接下一卷。已经写出来的部分不能改，只能往后接。"
         const val SYSTEM_CHAPTER = "你在写一段推演：让读者跟着走，制度自己出现，而不是被告知名词。"
         const val SYSTEM_VERIFY = "你是核验员。既查知识准确性，也查推演有没有跳步。"
 
@@ -856,8 +1034,19 @@ class PipelineService(
 
         // 一章承载一整条演进链，所以章数远少于知识点数（问题7）
         const val NODES_PER_CHAPTER = 4
-        const val MIN_CHAPTERS = 4
-        const val MAX_CHAPTERS = 12
+
+        /** 第一卷的索引。0 而不是 1，这样旧数据靠默认值就落在第一卷（3C） */
+        const val FIRST_VOLUME = 0
+
+        /**
+         * 一卷 4~8 章（3C）。
+         *
+         * 这不是全书上限：读完一卷可以继续规划下一卷，总章数没有硬顶。
+         * 之所以不把上限直接改成 100，是因为「一次规划多少」和「总共能讲多少」
+         * 是两件事——让模型一次想出 100 章，越往后越糊，而用户根本还没读到那儿。
+         */
+        const val VOLUME_MIN_CHAPTERS = 4
+        const val VOLUME_MAX_CHAPTERS = 8
         const val MIN_WORDS = 1200
         const val MAX_WORDS = 4000
 

@@ -1,0 +1,129 @@
+package com.example.zhishu
+
+import com.example.zhishu.ai.JsonDecoder
+import com.example.zhishu.ai.ModelError
+import com.example.zhishu.ai.ModelRequest
+import com.example.zhishu.ai.ModelRouter
+import com.example.zhishu.ai.PromptProvider
+import com.example.zhishu.domain.model.ModelRole
+
+/**
+ * 分卷测试用的模型桩（第三阶段 3C）。
+ *
+ * 与 [ScriptedRouter] 的区别：这个能控制「首次规划给几章」「续卷讲哪些知识点」
+ * 「续卷是否失败」，并且把续卷提示词原样留下来——
+ * 「续卷上下文里不能出现历史正文」这条只能从提示词里验。
+ */
+internal class VolumeRouter : ModelRouter {
+
+    /** 首次规划返回几章。用来验证「模型多给了也只收前 8 章」 */
+    var bibleChapterCount: Int = 5
+
+    /** 续卷章节要讲的知识点标题。默认讲还没讲过的那两个 */
+    var nextVolumeNodeTitles: List<String> = listOf("遗嘱继承", "法定继承")
+
+    var failNextVolume: Boolean = false
+
+    var lastNextVolumePrompt: String = ""
+
+    override suspend fun <T> generate(
+        role: ModelRole,
+        request: ModelRequest,
+        decoder: JsonDecoder<T>,
+    ): Result<T> {
+        val text = when {
+            request.user.contains("[[MAP]]") -> MAP_JSON
+            request.user.contains("[[BIBLE]]") -> bibleJson()
+            request.user.contains("[[VOLUME]]") -> {
+                lastNextVolumePrompt = request.user
+                if (failNextVolume) return Result.failure(ModelError.Server("500"))
+                nextVolumeJson()
+            }
+            request.user.contains("[[CHAPTER]]") -> chapterJson(request.user)
+            request.user.contains("[[VERIFY]]") -> """{"issues":[]}"""
+            request.user.contains("[[QUIZ]]") -> quizJson(request.user)
+            else -> error("没有匹配的测试数据: ${request.user.take(40)}")
+        }
+        return try {
+            Result.success(decoder.decode(text))
+        } catch (e: Exception) {
+            Result.failure(ModelError.Decode(e.message ?: "decode failed"))
+        }
+    }
+
+    /** 第一卷只讲「继承」「遗产范围」，留两个知识点给续卷 */
+    private fun bibleJson(): String {
+        val chapters = (1..bibleChapterCount).joinToString(",") { order ->
+            val node = if (order == 1) "继承" else "遗产范围"
+            """{"order":$order,"title":"第${order}章","plotGoal":"讲$node","learningGoals":["$node"],""" +
+                """"nodeTitles":["$node"],"wordTarget":1200,"openingHook":"第${order}章的开场",""" +
+                """"closingHook":"第${order}章的口子"}"""
+        }
+        return """{"world":"滨海市","characters":[{"name":"林默","role":"主角","description":"律师"}],""" +
+            """"conflict":"遗产纠纷","style":"悬疑","chapters":[$chapters]}"""
+    }
+
+    private fun nextVolumeJson(): String {
+        val chapters = nextVolumeNodeTitles.mapIndexed { index, title ->
+            """{"order":${index + 1},"title":"新卷第${index + 1}章","plotGoal":"讲$title",""" +
+                """"learningGoals":["$title"],"nodeTitles":["$title"],"wordTarget":1200,""" +
+                """"openingHook":"新卷第${index + 1}章的开场","closingHook":"新卷第${index + 1}章的口子"}"""
+        }.joinToString(",")
+        return """{"volumeTitle":"第二卷","volumeGoal":"讲清遗嘱与法定继承的关系","chapters":[$chapters]}"""
+    }
+
+    /**
+     * 正文按「本章实际关联的知识点」生成。
+     *
+     * 不能所有章都写死同一个知识点：核验器要求正文标注的知识点属于本章，
+     * 写死了第二章就通不过——那是校验在正常工作，不是测试数据的自由。
+     */
+    private fun chapterJson(prompt: String): String {
+        val node = NODE_IN_PROMPT.find(prompt)?.groupValues?.get(1)?.trim() ?: "继承"
+        return """{"title":"某一章","summary":"讲了$node","carryOver":"房子归属仍未决",""" +
+            """"runningStateUpdate":"案子推进了一步","coveredTitles":["$node"],"openThreads":[],""" +
+            """"blocks":[{"type":"STORY","text":"老人立下遗嘱，子女各怀心思。","knowledgeNodeTitles":["$node"],"sourceRefs":["c-1"]},""" +
+            """{"type":"EXPLANATION","text":"$node 是这一章要讲透的东西。","knowledgeNodeTitles":["$node"],"sourceRefs":["c-1"]}]}"""
+    }
+
+    private fun quizJson(prompt: String): String {
+        val node = NODE_IN_PROMPT.find(prompt)?.groupValues?.get(1)?.trim() ?: "继承"
+        return """{"questions":[""" +
+            """{"question":"$node 是什么？","type":"TRUE_FALSE","options":["对","错"],"answer":"对","explanation":"e","nodeTitles":["$node"]},""" +
+            """{"question":"$node 与遗产有关吗？","type":"TRUE_FALSE","options":["是","否"],"answer":"是","explanation":"e","nodeTitles":["$node"]},""" +
+            """{"question":"回忆 $node 的定义。","type":"RECALL","options":[],"answer":"定义","explanation":"e","nodeTitles":["$node"]}""" +
+            """]}"""
+    }
+
+    private companion object {
+        /** 从章节提示词里取出本章第一个知识点标题（formatNodesWithDerivation 的「- 标题：定义」格式） */
+        val NODE_IN_PROMPT = Regex("- ([^：\\n]+)：")
+
+        const val MAP_JSON =
+            """{"nodes":[""" +
+                """{"title":"继承","definition":"财产权利义务的转移制度。","depth":1,"sourceRefs":["c-1"]},""" +
+                """{"title":"遗产范围","definition":"死亡时遗留的个人合法财产。","depth":2,"sourceRefs":["c-1"]},""" +
+                """{"title":"遗嘱继承","definition":"有有效遗嘱时按遗嘱继承。","depth":2,"sourceRefs":["c-1"]},""" +
+                """{"title":"法定继承","definition":"无遗嘱时按法定顺序继承。","depth":2,"sourceRefs":["c-1"]}""" +
+                """],"gaps":[],"conflicts":[]}"""
+
+    }
+}
+
+/** 分卷测试的阶段标记 prompt，额外区分续卷阶段 */
+internal class VolumePromptProvider : PromptProvider {
+    private val map = mapOf(
+        "knowledge_map" to "[[MAP]]",
+        "knowledge_map_model" to "[[MAP]]",
+        "story_bible" to "[[BIBLE]]",
+        // 续卷提示词保留几个关键字段，用来断言喂进去的到底是什么
+        "next_volume" to "[[VOLUME]] 累积状态={runningState} 上一章结束时的处境={lastEndingState} " +
+            "已讲={coveredTitles} 待讲={pendingNodes}",
+        "chapter" to "[[CHAPTER]] {nodes}",
+        "verify" to "[[VERIFY]]",
+        "verify_model" to "[[VERIFY]]",
+        "quiz" to "[[QUIZ]] {nodes}",
+    )
+
+    override fun load(name: String): String = map[name] ?: name
+}

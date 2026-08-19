@@ -52,6 +52,37 @@ object OutputValidators {
         return Result.success(output.copy(chapters = chapters))
     }
 
+    /**
+     * 续卷规划的校验（第三阶段 3C）。
+     *
+     * 比首次规划多两条：章数不能超过卷内上限（多给的丢掉，留给再下一卷），
+     * 且至少要有一章真的落在**还没讲过**的知识点上——否则这一卷就是把讲过的
+     * 再讲一遍，白花钱。已讲知识点仍可作为承接引用，只是不能是全部。
+     */
+    fun validateNextVolume(
+        output: NextVolumeOutput,
+        knownNodeTitles: Set<String>,
+        pendingNodeTitles: Set<String>,
+        maxChapters: Int,
+    ): Result<NextVolumeOutput> {
+        val chapters = output.chapters.filter { it.title.isNotBlank() }.take(maxChapters)
+        if (chapters.isEmpty()) {
+            return Result.failure(ModelError.Invalid("续卷规划没有有效章节"))
+        }
+        if (chapters.none { chapter -> chapter.nodeTitles.any { it.trim() in knownNodeTitles } }) {
+            return Result.failure(ModelError.Invalid("续卷规划没有任何一章关联到已有知识点"))
+        }
+        // 还有没讲的知识点时，新卷必须至少讲到一个；全讲完了才允许纯深化
+        if (pendingNodeTitles.isNotEmpty() &&
+            chapters.none { chapter -> chapter.nodeTitles.any { it.trim() in pendingNodeTitles } }
+        ) {
+            return Result.failure(
+                ModelError.Invalid("续卷规划全是已经讲过的知识点，没有推进主线"),
+            )
+        }
+        return Result.success(output.copy(chapters = chapters))
+    }
+
     fun validateChapter(
         output: ChapterOutput,
         knownNodeTitles: Set<String>,

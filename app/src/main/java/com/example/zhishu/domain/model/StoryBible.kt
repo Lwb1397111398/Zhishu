@@ -37,6 +37,12 @@ data class StoryBible(
     val coveredTitles: List<String> = emptyList(),
     /** 尚未展开的悬念钩子，下一章优先回收 */
     val openThreads: List<String> = emptyList(),
+    /**
+     * 已规划到第几卷（第三阶段 3C）。从 0 开始，0 表示只规划了第一卷。
+     * 续卷时递增，新卷的章节 order 一律接在现有章节之后，绝不与旧章节冲突。
+     */
+    @androidx.room.ColumnInfo(defaultValue = "0")
+    val currentVolumeIndex: Int = 0,
     val updatedAt: Long = 0L,
 ) {
     companion object {

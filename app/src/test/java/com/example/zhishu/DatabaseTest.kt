@@ -53,8 +53,8 @@ class DatabaseTest {
     }
 
     @Test
-    fun databaseVersion_isSeven() {
-        assertEquals(7, db.openHelper.readableDatabase.version)
+    fun databaseVersion_isEight() {
+        assertEquals(8, db.openHelper.readableDatabase.version)
     }
 
     @Test

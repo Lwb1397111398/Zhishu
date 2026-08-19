@@ -71,6 +71,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.zhishu.ai.pipeline.NextVolumeAvailability
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.GENRE_AUTO
@@ -817,6 +818,9 @@ private fun OutlineTab(
     var showGenre by remember { mutableStateOf(false) }
     // 重新生成失败的说明按章节取，绑在新版本上而不是覆盖当前正文的核验说明（3A）
     val failedRegenerations by vm.failedRegenerations.collectAsState()
+    // 「继续下一卷」的入口状态（3C）
+    val nextVolume by vm.nextVolume.collectAsState()
+    val volumeCount = plans.map { it.volumeIndex }.distinct().size
     // 进度按「正文可读」算，不因为缺自测题就少算一章
     val published = plans.count { it.isReadable }
     val needsAttention = plans.count { it.status == ChapterStatus.NEEDS_REVIEW }
@@ -838,7 +842,14 @@ private fun OutlineTab(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("共 ${plans.size} 章 · 已完成 $published 章", style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        if (volumeCount > 1) {
+                            "共 $volumeCount 卷 · ${plans.size} 章 · 已完成 $published 章"
+                        } else {
+                            "共 ${plans.size} 章 · 已完成 $published 章"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                     Text(
                         "一章走完一条演进链，不是一两个零散考点",
                         style = MaterialTheme.typography.bodySmall,
@@ -874,6 +885,8 @@ private fun OutlineTab(
                     }
                 }
             }
+            Spacer(Modifier.height(8.dp))
+            NextVolumeCard(availability = nextVolume, onPlan = { vm.planNextVolume() })
             Spacer(Modifier.height(8.dp))
             LazyColumn {
                 if (bible != null) {
@@ -1070,6 +1083,67 @@ internal val GENRE_OPTIONS = listOf(
     "师徒对话",
     "悬疑",
 )
+
+/**
+ * 「继续下一卷」入口（第三阶段 3C）。
+ *
+ * 三种情形三种话，不合并成一个按钮：
+ * - 当前卷没读完 → 不给按钮，说清为什么（硬续会打乱故事顺序）
+ * - 还有没讲到的知识点 → 「继续主线」
+ * - 主线讲完了 → 「扩展阅读」，与继续主线明确区分，避免无止境地再要一卷
+ */
+@Composable
+private fun NextVolumeCard(
+    availability: NextVolumeAvailability,
+    onPlan: () -> Unit,
+) {
+    if (availability is NextVolumeAvailability.NoPlanYet) return
+    Card {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                when (availability) {
+                    is NextVolumeAvailability.CurrentVolumeUnfinished -> {
+                        Text("这一卷还有 ${availability.remaining} 章没写完", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "写完这一卷再规划下一卷，故事顺序才接得上",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    is NextVolumeAvailability.CanContinue -> {
+                        Text("还有 ${availability.pendingCount} 个知识点没讲到", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "接着当前进度规划下一卷，已写好的章节不会改动",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    NextVolumeAvailability.MainLineDone -> {
+                        Text("主线已经讲完了", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "知识地图上的内容都讲到了。还想读可以规划一卷扩展阅读。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    NextVolumeAvailability.NoPlanYet -> Unit
+                }
+            }
+            when (availability) {
+                is NextVolumeAvailability.CanContinue ->
+                    OutlinedButton(onClick = onPlan) { Text("继续主线") }
+                NextVolumeAvailability.MainLineDone ->
+                    TextButton(onClick = onPlan) { Text("扩展阅读") }
+                else -> Unit
+            }
+        }
+    }
+}
 
 @Composable
 private fun ChapterPlanCard(

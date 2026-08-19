@@ -110,6 +110,20 @@ data class ChapterPlan(
     @ColumnInfo(defaultValue = "")
     val quizNote: String = "",
     /**
+     * 本章属于第几卷（第三阶段 3C）。从 0 开始，0 就是第一卷。
+     *
+     * 分卷不是为了排版，是为了让「一次规划的量」有上限：首次只规划一卷 4~8 章，
+     * 读完再按当前状态规划下一卷。这样既不需要让模型一次想出整个主题的所有章节，
+     * 也不必把 MAX_CHAPTERS 直接改成很大。
+     */
+    @ColumnInfo(defaultValue = "0")
+    val volumeIndex: Int = 0,
+    @ColumnInfo(defaultValue = "")
+    val volumeTitle: String = "",
+    /** 这一卷要走完的目标，续卷规划时用来判断「上一卷讲到哪了」 */
+    @ColumnInfo(defaultValue = "")
+    val volumeGoal: String = "",
+    /**
      * 当前对读者生效的正文版本（第三阶段 3A）。
      *
      * 阅读、搜索、知识点跳转一律走这个指针，而不是按 chapterId 直接捞全部正文块——

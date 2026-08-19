@@ -419,9 +419,11 @@ class TransferManager(private val container: AppContainer) {
     )
 
     companion object {
-        // v4：备份内加入 chapter_versions.json，blocks / quizzes 带 versionId（第三阶段 3A）。
-        // 仍能读 v1～v3 备份——缺失的版本信息按「每章一个初始版本」补齐。
-        const val FORMAT_VERSION = 4
+        // v5：章节带上分卷字段、故事总纲带上 currentVolumeIndex（第三阶段 3C）。
+        // v4 加入 chapter_versions.json 与 versionId（3A）。
+        // 仍能读 v1~v4 备份——缺失的版本信息按「每章一个初始版本」补齐，
+        // 缺失的分卷字段一律落在第一卷。
+        const val FORMAT_VERSION = 5
         const val MAX_ENTRIES = 64
         const val MAX_ENTRY_BYTES = 32 * 1024 * 1024
         const val MAX_TOTAL_BYTES = 128L * 1024 * 1024

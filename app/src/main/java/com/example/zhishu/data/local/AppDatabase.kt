@@ -61,7 +61,7 @@ import com.example.zhishu.search.SearchTokenizer
         ModelConfig::class,
         StoryBible::class,
     ],
-    version = 7,
+    version = 8,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -381,6 +381,24 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v7 → v8：分卷与按需续讲（第三阶段 3C）。
+         *
+         * 首次只规划一卷（4~8 章），读完再按当前状态规划下一卷。
+         * 所以需要记「这一章属于第几卷」和「已经规划到第几卷」。
+         *
+         * 旧数据全部落在第 0 卷——它们确实是「第一次规划出来的那一批」，
+         * 默认值就是对的，不需要回填任何一行。
+         */
+        val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE chapters ADD COLUMN volumeIndex INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE chapters ADD COLUMN volumeTitle TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE chapters ADD COLUMN volumeGoal TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE story_bibles ADD COLUMN currentVolumeIndex INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         /** 迁移出来的初始版本 ID 后缀。测试与导入兼容逻辑共用同一个约定。 */
         const val INITIAL_VERSION_SUFFIX = "-v1"
 
@@ -393,6 +411,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_4_5,
                     MIGRATION_5_6,
                     MIGRATION_6_7,
+                    MIGRATION_7_8,
                 )
                 .build()
     }

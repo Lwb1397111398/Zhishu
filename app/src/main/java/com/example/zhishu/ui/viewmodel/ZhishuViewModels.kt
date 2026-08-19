@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.work.WorkManager
 import com.example.zhishu.ZhishuApp
+import com.example.zhishu.ai.pipeline.NextVolumeAvailability
 import com.example.zhishu.di.AppContainer
 import com.example.zhishu.domain.model.AnswerRecord
 import com.example.zhishu.domain.model.ChapterBlock
@@ -379,6 +380,38 @@ class ProjectDetailViewModel(
                 ?: return@mapNotNull null
             plan.id to latestFailure.verificationNote
         }.toMap()
+    }
+
+    /**
+     * 「继续下一卷」入口的状态（第三阶段 3C）。
+     *
+     * 当前卷没读完就不显示——续卷的开场必须接上「上一章的结尾」，
+     * 那个结尾在当前卷写完之前根本不存在，硬续会打乱故事顺序。
+     */
+    val nextVolume: StateFlow<NextVolumeAvailability> =
+        plans.map { container.pipeline.nextVolumeAvailability(projectId) }
+            .stateIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(5000),
+                NextVolumeAvailability.NoPlanYet,
+            )
+
+    /**
+     * 规划下一卷。只往后加章节，已发布的一个字不改。
+     *
+     * 走同步调用而不是 Worker：这是一次模型调用，用户主动点的，
+     * 而且它绝不会触发任何正文生成。
+     */
+    fun planNextVolume() {
+        viewModelScope.launch {
+            _message.value = "正在规划下一卷…"
+            val result = container.pipeline.generateNextVolume(projectId)
+            _message.value = if (result.isSuccess) {
+                "下一卷已规划好，已发布的章节没有任何改动。可以开始生成新章节了。"
+            } else {
+                result.exceptionOrNull()?.message ?: "规划失败，请重试"
+            }
+        }
     }
 
     private val _message = MutableStateFlow<String?>(null)

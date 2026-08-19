@@ -79,6 +79,19 @@ data class ChapterPlanDto(
     val closingHook: String = "",
 )
 
+/**
+ * 续卷规划的产出（第三阶段 3C）。
+ *
+ * 与 [StoryBibleOutput] 分开是因为续卷不重写世界观、人物、全书主线——
+ * 那些已经定下来了，重新给一遍只会让已发布的章节和设定对不上。
+ */
+@Serializable
+data class NextVolumeOutput(
+    val volumeTitle: String = "",
+    val volumeGoal: String = "",
+    val chapters: List<ChapterPlanDto> = emptyList(),
+)
+
 @Serializable
 data class ChapterOutput(
     val title: String,
