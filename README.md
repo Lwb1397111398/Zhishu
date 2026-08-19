@@ -19,12 +19,14 @@
 - **故事大纲**：章节列表、状态流转、章节标题/剧情目标/知识点编辑、核验说明与失败重试入口
 - **生成任务**：一章一个 WorkRequest，批量在入队时展开成串行链；**同一项目只允许一个生成会话**（项目级唯一名 + `KEEP`，连点不重复扣费）；**随时可取消**（状态条与前台通知都有取消，取消整条链）；真正调模型的 Worker 走前台长任务，进程重启后 WorkManager 接着跑剩下的章节
 - **正文与测验解耦**：正文过核验就发布、就能读。出题失败只记在章节的 `quizState` 上，不阻塞阅读、不阻塞下一章、更不会为补几道题重写正文（可单独「重新生成自测」）
+- **正文版本化**：每次生成写一个独立版本，只有核验通过才把 `chapters.activeVersionId` 原子切过去。重生成失败、核验不过或用户取消，**读者手里的正文一个字都不会变**；旧版本正文块一律保留（可追溯），阅读、搜索、知识点跳转与自测题只认当前版本
+- **分卷续讲**：首次只规划一卷 4~8 章，读完再按当前状态规划下一卷（`generateNextVolume`）。续卷只往后加章节，不改也不删已发布内容；续卷上下文只有累积状态 + 上一章当前版本的结尾 + 已讲/待讲知识点标题，不携带任何历史正文。已有已发布章节时**拒绝整本重新规划**
 - **阅读器**：`LazyColumn` 按块渲染（稳定 `key`，长章节不再一次性组合全文）、安静/密集模式、知识块高亮、**本章导览**（本章解决什么、学习目标、涉及知识点、关键结论可跳转）、知识点卡片可回跳知识地图、上下章导航、**阅读进度按「章节 + 正文块 + 块内偏移」保存**
 - **知识搜索**：跨知识点、章节正文、资料原文搜索，走 FTS 倒排索引，**命中后定位到具体正文块并短暂高亮**
 - **章节自测**：回忆题（自评）/ 判断题 / 案例题，放在章末「自测」按钮里由用户主动开启，不自动弹出、不阻塞下一章；答题记录持久化、掌握度一题只计一次
 - **复习中心（可选）**：间隔复习（1/3/7/14/30 天）。默认关闭——关闭时不自动创建复习计划、首页不显示「今日复习」；在「我的 → 学习方式」开启后恢复完整节奏，已有数据不受影响
 - **模型配置**：FAST / STORY / VERIFY 三种角色可分别配置兼容 OpenAI 接口的服务商（仅 https）；API Key 使用 Android Keystore 加密存储、密码方式输入，支持连通性测试
-- **备份导入导出**：ZIP 格式，包含项目/资料/知识/章节/测验/进度，**绝不包含 API Key**；导入先整包校验再单事务写入，并有条目数/解压大小上限
+- **备份导入导出**：ZIP 格式（`formatVersion` 5），包含项目/资料/知识/章节/正文版本/测验/进度，**绝不包含 API Key**；导入先整包校验再单事务写入，并有条目数/解压大小上限。旧备份（v1~v4）仍可导入——缺少的版本信息按「每章一个初始版本」补齐，缺少的分卷字段落在第一卷，导入不会把旧版本正文当成当前正文
 
 ## AI 生成流程
 
@@ -45,7 +47,7 @@
 # 编译 Debug APK
 .\gradlew.bat :app:assembleDebug
 
-# 单元测试（170 个，含真实 WorkManager 调度、Robolectric、Room 迁移与 Compose UI 测试）
+# 单元测试（211 个，含真实 WorkManager 调度、Robolectric、Room 迁移与 Compose UI 测试）
 .\gradlew.bat :app:testDebugUnitTest
 
 # Lint 检查
@@ -56,7 +58,10 @@ APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 
 ## 数据库
 
-- 当前版本：5。Room schema 导出到 `app/schemas/`，v1→v2、v2→v3、v3→v4、v4→v5 都提供了非破坏性 `Migration`（不使用 `fallbackToDestructiveMigration`）。
+- 当前版本：8。Room schema 导出到 `app/schemas/`，v1→v2 一路到 v7→v8 都提供了非破坏性 `Migration`（不使用 `fallbackToDestructiveMigration`）。
+  - v7→v8：`chapters` 增加 `volumeIndex` / `volumeTitle` / `volumeGoal`，`story_bibles` 增加 `currentVolumeIndex`。旧数据全部落在第一卷，默认值即正确。
+  - v6→v7：`chapters` 增加 `openingHook`，拆开 `carryOver` 的双重语义——它原来在未发布章节里装「开头钩子」、在已发布章节里装「结尾状态」，只能靠章节状态猜。迁移把这个猜法固化一次：未发布 → `openingHook`，已发布 → 当前版本的 `endingState`。`carryOver` 列保留，不再读写。
+  - v5→v6：新增 `chapter_versions` 表，`chapters` 增加 `activeVersionId`，`chapter_blocks` / `quizzes` 增加 `versionId`。为每个现有章节建一个初始版本 `<章节id>-v1`，现有正文与自测题绑上去，正文可读的章节把指针指过去；一个正文块都不删。
   - v4→v5：`chapters` 增加 `quizState` / `quizNote`。正文发布不再依赖出题成功；历史上停在 `QUIZ_FAILED` 的章节被扶正成「正文已发布 + 测验失败」，原失败说明搬进 `quizNote`，数据不丢。
   - v3→v4：`reading_progress` 增加 `blockOffset`。阅读进度改为「章节 + 正文块 + 块内偏移」；旧的 `charOffset`（整章滚动像素）保留但不再写入——它换机型或字号就失效，也和搜索用的字符位置不是同一坐标系。
 - 正文与资料片段各有一张 FTS4 索引表。中文子串检索靠**字符二元组**分词实现（FTS 默认分词器会把连续中文当成一个 token，FTS5 的 trigram 分词器要求 SQLite 3.34+，在 minSdk 26 上不可用）。
