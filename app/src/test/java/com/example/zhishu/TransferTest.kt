@@ -10,8 +10,11 @@ import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.Citation
 import com.example.zhishu.domain.model.CitationStatus
+import com.example.zhishu.domain.model.IssueResolution
+import com.example.zhishu.domain.model.IssueType
 import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ModelRole
+import com.example.zhishu.domain.model.VerificationIssue
 import com.example.zhishu.ui.viewmodel.DemoSeeder
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -348,6 +351,8 @@ class TransferTest {
             }
         }
         assertTrue("chapter_versions.json" in names)
+        assertTrue("citations.json" in names)
+        assertTrue("verification_issues.json" in names)
         assertTrue(names.none { it.contains("model") || it.contains("config") })
         assertFalse(text.contains("super-secret-key"))
         assertFalse(text.contains("keyRef"))
@@ -359,7 +364,7 @@ class TransferTest {
         DemoSeeder.seed(container)
         val file = File(workDir, "manifest.zip")
         assertTrue(transfer.export(app, Uri.fromFile(file)).isSuccess)
-        assertEquals(7, TransferManager.FORMAT_VERSION)
+        assertEquals(8, TransferManager.FORMAT_VERSION)
 
         var manifest = ""
         ZipInputStream(file.inputStream()).use { zip ->
@@ -370,7 +375,7 @@ class TransferTest {
                 entry = zip.nextEntry
             }
         }
-        assertTrue(manifest.contains("\"formatVersion\": 7"))
+        assertTrue(manifest.contains("\"formatVersion\": 8"))
     }
 
     /** 分卷字段能导出也能恢复（第三阶段 3C） */
@@ -496,6 +501,124 @@ class TransferTest {
         assertTrue(plan?.coveredNodeIds.orEmpty().isEmpty())
         // 标题没被丢掉：界面据此报「有内容对不上知识点」，而不是当成没讲过
         assertEquals(listOf("一个已经改过名的知识点"), plan?.coveredTitles)
+    }
+
+    /**
+     * 核验问题随备份往返（4B）。
+     *
+     * 三件事：内容原样回来（类型、说明、建议、相关来源）、
+     * 用户已经处理过的结论不被重置成「待处理」、
+     * blockId 对不上那一版的问题降级成「定位不到段落」而不是被丢掉。
+     *
+     * 最后一条是有代价的选择：丢掉更省事，但那等于恢复出来的库
+     * 悄悄告诉用户「这一章没问题」。
+     */
+    @Test
+    fun exportThenImport_roundTripsVerificationIssues() = runBlocking {
+        DemoSeeder.seed(container)
+        val projectId = firstProjectId()
+        val blocks = container.chapterRepository.getActiveBlocks("c1")
+        val versionId = blocks.first().versionId
+        container.issueRepository.upsertAll(
+            listOf(
+                VerificationIssue(
+                    id = VerificationIssue.idFor(versionId, 0),
+                    projectId = projectId,
+                    chapterId = "c1",
+                    versionId = versionId,
+                    blockId = blocks.first().id,
+                    type = IssueType.CONTRADICTION,
+                    rawType = "contradiction",
+                    message = "继承顺序说错了",
+                    sourceRefs = listOf("chunk-x"),
+                    suggestedFix = "改成配偶、子女、父母",
+                    resolution = IssueResolution.ACCEPTED,
+                    order = 0,
+                    createdAt = 5L,
+                ),
+                VerificationIssue(
+                    id = VerificationIssue.idFor(versionId, 1),
+                    projectId = projectId,
+                    chapterId = "c1",
+                    versionId = versionId,
+                    // 指向一个不属于这一版的块：导入时要降级成「定位不到」
+                    blockId = "别的版本的块",
+                    type = IssueType.BROKEN_DERIVATION,
+                    message = "推演跳了一步",
+                    order = 1,
+                    createdAt = 5L,
+                ),
+            ),
+        )
+
+        val file = File(workDir, "issues.zip")
+        val uri = Uri.fromFile(file)
+        assertTrue(transfer.export(app, uri).isSuccess)
+        container.issueRepository.deleteByProject(projectId)
+        assertTrue(container.issueRepository.getActiveByChapter("c1").isEmpty())
+
+        assertTrue(transfer.import(app, uri).isSuccess)
+        val restored = container.issueRepository.getActiveByChapter("c1").sortedBy { it.order }
+        assertEquals(2, restored.size)
+
+        assertEquals(IssueType.CONTRADICTION, restored[0].type)
+        assertEquals("继承顺序说错了", restored[0].message)
+        assertEquals("改成配偶、子女、父母", restored[0].suggestedFix)
+        assertEquals(listOf("chunk-x"), restored[0].sourceRefs)
+        assertEquals(blocks.first().id, restored[0].blockId)
+        // 用户当初判断「不用改」，恢复之后不该又变成待处理
+        assertEquals(IssueResolution.ACCEPTED, restored[0].resolution)
+
+        // 对不上这一版的 blockId：问题留着，但明确说定位不到
+        assertNull(restored[1].blockId)
+        assertFalse(restored[1].isBlockScoped)
+        assertEquals("推演跳了一步", restored[1].message)
+    }
+
+    /** v7 及更早的备份没有问题表，导入后是空的，旧的核验说明原样保留（4B） */
+    @Test
+    fun import_v7Backup_hasNoIssuesButKeepsOldNote() = runBlocking {
+        val note = "[contradiction] 旧版本拼出来的核验说明"
+        val file = File(workDir, "v7-issues.zip")
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun put(name: String, body: String) {
+                zip.putNextEntry(ZipEntry(name))
+                zip.write(body.toByteArray())
+                zip.closeEntry()
+            }
+            put("manifest.json", """{"app":"zhishu","formatVersion":7,"exportedAt":0,"projects":1}""")
+            put(
+                "projects.json",
+                """[{"id":"v7-p","title":"旧档","topic":"t","baseline":"b","depth":"d",""" +
+                    """"dailyMinutes":10,"targetDays":7,"genre":"悬疑","status":"READY","createdAt":1,"updatedAt":1}]""",
+            )
+            put(
+                "chapters.json",
+                """[{"id":"v7-c","projectId":"v7-p","order":1,"title":"第一章","status":"PUBLISHED",""" +
+                    """"verificationNote":"$note","activeVersionId":"v7-c-v1"}]""",
+            )
+            put(
+                "chapter_versions.json",
+                """[{"id":"v7-c-v1","chapterId":"v7-c","projectId":"v7-p","versionNumber":1,""" +
+                    """"status":"PUBLISHED","title":"第一章","createdAt":1,"updatedAt":1}]""",
+            )
+            put(
+                "blocks.json",
+                """[{"id":"v7-b","chapterId":"v7-c","versionId":"v7-c-v1","projectId":"v7-p",""" +
+                    """"order":0,"text":"正文","blockType":"STORY","sourceRefs":[]}]""",
+            )
+        }
+        assertTrue(transfer.import(app, Uri.fromFile(file)).isSuccess)
+
+        // 问题表是空的，不硬造记录
+        assertTrue(container.issueRepository.getAllVersionsByProject("v7-p").isEmpty())
+        // 那句说明还在：它没有 blockId 也没有原始类型，回填只会造出一批假记录，
+        // 让「本章还有 3 个问题待处理」从第一天起就不可信
+        assertEquals(note, container.chapterRepository.getPlan("v7-c")?.verificationNote)
+        // 版本行的两个新列有默认值，旧版本不会被当成局部重写的产物
+        val version = container.chapterRepository.getVersion("v7-c-v1")
+        assertNull(version?.derivedFromVersionId)
+        assertFalse(version?.isPartialRewrite == true)
     }
 
     /**

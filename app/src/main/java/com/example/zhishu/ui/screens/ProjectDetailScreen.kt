@@ -36,6 +36,7 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -73,6 +74,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.zhishu.ai.pipeline.NextVolumeAvailability
+import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.GENRE_AUTO
@@ -84,6 +86,7 @@ import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.SourceMode
 import com.example.zhishu.domain.model.StoryBible
+import com.example.zhishu.domain.model.VerificationIssue
 import com.example.zhishu.ui.common.ChapterStatusChip
 import com.example.zhishu.ui.common.ConfirmDialog
 import com.example.zhishu.ui.common.EmptyState
@@ -947,8 +950,14 @@ private fun OutlineTab(
 ) {
     var editPlan by remember { mutableStateOf<ChapterPlan?>(null) }
     var showGenre by remember { mutableStateOf(false) }
+    // 正在查看问题清单的章节（4B）
+    var issuePlan by remember { mutableStateOf<ChapterPlan?>(null) }
     // 重新生成失败的说明按章节取，绑在新版本上而不是覆盖当前正文的核验说明（3A）
     val failedRegenerations by vm.failedRegenerations.collectAsState()
+    // 当前正文的核验问题，按章节分组（4B）
+    val issues by vm.issues.collectAsState()
+    val issueBlocks by vm.issueBlocks.collectAsState()
+    val rewriting by vm.rewriting.collectAsState()
     // 「继续下一卷」的入口状态（3C）
     val nextVolume by vm.nextVolume.collectAsState()
     // 统计只数当前版本正文（3D）
@@ -1062,10 +1071,32 @@ private fun OutlineTab(
                         onRead = { onOpenReader(plan.id, null) },
                         onQuiz = { onOpenQuiz(plan.id) },
                         onRegenerateQuiz = { vm.regenerateQuiz(plan.id) },
+                        issues = issues[plan.id].orEmpty(),
+                        onOpenIssues = {
+                            // 正文按需装载：问题清单要显示「这条说的是哪一段」
+                            vm.loadIssueBlocks(plan.id)
+                            issuePlan = plan
+                        },
+                        rewriting = plan.id in rewriting,
                     )
                 }
             }
         }
+    }
+
+    issuePlan?.let { plan ->
+        IssueSheet(
+            plan = plan,
+            issues = issues[plan.id].orEmpty(),
+            blocks = issueBlocks,
+            rewriting = plan.id in rewriting,
+            onRewrite = { blockIds ->
+                vm.rewriteBlocks(plan.id, blockIds)
+                issuePlan = null
+            },
+            onAccept = { vm.acceptIssue(it) },
+            onDismiss = { issuePlan = null },
+        )
     }
 
     if (showGenre) {
@@ -1309,6 +1340,12 @@ private fun ChapterPlanCard(
     onQuiz: () -> Unit,
     /** 只重新出题，不重写正文（第二阶段） */
     onRegenerateQuiz: () -> Unit,
+    /** 本章当前正文的核验问题（4B）。空表示没有问题记录 */
+    issues: List<VerificationIssue> = emptyList(),
+    /** 打开问题列表，逐条查看并选择要重写的段落（4B） */
+    onOpenIssues: () -> Unit = {},
+    /** 正在局部重写 */
+    rewriting: Boolean = false,
 ) {
     // 可读性只看正文状态。QUIZ_FAILED 是旧库里的值，正文其实是通过核验的
     val canRead = plan.isReadable ||
@@ -1319,6 +1356,8 @@ private fun ChapterPlanCard(
     val quizMissing = plan.isReadable && plan.quizState == QuizState.FAILED
     val needsRetry = plan.status == ChapterStatus.NEEDS_REVIEW ||
         plan.status == ChapterStatus.FAILED
+    // 还没处理的问题。已接受和已修的不再计数——那两种都已经有结论了（4B）
+    val openIssues = issues.filter { it.resolution.isOpen }
     Card(modifier = Modifier.padding(vertical = 6.dp)) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1400,6 +1439,24 @@ private fun ChapterPlanCard(
                     )
                 }
             }
+            // 逐条的问题记录（4B）。这里只给一句概览，详情在问题列表里。
+            // 关键是把「能不能只改那几段」说出来——它决定用户点哪个按钮
+            if (openIssues.isNotEmpty()) {
+                val located = openIssues.count { it.isBlockScoped }
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    buildString {
+                        append("核验待处理 ${openIssues.size} 条")
+                        if (located > 0) {
+                            append("，其中 $located 条能定位到具体段落，可只重写这几段")
+                        } else {
+                            append("，都没能定位到具体段落，只能整章重新生成")
+                        }
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.tertiary,
+                )
+            }
             // 重新生成没成功时如实说一句：正文还是原来那一版（第三阶段 3A）。
             // 用中性底色而不是错误红——这一章本身好着呢，只是新写的那一版没通过
             if (!failedRegeneration.isNullOrBlank()) {
@@ -1423,13 +1480,183 @@ private fun ChapterPlanCard(
                 if (canQuiz) TextButton(onClick = onQuiz) { Text("测验") }
                 // 补题只调出题阶段，绝不重写正文
                 if (quizMissing) TextButton(onClick = onRegenerateQuiz) { Text("重新生成自测") }
-                TextButton(onClick = onGenerate) {
+                // 有可定位到段落的问题时，「逐条处理」排在「重新生成」前面（4B）：
+                // 只重写出问题的那几段，比整章推翻重来便宜得多，也不会把
+                // 写对的部分一起换掉
+                if (openIssues.isNotEmpty()) {
+                    TextButton(onClick = onOpenIssues, enabled = !rewriting) {
+                        Text(if (rewriting) "修改中…" else "逐条处理")
+                    }
+                }
+                TextButton(onClick = onGenerate, enabled = !rewriting) {
                     Text(if (needsRetry) "重新生成" else "生成")
                 }
             }
         }
     }
 }
+
+/**
+ * 核验问题列表（4B）。
+ *
+ * 这个面板存在的全部理由：让「核验没通过」从一句没法处理的话，
+ * 变成一份能逐条处理的清单。所以每条问题都必须能回答三个问题——
+ * 它说的是哪一段（正文原文就在下面）、属于什么类型、建议怎么改。
+ *
+ * 勾选框只出现在能定位到段落的问题上。定位不到的问题不给勾选框，
+ * 也不给一个假的「重写」按钮：不知道改哪儿的时候，能做的只有整章重来
+ * 或者由用户自己判断，把这件事说清楚比给一个点了没用的按钮诚实。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun IssueSheet(
+    plan: ChapterPlan,
+    issues: List<VerificationIssue>,
+    blocks: Map<String, ChapterBlock>,
+    rewriting: Boolean,
+    onRewrite: (List<String>) -> Unit,
+    onAccept: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val open = issues.filter { it.resolution.isOpen }
+    var selected by remember(plan.id) { mutableStateOf(setOf<String>()) }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.padding(horizontal = 16.dp).padding(bottom = 24.dp)) {
+            Text(
+                "第 ${plan.order} 章 · 核验问题",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(Modifier.height(4.dp))
+            // 这句话是整个面板的定心丸：用户在动自己读过的内容，
+            // 必须先知道「改坏了也不影响现在能读的正文」
+            Text(
+                "修改会写成新的一版，通过核验后才替换当前正文。" +
+                    "没通过就自动作废，你现在读到的内容不会变。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(12.dp))
+
+            if (open.isEmpty()) {
+                Text("没有待处理的问题。", style = MaterialTheme.typography.bodyMedium)
+                return@Column
+            }
+
+            LazyColumn(Modifier.weight(1f, fill = false)) {
+                items(open, key = { it.id }) { issue ->
+                    IssueRow(
+                        issue = issue,
+                        block = issue.blockId?.let { blocks[it] },
+                        checked = issue.blockId in selected,
+                        enabled = !rewriting,
+                        onToggle = {
+                            val blockId = issue.blockId ?: return@IssueRow
+                            selected = if (blockId in selected) {
+                                selected - blockId
+                            } else {
+                                selected + blockId
+                            }
+                        },
+                        onAccept = { onAccept(issue.id) },
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+            val located = open.count { it.isBlockScoped }
+            if (located == 0) {
+                Text(
+                    "这些问题都没能定位到具体段落，只能整章重新生成。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                Button(
+                    onClick = { onRewrite(selected.toList()) },
+                    enabled = selected.isNotEmpty() && !rewriting,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        when {
+                            rewriting -> "正在修改并重新核验…"
+                            selected.isEmpty() -> "勾选要重写的段落"
+                            else -> "重写选中的 ${selected.size} 段并重新核验"
+                        },
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "重写后会做一次全章核验：只改一段也可能让别处的「如前所述」变得不对。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun IssueRow(
+    issue: VerificationIssue,
+    block: ChapterBlock?,
+    checked: Boolean,
+    enabled: Boolean,
+    onToggle: () -> Unit,
+    onAccept: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+    ) {
+        Column(Modifier.padding(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (issue.isBlockScoped) {
+                    Checkbox(checked = checked, onCheckedChange = { onToggle() }, enabled = enabled)
+                }
+                Text(
+                    issue.type.label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onAccept, enabled = enabled) { Text("不用改") }
+            }
+            Text(issue.message, style = MaterialTheme.typography.bodyMedium)
+            if (issue.suggestedFix.isNotBlank()) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "建议：${issue.suggestedFix}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            // 问题指的是哪一段。没有这段原文，用户没法判断该不该改
+            if (block != null) {
+                Spacer(Modifier.height(6.dp))
+                Surface(color = MaterialTheme.colorScheme.surface, shape = MaterialTheme.shapes.small) {
+                    Text(
+                        block.text.take(ISSUE_BLOCK_EXCERPT),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(8.dp),
+                    )
+                }
+            } else {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "没能定位到具体段落，无法单独重写。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/** 问题面板里正文原文显示多少字。够认出是哪一段，不必铺满屏幕 */
+private const val ISSUE_BLOCK_EXCERPT = 240
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

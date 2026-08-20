@@ -30,6 +30,7 @@ import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.SourceKind
 import com.example.zhishu.domain.model.SourceMode
 import com.example.zhishu.domain.model.StoryBible
+import com.example.zhishu.domain.model.VerificationIssue
 import com.example.zhishu.search.ParseResult
 import com.example.zhishu.search.SearchHit
 import com.example.zhishu.search.SourceInput
@@ -62,6 +63,8 @@ internal suspend fun deleteProjectCompletely(container: AppContainer, projectId:
     container.inTransaction {
         // 引用先删：它同时指向正文块和资料片段，两头都要没了才没有意义（4A）
         container.citationRepository.deleteByProject(projectId)
+        // 核验问题绑在版本与块上，同样跟着一起删（4B）
+        container.issueRepository.deleteByProject(projectId)
         container.chapterRepository.clearBlocksForProject(projectId)
         container.chapterRepository.clearVersionsForProject(projectId)
         container.chapterRepository.clearPlansForProject(projectId)
@@ -298,6 +301,85 @@ class ProjectDetailViewModel(
     val bible: StateFlow<StoryBible?> =
         container.storyBibleRepository.observe(projectId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    /**
+     * 当前正文的核验问题，按章节分组（4B）。
+     *
+     * 只订阅 active version 的问题：草稿版本的问题属于一次还没发布的修改尝试，
+     * 混进来会让用户看到「本章有 5 个问题」，而其中 3 个说的是他刚才那次
+     * 没通过的修改。历史版本同理——那些文字读者已经看不到了。
+     */
+    val issues: StateFlow<Map<String, List<VerificationIssue>>> =
+        container.issueRepository.observeActiveByProject(projectId)
+            .map { list -> list.groupBy { it.chapterId } }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
+
+    /** 正在局部重写的章节 ID。防连点，也让卡片能显示「正在修改」 */
+    private val _rewriting = MutableStateFlow<Set<String>>(emptySet())
+    val rewriting: StateFlow<Set<String>> = _rewriting
+
+    /**
+     * 问题所在段落的正文，blockId → 文字（4B）。
+     *
+     * 用户要能看到「问题指的是哪一段」才谈得上判断。只给一句问题说明
+     * 就让人选「要不要重写」，等于让他闭着眼决定改动自己读过的内容。
+     * 打开某一章的问题列表时按需装载，不常驻。
+     */
+    private val _issueBlocks = MutableStateFlow<Map<String, ChapterBlock>>(emptyMap())
+    val issueBlocks: StateFlow<Map<String, ChapterBlock>> = _issueBlocks
+
+    fun loadIssueBlocks(chapterId: String) {
+        viewModelScope.launch {
+            _issueBlocks.value = container.chapterRepository.getActiveBlocks(chapterId)
+                .associateBy { it.id }
+        }
+    }
+
+    /**
+     * 只重写选中的问题段落（4B）。
+     *
+     * 同步调用而不是排 Worker，和「重新出题」同一个理由：用户是在问题列表上
+     * 主动点的，而且这条路**不会**触发整章重生成。它自己带着「旧正文继续可读」
+     * 的保证——中途失败只是草稿作废。
+     */
+    fun rewriteBlocks(planId: String, blockIds: List<String>) {
+        if (planId in _rewriting.value) {
+            _message.value = "这一章正在修改中，没有重复提交。"
+            return
+        }
+        if (blockIds.isEmpty()) {
+            _message.value = "请先选择要修改的段落。"
+            return
+        }
+        viewModelScope.launch {
+            _rewriting.value = _rewriting.value + planId
+            _message.value = "正在重写 ${blockIds.size} 个段落并重新核验（需要网络）…"
+            val result = runCatching {
+                container.pipeline.rewriteBlocks(projectId, planId, blockIds)
+            }.getOrElse { Result.failure(it) }
+            _rewriting.value = _rewriting.value - planId
+            _message.value = if (result.isSuccess) {
+                "已修改并通过核验，正文已更新为新版本。"
+            } else {
+                // 这句话必须说全：用户最担心的是「我点了修改，是不是把能读的正文弄坏了」
+                "修改没有发布：${result.exceptionOrNull()?.message ?: "未知原因"}。" +
+                    "正文仍是此前那一版，可以继续阅读。"
+            }
+        }
+    }
+
+    /**
+     * 用户判断某条问题不需要改（4B）。
+     *
+     * 只有「我看过了，不改」这一个选项，没有「标记为已修」——那得由
+     * 「重写 → 重新核验 → 问题没再出现」推出来（见 IssueResolution）。
+     */
+    fun acceptIssue(issueId: String) {
+        viewModelScope.launch {
+            container.issueRepository.accept(issueId)
+            _message.value = "已标记为「不需要修改」，正文没有改动。"
+        }
+    }
 
     /** 知识点在正文里的落点：第几章、章里的哪一块。知识地图靠它跳进正文 */
     data class ChapterAnchor(

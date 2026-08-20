@@ -11,6 +11,7 @@ import com.example.zhishu.ai.pipeline.PipelineService
 import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.data.local.repo.DefaultChapterRepository
 import com.example.zhishu.data.local.repo.DefaultCitationRepository
+import com.example.zhishu.data.local.repo.DefaultVerificationIssueRepository
 import com.example.zhishu.data.local.repo.DefaultKnowledgeRepository
 import com.example.zhishu.data.local.repo.DefaultProjectRepository
 import com.example.zhishu.data.local.repo.DefaultQuizRepository
@@ -72,6 +73,7 @@ class GenerationTest {
             ),
             chapterRepository = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao(), db.chapterVersionDao()),
             citationRepository = DefaultCitationRepository(db.citationDao()),
+            issueRepository = DefaultVerificationIssueRepository(db.verificationIssueDao()),
             storyBibleRepository = DefaultStoryBibleRepository(db.storyBibleDao()),
             quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
             reviewRepository = DefaultReviewRepository(db.reviewItemDao()),
@@ -281,7 +283,12 @@ class GenerationTest {
         assertTrue(result.isFailure)
         val loaded = db.chapterPlanDao().getById(plan.id)
         assertEquals(ChapterStatus.NEEDS_REVIEW, loaded?.status)
-        assertTrue(loaded?.verificationNote.orEmpty().contains("contradiction"))
+        // 4B 起说明里给的是问题条数与可读的类型名，而不是模型的原始 type 串。
+        // 「contradiction」是给代码看的，用户看的是「与资料矛盾」
+        val note = loaded?.verificationNote.orEmpty()
+        assertTrue(note.contains("1 个问题"))
+        assertTrue(note.contains("与资料矛盾"))
+        assertFalse(note.contains("contradiction"))
     }
 
     /** 章节生成期间项目状态进入 GENERATING（B17） */

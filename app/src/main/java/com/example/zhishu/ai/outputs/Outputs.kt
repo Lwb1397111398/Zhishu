@@ -121,6 +121,23 @@ data class BlockDto(
     val sourceRefs: List<String> = emptyList(),
 )
 
+/**
+ * 局部重写一个正文块的产出（第四阶段 4B）。
+ *
+ * 与 [BlockDto] 分开是因为多了 [changeNote]，而且**没有** type 字段：
+ * 段落类型由原来那一块决定，不该让模型在修一个事实错误的时候
+ * 顺手把 FACT 改成 STORY——那会让「本章有几处需要出处」这类统计
+ * 因为一次修订而变化。
+ */
+@Serializable
+data class BlockRewriteOutput(
+    val text: String,
+    val knowledgeNodeTitles: List<String> = emptyList(),
+    val sourceRefs: List<String> = emptyList(),
+    /** 模型自述改了什么。写进版本说明，用户能看到「这一版动了什么」 */
+    val changeNote: String = "",
+)
+
 @Serializable
 data class VerificationOutput(
     val issues: List<VerificationIssueDto> = emptyList(),

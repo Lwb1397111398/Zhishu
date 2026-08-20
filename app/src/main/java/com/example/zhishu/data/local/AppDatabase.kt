@@ -23,6 +23,7 @@ import com.example.zhishu.data.local.dao.ReviewItemDao
 import com.example.zhishu.data.local.dao.SourceChunkDao
 import com.example.zhishu.data.local.dao.SourceDocumentDao
 import com.example.zhishu.data.local.dao.StoryBibleDao
+import com.example.zhishu.data.local.dao.VerificationIssueDao
 import com.example.zhishu.domain.model.AnswerRecord
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterBlockFts
@@ -41,6 +42,7 @@ import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceChunkFts
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.StoryBible
+import com.example.zhishu.domain.model.VerificationIssue
 import com.example.zhishu.search.SearchTokenizer
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
@@ -60,6 +62,7 @@ import kotlinx.serialization.json.Json
         ChapterBlock::class,
         ChapterBlockFts::class,
         Citation::class,
+        VerificationIssue::class,
         Quiz::class,
         AnswerRecord::class,
         ReviewItem::class,
@@ -67,7 +70,7 @@ import kotlinx.serialization.json.Json
         ModelConfig::class,
         StoryBible::class,
     ],
-    version = 10,
+    version = 11,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -82,6 +85,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun chapterVersionDao(): ChapterVersionDao
     abstract fun chapterBlockDao(): ChapterBlockDao
     abstract fun citationDao(): CitationDao
+    abstract fun verificationIssueDao(): VerificationIssueDao
     abstract fun quizDao(): QuizDao
     abstract fun answerRecordDao(): AnswerRecordDao
     abstract fun reviewItemDao(): ReviewItemDao
@@ -649,6 +653,59 @@ abstract class AppDatabase : RoomDatabase() {
                 if (value.isBlank()) emptyList() else LIST_JSON.decodeFromString(LIST_SERIALIZER, value)
             }.getOrDefault(emptyList())
         }
+        /**
+         * v10 → v11（4B）：核验问题落成一张表。
+         *
+         * 在此之前，一整章的核验问题被 `issues.take(5).joinToString("\n")` 拼成
+         * 一个字符串塞进 `chapters.verificationNote`，第 6 条起直接丢掉，
+         * `blockId` / `sourceRefs` / `suggestedFix` 全部蒸发。用户看到一段
+         * 没法点、没法定位的文字，唯一的出路是整章重新生成——把写对的部分
+         * 连同写错的部分一起推翻。
+         *
+         * 旧数据能救回多少：`verificationNote` 里那段文字是唯一线索，
+         * 但它既没有 blockId 也没有原始类型，回填成一条条问题只会造出
+         * 一批「定位不到块、类型是其他」的记录，而且和当时真实的问题条数
+         * 未必对得上（超过 5 条的部分早就没了）。所以**不回填**：
+         * 旧的说明文字继续留在 `verificationNote` 里照原样显示，
+         * 这张表从下一次核验开始有数据。硬造一批半真的问题记录，
+         * 会让「本章还有 3 个问题待处理」这种数字从一开始就不可信。
+         */
+        val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `verification_issues` (" +
+                        "`id` TEXT NOT NULL, `projectId` TEXT NOT NULL, `chapterId` TEXT NOT NULL, " +
+                        "`versionId` TEXT NOT NULL, `blockId` TEXT, `type` TEXT NOT NULL, " +
+                        "`rawType` TEXT NOT NULL DEFAULT '', `message` TEXT NOT NULL, " +
+                        "`sourceRefs` TEXT NOT NULL DEFAULT '', `suggestedFix` TEXT NOT NULL, " +
+                        "`resolution` TEXT NOT NULL, `order` INTEGER NOT NULL DEFAULT 0, " +
+                        "`createdAt` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_verification_issues_versionId` " +
+                        "ON `verification_issues` (`versionId`)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_verification_issues_blockId` " +
+                        "ON `verification_issues` (`blockId`)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_verification_issues_chapterId` " +
+                        "ON `verification_issues` (`chapterId`)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_verification_issues_projectId` " +
+                        "ON `verification_issues` (`projectId`)",
+                )
+                // 草稿版本是从哪一版派生出来的（4B）。局部重写要能说出
+                // 「这一版是在上一版基础上改了 3 块」，也要能在放弃时讲清放弃了什么
+                db.execSQL("ALTER TABLE chapter_versions ADD COLUMN derivedFromVersionId TEXT")
+                db.execSQL(
+                    "ALTER TABLE chapter_versions ADD COLUMN rewrittenBlockIds TEXT NOT NULL DEFAULT ''",
+                )
+            }
+        }
+
         /** 迁移里手工拼列表时用的 JSON 编解码，与 [Converters] 保持一致 */
         val LIST_JSON = Json
         val LIST_SERIALIZER = ListSerializer(String.serializer())
@@ -665,6 +722,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_7_8,
                     MIGRATION_8_9,
                     MIGRATION_9_10,
+                    MIGRATION_10_11,
                 )
                 .build()
     }

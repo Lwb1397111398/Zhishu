@@ -20,6 +20,7 @@ import com.example.zhishu.domain.model.ReviewItem
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.StoryBible
+import com.example.zhishu.domain.model.VerificationIssue
 import java.io.InputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
@@ -44,6 +45,7 @@ class TransferManager(private val container: AppContainer) {
             val versions = mutableListOf<ChapterVersion>()
             val blocks = mutableListOf<ChapterBlock>()
             val citations = mutableListOf<Citation>()
+            val issues = mutableListOf<VerificationIssue>()
             val quizzes = mutableListOf<Quiz>()
             val reviews = mutableListOf<ReviewItem>()
             val progress = mutableListOf<ReadingProgress>()
@@ -65,6 +67,9 @@ class TransferManager(private val container: AppContainer) {
                 // 引用同样导出全部历史版本：正文都留着了，引用只留当前版本的话，
                 // 恢复出来的旧版本会变成一段没有出处的正文（4A）
                 citations += container.citationRepository.getAllVersionsByProject(project.id)
+                // 核验问题同样导出全部历史版本：它们记录的是「这一版当时被指出了什么」，
+                // 只导当前版本的话，恢复出来的历史版本会显得从未被核验过（4B）
+                issues += container.issueRepository.getAllVersionsByProject(project.id)
                 val projectQuizzes = container.quizRepository.getByProject(project.id)
                 quizzes += projectQuizzes
                 // 导出真实答题记录，而不是伪造 restored-* 记录
@@ -92,6 +97,7 @@ class TransferManager(private val container: AppContainer) {
             entries["chapter_versions.json"] = json.encodeToString(versions)
             entries["blocks.json"] = json.encodeToString(blocks)
             entries["citations.json"] = json.encodeToString(citations)
+            entries["verification_issues.json"] = json.encodeToString(issues)
             entries["quizzes.json"] = json.encodeToString(quizzes)
             entries["answers.json"] = json.encodeToString(answers)
             entries["reviews.json"] = json.encodeToString(reviews)
@@ -271,6 +277,13 @@ class TransferManager(private val container: AppContainer) {
         val bibles = decodeList<StoryBible>(files, "story_bibles.json")
             .filter { it.projectId in projectIds }
 
+        // 核验问题（4B）。v7 及更早的备份没有这个文件，decodeList 返回空即可
+        val issues = normalizeIssues(
+            imported = decodeList<VerificationIssue>(files, "verification_issues.json"),
+            blocks = citations.blocks,
+            versionIds = versioned.versionIds,
+        )
+
         return ImportPayload(
             projects = projects,
             sources = sources,
@@ -282,6 +295,7 @@ class TransferManager(private val container: AppContainer) {
             // 同一件事有两种表示时，它们不一致的那天就是 bug 出现的那天
             blocks = citations.blocks,
             citations = citations.citations,
+            issues = issues,
             quizzes = quizzes,
             answers = answers,
             reviews = reviews,
@@ -490,6 +504,43 @@ class TransferManager(private val container: AppContainer) {
         return NormalizedCitations(blocks = rebuiltBlocks, citations = citations)
     }
 
+    /**
+     * 整理导入进来的核验问题（4B）。
+     *
+     * 两条判断，理由和 [normalizeCitations] 同源但结论不同：
+     *
+     * - **版本不存在 → 丢掉。** 问题是针对某一版正文提的，那一版不在了，
+     *   这条问题连「说的是哪份文字」都答不上来。
+     * - **blockId 对不上那一版真实的块 → 不丢，降级成「定位不到具体段落」。**
+     *   问题本身仍然成立（核验当时确实指出了它），只是没法再单独重写那一段。
+     *   丢掉它等于悄悄告诉用户「这一章没问题」。
+     *
+     * ID 一律用 [VerificationIssue.idFor] 重算，与迁移、重新核验三条路径一致。
+     */
+    private fun normalizeIssues(
+        imported: List<VerificationIssue>,
+        blocks: List<ChapterBlock>,
+        versionIds: Set<String>,
+    ): List<VerificationIssue> {
+        val blockToVersion = blocks.associate { it.id to it.versionId }
+        return imported
+            .filter { it.versionId in versionIds && it.message.isNotBlank() }
+            .groupBy { it.versionId }
+            .flatMap { (versionId, group) ->
+                group.sortedBy { it.order }.mapIndexed { order, issue ->
+                    // 块必须存在，而且必须属于同一版正文。属于别的版本的 blockId
+                    // 拿到这一版上是个错误的坐标——点开会看到一段不相干的文字
+                    val blockId = issue.blockId
+                        ?.takeIf { blockToVersion[it] == versionId }
+                    issue.copy(
+                        id = VerificationIssue.idFor(versionId, order),
+                        blockId = blockId,
+                        order = order,
+                    )
+                }
+            }
+    }
+
     private class NormalizedCitations(
         val blocks: List<ChapterBlock>,
         val citations: List<Citation>,
@@ -510,6 +561,7 @@ class TransferManager(private val container: AppContainer) {
                 container.sourceRepository.deleteByProject(project.id)
                 container.knowledgeRepository.clearForProject(project.id)
                 container.citationRepository.deleteByProject(project.id)
+                container.issueRepository.deleteByProject(project.id)
                 container.chapterRepository.clearBlocksForProject(project.id)
                 container.chapterRepository.clearVersionsForProject(project.id)
                 container.chapterRepository.clearPlansForProject(project.id)
@@ -533,6 +585,8 @@ class TransferManager(private val container: AppContainer) {
             if (payload.blocks.isNotEmpty()) container.chapterRepository.upsertBlocks(payload.blocks)
             // 引用在块之后写入，同一个事务内「引用 → 块 → 版本 → 章节」这条链始终自洽
             if (payload.citations.isNotEmpty()) container.citationRepository.upsertAll(payload.citations)
+            // 问题在块之后写入，同理：它引用的 blockId 此刻已经在库里了
+            if (payload.issues.isNotEmpty()) container.issueRepository.upsertAll(payload.issues)
             if (payload.quizzes.isNotEmpty()) container.quizRepository.upsertAll(payload.quizzes)
             payload.answers.forEach { container.quizRepository.recordAnswer(it) }
             if (payload.reviews.isNotEmpty()) container.reviewRepository.upsertAll(payload.reviews)
@@ -553,6 +607,7 @@ class TransferManager(private val container: AppContainer) {
         val versions: List<ChapterVersion>,
         val blocks: List<ChapterBlock>,
         val citations: List<Citation>,
+        val issues: List<VerificationIssue>,
         val quizzes: List<Quiz>,
         val answers: List<AnswerRecord>,
         val reviews: List<ReviewItem>,
@@ -572,7 +627,13 @@ class TransferManager(private val container: AppContainer) {
         // v5 里被取代的旧正文（记成 ABANDONED）按与 v8→v9 迁移相同的判据改成 ARCHIVED。
         // 仍能读 v1~v6 备份：没有 citations.json 时按块的 sourceRefs 重建引用，
         // 缺失的来源元数据与片段定位一律留空（旧片段的页码无从倒推，硬填会让用户翻错页）。
-        const val FORMAT_VERSION = 7
+        // v8：加入 verification_issues.json（核验问题逐条记录），
+        //     chapter_versions 带上 derivedFromVersionId / rewrittenBlockIds（第四阶段 4B）。
+        // 仍能读 v1~v7 备份：没有 verification_issues.json 时这张表就是空的——
+        // 旧备份里的问题当年被拼成一句 verificationNote 存着，
+        // 没有 blockId 也没有原始类型，回填只会造出一批「定位不到段落」的假记录，
+        // 让「本章还有 3 个问题待处理」从一开始就不可信。那句说明照原样保留。
+        const val FORMAT_VERSION = 8
         const val MAX_ENTRIES = 64
         const val MAX_ENTRY_BYTES = 32 * 1024 * 1024
         const val MAX_TOTAL_BYTES = 128L * 1024 * 1024

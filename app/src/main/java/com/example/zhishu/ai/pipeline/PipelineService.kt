@@ -5,6 +5,7 @@ import com.example.zhishu.ai.ModelRequest
 import com.example.zhishu.ai.ModelRouter
 import com.example.zhishu.ai.PromptProvider
 import com.example.zhishu.ai.jsonDecoder
+import com.example.zhishu.ai.outputs.BlockRewriteOutput
 import com.example.zhishu.ai.outputs.ChapterOutput
 import com.example.zhishu.ai.outputs.ChapterPlanDto
 import com.example.zhishu.ai.outputs.KnowledgeMapOutput
@@ -18,10 +19,12 @@ import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.ChapterVersionStatus
+import com.example.zhishu.domain.model.Citation
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.ModelRole
+import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.ProjectStatus
 import com.example.zhishu.domain.model.Quiz
 import com.example.zhishu.domain.model.QuizState
@@ -30,6 +33,7 @@ import com.example.zhishu.domain.model.ReviewStatus
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.StoryBible
+import com.example.zhishu.domain.model.VerificationIssue
 import com.example.zhishu.domain.repository.ChapterRepository
 import com.example.zhishu.domain.repository.CitationRepository
 import com.example.zhishu.domain.repository.KnowledgeRepository
@@ -38,6 +42,7 @@ import com.example.zhishu.domain.repository.QuizRepository
 import com.example.zhishu.domain.repository.ReviewRepository
 import com.example.zhishu.domain.repository.SourceRepository
 import com.example.zhishu.domain.repository.StoryBibleRepository
+import com.example.zhishu.domain.repository.VerificationIssueRepository
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -52,6 +57,8 @@ class PipelineService(
     private val chapterRepository: ChapterRepository,
     /** 正文块 ↔ 资料片段的引用关系（4A）。发布哪一版正文，就写哪一版的引用 */
     private val citationRepository: CitationRepository,
+    /** 核验问题（4B）。问题绑在版本上，局部重写据此知道该重写哪几块 */
+    private val issueRepository: VerificationIssueRepository,
     private val storyBibleRepository: StoryBibleRepository,
     private val quizRepository: QuizRepository,
     private val reviewRepository: ReviewRepository,
@@ -224,6 +231,8 @@ class PipelineService(
         // 引用跟着正文块一起清。留着的话它们会指向不存在的块，
         // 「这份资料被哪几段引用了」就会给出点不开的结果（4A）
         citationRepository.deleteByProject(projectId)
+        // 核验问题同理：它们说的是某一版正文的某一块，那些块马上就不存在了（4B）
+        issueRepository.deleteByProject(projectId)
         chapterRepository.clearBlocksForProject(projectId)
         chapterRepository.clearPlansForProject(projectId)
         chapterRepository.upsertPlans(plans)
@@ -621,10 +630,24 @@ class PipelineService(
         }
 
         val verified = verification.getOrThrow()
-        if (verified.issues.isNotEmpty()) {
-            val note = verified.issues.take(5).joinToString("\n") { "[${it.type}] ${it.message}" }
-            failAttempt(planId, attempt, note, ChapterStatus.NEEDS_REVIEW)
-            return Result.failure(IllegalStateException("章节存在 ${verified.issues.size} 个待处理问题"))
+        // 核验问题落成一条条记录（4B）。
+        //
+        // 原来这里是 `issues.take(5).joinToString("\n")`：一整章的问题被拼成
+        // 一个字符串，第 6 条起丢掉，blockId / sourceRefs / suggestedFix 全部蒸发。
+        // 用户看到一段没法点、没法定位的文字，唯一的出路是整章重新生成——
+        // 把写对的部分连同写错的部分一起推翻，还要再扣一次故事模型的钱。
+        val recorded = IssueRecorder.record(
+            projectId = projectId,
+            chapterId = planId,
+            versionId = version.id,
+            issues = verified.issues,
+            validBlockIds = blocks.map { it.id }.toSet(),
+            now = clock(),
+        )
+        issueRepository.replaceForVersion(version.id, recorded.issues)
+        if (recorded.issues.isNotEmpty()) {
+            failAttempt(planId, attempt, issueSummary(recorded), ChapterStatus.NEEDS_REVIEW)
+            return Result.failure(IllegalStateException("章节存在 ${recorded.issues.size} 个待处理问题"))
         }
 
         // 正文过了核验 —— 到这里这一章就算写成了，先发布再说（第二阶段）。
@@ -689,6 +712,370 @@ class PipelineService(
             chapterRepository.updateQuizState(planId, QuizState.FAILED, message)
         }
         return Result.success(Unit)
+    }
+
+    /**
+     * 只重写有问题的正文块（第四阶段 4B）。
+     *
+     * ```
+     * 保留 active version
+     *   → 从 active version 派生草稿版本
+     *   → 复制没问题的块（换新 ID）
+     *   → 只重写选中的那几块
+     *   → 全章重新核验
+     *   → 通过后原子切换 activeVersionId
+     * ```
+     *
+     * 全程不碰 active version 一个字段。中途失败、取消、或者重新核验还有问题，
+     * 草稿版本置 ABANDONED，读者手里的正文完好无损——这是 3A 定下的底线，
+     * 局部重写没有理由例外。
+     *
+     * ## 为什么发布前一定要全章重新核验
+     *
+     * 只核验改过的那几块，成本确实低得多，但局部修改**恰恰**是最容易
+     * 制造全章不一致的操作：改掉第 3 段里的一个数字，第 7 段那句
+     * 「如前所述，这个期限是三年」就成了错的，而第 7 段自己一个字都没改，
+     * 只核验改动块永远发现不了它。所以宁可多花一次核验的钱。
+     */
+    suspend fun rewriteBlocks(
+        projectId: String,
+        planId: String,
+        blockIds: List<String>,
+        onPhase: ProgressReporter = NoOpProgressReporter,
+    ): Result<Unit> {
+        if (blockIds.isEmpty()) {
+            return Result.failure(IllegalStateException("没有选中要修改的段落"))
+        }
+        val plan = chapterRepository.getPlan(planId)
+            ?: return Result.failure(IllegalStateException("章节不存在"))
+        val active = chapterRepository.getActiveVersion(planId)
+            ?: return Result.failure(
+                IllegalStateException("本章还没有通过核验的正文，请先整章生成"),
+            )
+        val oldBlocks = chapterRepository.getBlocksByVersion(active.id)
+        if (oldBlocks.isEmpty()) {
+            return Result.failure(IllegalStateException("当前正文没有内容可修改"))
+        }
+        val targets = blockIds.toSet()
+        if (oldBlocks.none { it.id in targets }) {
+            return Result.failure(
+                IllegalStateException("选中的段落不属于当前正文（可能正文已经更新过）"),
+            )
+        }
+
+        var draft: ChapterVersion? = null
+        return try {
+            runRewrite(projectId, planId, plan, active, oldBlocks, targets, onPhase) { draft = it }
+        } catch (e: CancellationException) {
+            // 收尾必须在不可取消的上下文里做，否则这几条写库自己也会被取消，
+            // 草稿版本会永久卡在 DRAFT / VERIFYING
+            withContext(NonCancellable) {
+                draft?.let {
+                    chapterRepository.abandonVersionIfPending(
+                        it.id,
+                        "局部修改已取消，正文仍是此前那一版。",
+                        clock(),
+                    )
+                }
+                refreshProjectStatus(projectId)
+            }
+            throw e
+        }
+    }
+
+    private suspend fun runRewrite(
+        projectId: String,
+        planId: String,
+        plan: ChapterPlan,
+        active: ChapterVersion,
+        oldBlocks: List<ChapterBlock>,
+        targets: Set<String>,
+        onPhase: ProgressReporter,
+        onDraftCreated: (ChapterVersion) -> Unit,
+    ): Result<Unit> {
+        val project = projectRepository.get(projectId)
+            ?: return Result.failure(IllegalStateException("项目不存在"))
+        onPhase(ChapterPhase.BODY)
+
+        // 草稿版本。指针不动，读者读到的还是 active version
+        val draft = chapterRepository.insertDerivedDraftVersion(
+            chapterId = planId,
+            projectId = projectId,
+            source = active,
+            now = clock(),
+        )
+        onDraftCreated(draft)
+
+        // 旧块 → 新块 ID。每一块都换新 ID，包括没改动的（4B）。
+        //
+        // 复用旧 ID 会让两个版本共享同一批块行，「改第 3 块」当场也改掉了
+        // 旧版本——旧正文变成一份从未通过核验的混合体，3A 的前提就没了。
+        // 而且核验问题是按 blockId 记的：ID 复用的话，挂在旧版本上的问题
+        // 会同时挂到新版本上，用户修完了问题还在。
+        val idMapping = oldBlocks.associate { it.id to idFactory() }
+        val oldCitations = citationRepository.getByVersion(active.id).groupBy { it.blockId }
+        val issuesByBlock = issueRepository.getByVersion(active.id)
+            .filter { it.resolution.isOpen }
+            .groupBy { it.blockId }
+
+        val modelKnowledge = active.usedModelKnowledge
+        val allNodes = knowledgeRepository.getByProject(projectId)
+        val nodes = plan.nodeIds.mapNotNull { id -> allNodes.firstOrNull { it.id == id } }
+        val chunks = if (modelKnowledge) emptyList() else loadChunksForNodes(projectId, nodes)
+        loadSourceMeta(projectId)
+        val validChunkIds = chunks.map { it.id }.toSet()
+        val titleToId = allNodes.associate { it.title to it.id }
+
+        val newBlocks = mutableListOf<ChapterBlock>()
+        val rewrittenRefs = mutableMapOf<String, List<String>>()
+        val rewrittenIds = mutableListOf<String>()
+        val changeNotes = mutableListOf<String>()
+
+        for ((index, old) in oldBlocks.withIndex()) {
+            val newId = idMapping.getValue(old.id)
+            if (old.id !in targets) {
+                // 没问题的块整块搬过去，一个字不改
+                newBlocks += old.copy(id = newId, versionId = draft.id)
+                continue
+            }
+            val rewritten = rewriteOneBlock(
+                plan = plan,
+                project = project,
+                target = old,
+                previous = oldBlocks.getOrNull(index - 1),
+                next = oldBlocks.getOrNull(index + 1),
+                issues = issuesByBlock[old.id].orEmpty(),
+                nodes = nodes,
+                chunks = chunks,
+                modelKnowledge = modelKnowledge,
+            ).getOrElse { error ->
+                chapterRepository.abandonVersionIfPending(
+                    draft.id,
+                    "局部修改失败：${error.message ?: "生成失败"}。正文仍是此前那一版。",
+                    clock(),
+                )
+                refreshProjectStatus(projectId)
+                return Result.failure(error)
+            }
+            newBlocks += old.copy(
+                id = newId,
+                versionId = draft.id,
+                text = rewritten.text,
+                // 段落类型跟着原块，不让模型顺手改掉（见 BlockRewriteOutput）
+                knowledgeNodeIds = rewritten.knowledgeNodeTitles
+                    .mapNotNull { titleToId[it.trim()] }
+                    .distinct()
+                    .ifEmpty { old.knowledgeNodeIds },
+                sourceRefs = emptyList(),
+            )
+            rewrittenRefs[newId] = rewritten.sourceRefs
+            rewrittenIds += newId
+            rewritten.changeNote.takeIf { it.isNotBlank() }?.let { changeNotes += it }
+        }
+
+        // 引用关系：没改过的块**照搬**旧引用（只换 blockId 与 versionId），
+        // 改过的块重新解析。
+        //
+        // 照搬而不是重新解析没改过的块，是因为那些块的文字一个字都没变——
+        // 重新解析等于让模型重新给一遍引用，结果可能和读者当初看到的不一样，
+        // 而那一段正文根本没动。UNCONFIRMED 也照搬：它当初就没对上，
+        // 这次也没有任何新信息能让它对上。
+        val carried = newBlocks.filterNot { it.id in rewrittenIds }.flatMap { block ->
+            val oldId = idMapping.entries.first { it.value == block.id }.key
+            oldCitations[oldId].orEmpty().mapIndexed { order, citation ->
+                citation.copy(
+                    id = Citation.idFor(block.id, order),
+                    versionId = draft.id,
+                    blockId = block.id,
+                    order = order,
+                )
+            }
+        }
+        val resolved = CitationResolver.resolve(
+            projectId = projectId,
+            chapterId = planId,
+            versionId = draft.id,
+            blocks = rewrittenIds.map { id ->
+                CitationResolver.BlockRefs(blockId = id, rawRefs = rewrittenRefs[id].orEmpty())
+            },
+            validChunkIds = validChunkIds,
+        )
+        val blocks = newBlocks.map { block ->
+            when {
+                block.id in rewrittenIds ->
+                    block.copy(sourceRefs = resolved.resolvedByBlock[block.id].orEmpty())
+                else -> block
+            }
+        }
+        chapterRepository.upsertBlocks(blocks)
+        citationRepository.replaceForVersion(draft.id, carried + resolved.citations)
+        chapterRepository.setRewrittenBlocks(draft.id, rewrittenIds)
+        chapterRepository.updateVersionStatus(draft.id, ChapterVersionStatus.VERIFYING, now = clock())
+        onPhase(ChapterPhase.VERIFY)
+
+        // 全章重新核验，不是只核改过的那几块（理由见 rewriteBlocks 的注释）
+        val verification = verifyChapter(projectId, plan, blocks)
+        if (verification.isFailure) {
+            val message = verification.exceptionOrNull()?.message ?: "核验失败"
+            chapterRepository.abandonVersionIfPending(
+                draft.id,
+                "局部修改后的核验没能完成：$message。正文仍是此前那一版。",
+                clock(),
+            )
+            refreshProjectStatus(projectId)
+            return Result.failure(verification.exceptionOrNull() ?: IllegalStateException(message))
+        }
+
+        val verified = verification.getOrThrow()
+        val recorded = IssueRecorder.record(
+            projectId = projectId,
+            chapterId = planId,
+            versionId = draft.id,
+            issues = verified.issues,
+            validBlockIds = blocks.map { it.id }.toSet(),
+            now = clock(),
+        )
+        // 新问题记在草稿版本上，旧版本的问题一条不动——它们说的是那一版的文字
+        issueRepository.replaceForVersion(draft.id, recorded.issues)
+        if (recorded.issues.isNotEmpty()) {
+            chapterRepository.abandonVersionIfPending(
+                draft.id,
+                "局部修改后仍有 ${recorded.issues.size} 个问题，这一版没有发布。" +
+                    "正文仍是此前那一版（可继续阅读）。",
+                clock(),
+            )
+            refreshProjectStatus(projectId)
+            return Result.failure(
+                IllegalStateException("修改后的正文仍有 ${recorded.issues.size} 个问题，未发布"),
+            )
+        }
+
+        // 过了 —— 原子切换。旧版本置 ARCHIVED（它成功过），指针指向草稿。
+        //
+        // rewrittenBlockIds 必须在这里再写一遍：发布走的是整行 upsert，
+        // 上面那次 setRewrittenBlocks 写的列会被这一行盖掉。
+        // （上面那次仍然要写——草稿没能发布时，那份名单是「这次试着改了哪几块」的唯一记录。）
+        chapterRepository.publishVersionAtomically(
+            version = draft.copy(
+                rewrittenBlockIds = rewrittenIds,
+                verificationNote = changeNotes.take(MAX_CHANGE_NOTES)
+                    .joinToString("；")
+                    .ifBlank { "已修改 ${rewrittenIds.size} 个段落并通过核验。" },
+            ),
+            now = clock(),
+        )
+        // 旧版本上那几块的问题：重写并重新核验后没再出现 → 标记已修。
+        // 「已修」不是用户手点的状态，它由这一串事实推出来（见 IssueResolution）
+        issueRepository.markFixedForBlocks(active.id, targets.toList())
+        writeBackNodeChapters(projectId, planId, blocks)
+        refreshProjectStatus(projectId)
+
+        // 正文换了版本，旧版本的题问的是被改掉的文字，重新出一次
+        onPhase(ChapterPhase.QUIZ)
+        val quizResult = generateQuiz(projectId, plan, nodes, blocks, draft.id)
+        if (quizResult.isSuccess) {
+            chapterRepository.updateQuizState(planId, QuizState.READY)
+        } else {
+            chapterRepository.updateQuizState(
+                planId,
+                QuizState.FAILED,
+                quizResult.exceptionOrNull()?.message ?: "测验生成失败",
+            )
+        }
+        return Result.success(Unit)
+    }
+
+    /** 重写一个块。上下段原文一起给模型，改出来的段落才接得回原位（4B） */
+    private suspend fun rewriteOneBlock(
+        plan: ChapterPlan,
+        project: Project,
+        target: ChapterBlock,
+        previous: ChapterBlock?,
+        next: ChapterBlock?,
+        issues: List<VerificationIssue>,
+        nodes: List<KnowledgeNode>,
+        chunks: List<SourceChunk>,
+        modelKnowledge: Boolean,
+    ): Result<BlockRewriteOutput> {
+        val prompt = prompts.load(PROMPT_REWRITE_BLOCK)
+            .replace("{derivationChain}", ContextBudget.orNone(plan.derivationChain.ifBlank { plan.plotGoal }))
+            .replace("{learningGoals}", plan.learningGoals.joinToString("；"))
+            .replace("{previousBlock}", previous?.text?.take(NEIGHBOUR_EXCERPT) ?: "（这是本章第一段）")
+            .replace("{blockType}", target.blockType.name)
+            .replace("{targetBlock}", target.text)
+            .replace("{nextBlock}", next?.text?.take(NEIGHBOUR_EXCERPT) ?: "（这是本章最后一段）")
+            .replace("{issues}", formatIssues(issues))
+            .replace("{sourceSection}", sourceSection(modelKnowledge, chunks))
+
+        val raw = router.generate(
+            role = ModelRole.STORY,
+            request = ModelRequest(
+                role = ModelRole.STORY,
+                system = SYSTEM_REWRITE,
+                user = prompt,
+                jsonMode = true,
+                // 比整章生成低：这是修一个具体问题，不是重新创作
+                temperature = 0.5f,
+            ),
+            decoder = jsonDecoder(BlockRewriteOutput.serializer()),
+        ).getOrElse { return Result.failure(it) }
+
+        if (raw.text.isBlank()) {
+            return Result.failure(ModelError.Invalid("改写结果是空的"))
+        }
+        return Result.success(raw)
+    }
+
+    /**
+     * 把这一块的问题喂给模型。
+     *
+     * 问题为空时明说「没有指出具体问题」而不是留一段空白：模型看到空白
+     * 会自己找点什么改，而用户点「重写这一块」时想要的是解决已知问题。
+     */
+    private fun formatIssues(issues: List<VerificationIssue>): String {
+        if (issues.isEmpty()) {
+            return "（核验没有指出这一段的具体问题，用户是自己选择重写它的。" +
+                "请只做必要的澄清，不要重新创作。）"
+        }
+        return issues.joinToString("\n\n") { issue ->
+            buildString {
+                append("- 【").append(issue.type.label).append("】").append(issue.message)
+                if (issue.suggestedFix.isNotBlank()) {
+                    append("\n  建议改法：").append(issue.suggestedFix)
+                }
+                if (issue.sourceRefs.isNotEmpty()) {
+                    append("\n  相关片段ID：").append(issue.sourceRefs.joinToString("、"))
+                }
+            }
+        }
+    }
+
+    /**
+     * 给章节行留的一句话说明（4B）。
+     *
+     * 问题的正文已经在 verification_issues 表里逐条存着了，所以这里主要说清
+     * 「有几个问题、能不能只修那几段」——那是决定用户点哪个按钮的信息。
+     *
+     * 但前几条问题的原文仍然要带上，而且不能省：一次失败的**重生成**留下的
+     * 问题挂在作废的草稿版本上，而问题清单只读当前正文的问题（它必须如此，
+     * 否则用户会看到一堆说的是已经被替换掉的文字的问题）。也就是说，
+     * 那种情况下这句说明是唯一能告诉用户「哪里不对」的地方。
+     */
+    private fun issueSummary(recorded: IssueRecorder.Recorded): String {
+        val blockCount = recorded.affectedBlockIds.size
+        val unlocated = recorded.chapterScoped.size
+        return buildString {
+            append("核验发现 ${recorded.issues.size} 个问题")
+            if (blockCount > 0) append("，涉及 $blockCount 个正文段落（可只重写这几段）")
+            if (unlocated > 0) append("，其中 $unlocated 条没能定位到具体段落")
+            append("。")
+            recorded.issues.take(NOTE_ISSUE_PREVIEW).forEach { issue ->
+                append("\n[").append(issue.type.label).append("] ").append(issue.message)
+            }
+            if (recorded.issues.size > NOTE_ISSUE_PREVIEW) {
+                append("\n……还有 ${recorded.issues.size - NOTE_ISSUE_PREVIEW} 条，展开逐条处理可以全部查看。")
+            }
+        }
     }
 
     /**
@@ -1133,6 +1520,7 @@ class PipelineService(
         const val PROMPT_VERIFY = "verify"
         const val PROMPT_VERIFY_MODEL = "verify_model"
         const val PROMPT_QUIZ = "quiz"
+        const val PROMPT_REWRITE_BLOCK = "rewrite_block"
 
         const val SYSTEM_MAP = "你在整理一门学科的演进主干，不是在做目录。"
         const val SYSTEM_MAP_MODEL =
@@ -1142,6 +1530,8 @@ class PipelineService(
             "你在给一条已经开讲的讲述路线接下一卷。已经写出来的部分不能改，只能往后接。"
         const val SYSTEM_CHAPTER = "你在写一段推演：让读者跟着走，制度自己出现，而不是被告知名词。"
         const val SYSTEM_VERIFY = "你是核验员。既查知识准确性，也查推演有没有跳步。"
+        const val SYSTEM_REWRITE =
+            "你在修一整章里的一个段落。只解决指出的问题，其余保持原样，改完要能无缝接回原位。"
 
         const val MIN_QUIZ_QUESTIONS = 3
         const val MAX_QUIZ_QUESTIONS = 5
@@ -1173,5 +1563,20 @@ class PipelineService(
         const val BLOCK_EXCERPT = 1200
         const val QUIZ_EXCERPT = 800
         const val CONTEXT_CHAIN_LIMIT = 10
+
+        /** 局部重写时上下相邻段落给多少字。够判断衔接，不必给全文 */
+        const val NEIGHBOUR_EXCERPT = 600
+
+        /** 版本说明里最多留几条改动自述 */
+        const val MAX_CHANGE_NOTES = 5
+
+        /**
+         * 章节说明里带几条问题原文（4B）。
+         *
+         * 不是「界面放不下更多」——这句说明只是入口，完整清单在问题面板里。
+         * 带上前几条是为了失败的重生成：那种情况下问题挂在作废版本上，
+         * 面板看不到，这句话是唯一的线索。
+         */
+        const val NOTE_ISSUE_PREVIEW = 3
     }
 }

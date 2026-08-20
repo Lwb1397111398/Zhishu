@@ -6,6 +6,7 @@ import com.example.zhishu.ai.pipeline.PipelineService
 import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.data.local.repo.DefaultChapterRepository
 import com.example.zhishu.data.local.repo.DefaultCitationRepository
+import com.example.zhishu.data.local.repo.DefaultVerificationIssueRepository
 import com.example.zhishu.data.local.repo.DefaultKnowledgeRepository
 import com.example.zhishu.data.local.repo.DefaultProjectRepository
 import com.example.zhishu.data.local.repo.DefaultQuizRepository
@@ -82,6 +83,7 @@ class SourceTraceTest {
                 db.chapterVersionDao(),
             ),
             citationRepository = DefaultCitationRepository(db.citationDao()),
+            issueRepository = DefaultVerificationIssueRepository(db.verificationIssueDao()),
             storyBibleRepository = DefaultStoryBibleRepository(db.storyBibleDao()),
             quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
             reviewRepository = DefaultReviewRepository(db.reviewItemDao()),

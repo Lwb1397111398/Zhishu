@@ -115,6 +115,28 @@ data class ChapterVersion(
     val usedModelKnowledge: Boolean = false,
     /** 本版本自己的核验问题。不覆盖当前发布版本的说明——那是另一份正文的事 */
     val verificationNote: String = "",
+    /**
+     * 这一版是从哪一版派生出来的（4B）。
+     *
+     * 局部重写的产物：从 active version 派生草稿、复制没问题的块、
+     * 只重写选中的块。null 表示这一版是整章从头生成的。
+     *
+     * 有了它才能说清「这一版改了什么」——否则用户看到的只是又一个版本号，
+     * 分不出「整章重写过」和「只动了第 3 段」。
+     */
+    val derivedFromVersionId: String? = null,
+    /**
+     * 这一版里真正重写过的块（4B）。
+     *
+     * 存的是**新块**的 ID。局部重写会给重写过的块换新 ID（旧块留在旧版本里不动），
+     * 所以这份名单同时也是「哪些块的引用需要重新解析」的答案。
+     * 整章生成时留空——那种情况下每一块都是新的，列出来没有信息量。
+     */
+    @ColumnInfo(defaultValue = "")
+    val rewrittenBlockIds: List<String> = emptyList(),
     val createdAt: Long,
     val updatedAt: Long,
-)
+) {
+    /** 是不是局部重写产生的版本 */
+    val isPartialRewrite: Boolean get() = derivedFromVersionId != null
+}

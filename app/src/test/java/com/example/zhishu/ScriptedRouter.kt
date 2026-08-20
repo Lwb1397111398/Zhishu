@@ -42,7 +42,7 @@ internal class ScriptedRouter : ModelRouter {
      */
     var onPhase: (suspend (Phase) -> Unit)? = null
 
-    enum class Phase { MAP, BIBLE, CHAPTER, VERIFY, QUIZ }
+    enum class Phase { MAP, BIBLE, CHAPTER, VERIFY, QUIZ, REWRITE }
 
     var chapterJson: String =
         """{"title":"第一章","summary":"老人立下遗嘱","endingState":"遗嘱真伪待查",""" +
@@ -50,6 +50,22 @@ internal class ScriptedRouter : ModelRouter {
             """"blocks":[{"type":"STORY","text":"老人立下遗嘱，子女各怀心思。","knowledgeNodeTitles":["意思表示"],"sourceRefs":["c-1"]},""" +
             """{"type":"EXPLANATION","text":"意思表示是民事法律行为的核心要素。","knowledgeNodeTitles":["意思表示"],"sourceRefs":["c-1"]}]}"""
     var verifyJson: String = """{"issues":[]}"""
+
+    /**
+     * 按顺序返回的核验结果（4B）。
+     *
+     * 局部重写要走两次核验：第一次指出问题，重写之后再核一次。
+     * 一个 [verifyJson] 表达不了「这次有问题、下次没有」，而那正是
+     * 整条局部重写路径唯一值得测的东西。队列空了就退回 [verifyJson]。
+     */
+    val verifyQueue: MutableList<String> = mutableListOf()
+
+    /** 局部重写的产出（4B）。队列空了就退回 [rewriteJson] */
+    var rewriteJson: String =
+        """{"text":"改写后的这一段。","knowledgeNodeTitles":["意思表示"],""" +
+            """"sourceRefs":["c-1"],"changeNote":"按资料改回正确的顺序"}"""
+    val rewriteQueue: MutableList<String> = mutableListOf()
+
     var quizJson: String = """
         {"questions":[
           {"question":"意思表示是民法概念吗？","type":"TRUE_FALSE","options":["对","错"],"answer":"对","explanation":"e","nodeTitles":["意思表示"]},
@@ -69,6 +85,7 @@ internal class ScriptedRouter : ModelRouter {
             request.user.contains("[[CHAPTER]]") -> Phase.CHAPTER
             request.user.contains("[[VERIFY]]") -> Phase.VERIFY
             request.user.contains("[[QUIZ]]") -> Phase.QUIZ
+            request.user.contains("[[REWRITE]]") -> Phase.REWRITE
             else -> error("没有匹配的测试数据: ${request.user.take(40)}")
         }
         calls += phase
@@ -81,8 +98,9 @@ internal class ScriptedRouter : ModelRouter {
             Phase.MAP -> MAP_JSON
             Phase.BIBLE -> BIBLE_JSON
             Phase.CHAPTER -> chapterJson
-            Phase.VERIFY -> verifyJson
+            Phase.VERIFY -> verifyQueue.removeFirstOrNull() ?: verifyJson
             Phase.QUIZ -> quizJson
+            Phase.REWRITE -> rewriteQueue.removeFirstOrNull() ?: rewriteJson
         }
         return try {
             Result.success(decoder.decode(text))
@@ -111,15 +129,28 @@ internal class TaggedPromptProvider(
      * 传一个带占位符的模板进来（第三阶段 3B）。
      */
     private val chapterTemplate: String = "[[CHAPTER]]",
+    /**
+     * 局部重写模板（4B）。默认就带上下段与问题清单的占位符——
+     * 「改出来的段落接不接得上原位」只能从喂进去的提示词里验。
+     */
+    private val rewriteTemplate: String =
+        "[[REWRITE]] 上一段=<{previousBlock}> 本段=<{targetBlock}> 下一段=<{nextBlock}> " +
+            "问题=<{issues}> 资料区=<{sourceSection}>",
+    /**
+     * 核验模板。默认带上 `{blocks}`——「核验看到的是哪几块正文」
+     * 是局部重写唯一能从外部验证的点（4B）：只改一块，但核验必须看到全章。
+     */
+    private val verifyTemplate: String = "[[VERIFY]] 正文=<{blocks}>",
 ) : PromptProvider {
     private val map = mapOf(
         "knowledge_map" to "[[MAP]]",
         "knowledge_map_model" to "[[MAP]]",
         "story_bible" to "[[BIBLE]]",
         "chapter" to chapterTemplate,
-        "verify" to "[[VERIFY]]",
-        "verify_model" to "[[VERIFY]]",
+        "verify" to verifyTemplate,
+        "verify_model" to verifyTemplate,
         "quiz" to "[[QUIZ]]",
+        "rewrite_block" to rewriteTemplate,
     )
 
     override fun load(name: String): String = map[name] ?: name

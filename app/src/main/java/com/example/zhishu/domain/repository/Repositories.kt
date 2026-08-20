@@ -20,6 +20,7 @@ import com.example.zhishu.domain.model.ReviewItem
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.StoryBible
+import com.example.zhishu.domain.model.VerificationIssue
 import kotlinx.coroutines.flow.Flow
 
 interface ProjectRepository {
@@ -99,6 +100,44 @@ interface CitationRepository {
      * 从来没打算给出处，读者也就不会想到去核对。
      */
     suspend fun unconfirmForSource(sourceId: String)
+}
+
+/**
+ * 核验问题（第四阶段 4B）。
+ *
+ * Active 系列读当前正文的问题，ByVersion 系列读某一版的——局部重写发生在
+ * 还没发布的草稿版本上，那时 Active 系列一条都查不到。
+ */
+interface VerificationIssueRepository {
+    /** 当前正文的问题。大纲页与阅读器订阅这一条 */
+    fun observeActiveByChapter(chapterId: String): Flow<List<VerificationIssue>>
+    suspend fun getActiveByChapter(chapterId: String): List<VerificationIssue>
+
+    /** 当前正文还没处理的问题条数 */
+    suspend fun countActiveOpen(chapterId: String): Int
+
+    fun observeActiveByProject(projectId: String): Flow<List<VerificationIssue>>
+
+    /** 指定版本的问题。局部重写与重新核验用 */
+    suspend fun getByVersion(versionId: String): List<VerificationIssue>
+    fun observeByVersion(versionId: String): Flow<List<VerificationIssue>>
+
+    /** 全项目**全部历史版本**的问题。只用于导出备份 */
+    suspend fun getAllVersionsByProject(projectId: String): List<VerificationIssue>
+
+    /** 换掉某一版的问题，历史版本一律保留 */
+    suspend fun replaceForVersion(versionId: String, issues: List<VerificationIssue>)
+
+    suspend fun upsertAll(issues: List<VerificationIssue>)
+
+    /** 用户判断这条不需要改 */
+    suspend fun accept(issueId: String)
+
+    /** 这些块重写并重新核验后问题没再出现 → 标记已修 */
+    suspend fun markFixedForBlocks(versionId: String, blockIds: List<String>)
+
+    suspend fun deleteByChapter(chapterId: String)
+    suspend fun deleteByProject(projectId: String)
 }
 
 interface KnowledgeRepository {
@@ -206,6 +245,26 @@ interface ChapterRepository {
         title: String,
         now: Long,
     ): ChapterVersion
+
+    /**
+     * 建一个**从某一版派生**的草稿版本（4B 局部重写）。
+     *
+     * 与 [insertDraftVersion] 的区别只在于记住了来源版本，并把来源版本的
+     * 摘要 / 结尾状态 / 覆盖台账先继承过来——局部重写只动几块正文，
+     * 这些元数据大概率不变；真变了会在重新核验通过时被覆盖。
+     * 不继承的话，一次只改了第 3 段的重写会把整章摘要清空。
+     *
+     * 同样只建行不改指针：读者此刻读到的还是旧正文。
+     */
+    suspend fun insertDerivedDraftVersion(
+        chapterId: String,
+        projectId: String,
+        source: ChapterVersion,
+        now: Long,
+    ): ChapterVersion
+
+    /** 把重写过的块记在版本上，供 UI 说清「这一版改了哪几块」 */
+    suspend fun setRewrittenBlocks(versionId: String, blockIds: List<String>)
 
     suspend fun updateVersionStatus(
         versionId: String,

@@ -6,6 +6,7 @@ import com.example.zhishu.ai.pipeline.PipelineService
 import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.data.local.repo.DefaultChapterRepository
 import com.example.zhishu.data.local.repo.DefaultCitationRepository
+import com.example.zhishu.data.local.repo.DefaultVerificationIssueRepository
 import com.example.zhishu.data.local.repo.DefaultKnowledgeRepository
 import com.example.zhishu.data.local.repo.DefaultProgressRepository
 import com.example.zhishu.data.local.repo.DefaultProjectRepository
@@ -76,6 +77,7 @@ class VersionHardeningTest {
                 db.chapterVersionDao(),
             ),
             citationRepository = DefaultCitationRepository(db.citationDao()),
+            issueRepository = DefaultVerificationIssueRepository(db.verificationIssueDao()),
             storyBibleRepository = DefaultStoryBibleRepository(db.storyBibleDao()),
             quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
             reviewRepository = DefaultReviewRepository(db.reviewItemDao()),
@@ -492,6 +494,10 @@ class VersionHardeningTest {
             "ChapterBlockDao.kt",
             // 引用关系的 DAO（4A）：同样只有备份导出会调它的 AllVersions 查询
             "CitationDao.kt",
+            // 核验问题的 DAO（4B）：同理，AllVersions 只给备份导出用。
+            // 大纲页看到的必须是 Active 系列——混进历史版本的问题，
+            // 用户会看到一堆说的是已经被替换掉的文字的问题
+            "VerificationIssueDao.kt",
         )
         val offenders = sourceRoot().resolve("src/main").walkTopDown()
             .filter { it.isFile && it.extension == "kt" && it.name !in allowed }
@@ -588,6 +594,7 @@ class VersionHardeningTest {
             db.chapterVersionDao(),
         ),
         citationRepository = DefaultCitationRepository(db.citationDao()),
+            issueRepository = DefaultVerificationIssueRepository(db.verificationIssueDao()),
             storyBibleRepository = DefaultStoryBibleRepository(db.storyBibleDao()),
         quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
         reviewRepository = DefaultReviewRepository(db.reviewItemDao()),

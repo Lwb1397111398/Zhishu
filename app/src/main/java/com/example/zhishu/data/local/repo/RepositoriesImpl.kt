@@ -16,6 +16,7 @@ import com.example.zhishu.data.local.dao.ReviewItemDao
 import com.example.zhishu.data.local.dao.SourceChunkDao
 import com.example.zhishu.data.local.dao.SourceDocumentDao
 import com.example.zhishu.data.local.dao.StoryBibleDao
+import com.example.zhishu.data.local.dao.VerificationIssueDao
 import com.example.zhishu.domain.model.AnswerRecord
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
@@ -24,6 +25,7 @@ import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.Citation
 import com.example.zhishu.domain.model.CitationStatus
+import com.example.zhishu.domain.model.IssueResolution
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
@@ -38,6 +40,7 @@ import com.example.zhishu.domain.model.ReviewStatus
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.StoryBible
+import com.example.zhishu.domain.model.VerificationIssue
 import com.example.zhishu.domain.repository.ChapterRepository
 import com.example.zhishu.domain.repository.CitationRepository
 import com.example.zhishu.domain.repository.KnowledgeRepository
@@ -48,6 +51,7 @@ import com.example.zhishu.domain.repository.ReviewRepository
 import com.example.zhishu.domain.repository.SettingsRepository
 import com.example.zhishu.domain.repository.SourceRepository
 import com.example.zhishu.domain.repository.StoryBibleRepository
+import com.example.zhishu.domain.repository.VerificationIssueRepository
 import kotlinx.coroutines.flow.Flow
 
 class DefaultProjectRepository(private val dao: ProjectDao) : ProjectRepository {
@@ -271,6 +275,40 @@ class DefaultChapterRepository(
         return version
     }
 
+    override suspend fun insertDerivedDraftVersion(
+        chapterId: String,
+        projectId: String,
+        source: ChapterVersion,
+        now: Long,
+    ): ChapterVersion {
+        val next = versionDao.maxVersionNumber(chapterId) + 1
+        val version = ChapterVersion(
+            id = "$chapterId-v$next",
+            chapterId = chapterId,
+            projectId = projectId,
+            versionNumber = next,
+            status = ChapterVersionStatus.DRAFT,
+            title = source.title,
+            // 元数据先继承。局部重写只动几块正文，整章摘要与结尾状态大概率不变；
+            // 真变了会在重新核验通过、发布时被覆盖。不继承的后果很具体：
+            // 只改了第 3 段的重写会把整章摘要和覆盖台账清空
+            summary = source.summary,
+            endingState = source.endingState,
+            coveredTitles = source.coveredTitles,
+            coveredNodeIds = source.coveredNodeIds,
+            unverifiedClaims = source.unverifiedClaims,
+            usedModelKnowledge = source.usedModelKnowledge,
+            derivedFromVersionId = source.id,
+            createdAt = now,
+            updatedAt = now,
+        )
+        versionDao.upsert(version)
+        return version
+    }
+
+    override suspend fun setRewrittenBlocks(versionId: String, blockIds: List<String>) =
+        versionDao.updateRewrittenBlocks(versionId, blockIds)
+
     override suspend fun updateVersionStatus(
         versionId: String,
         status: ChapterVersionStatus,
@@ -349,6 +387,54 @@ class DefaultCitationRepository(private val dao: CitationDao) : CitationReposito
 
     override suspend fun unconfirmForSource(sourceId: String) =
         dao.unconfirmForSource(sourceId, CitationStatus.UNCONFIRMED)
+}
+
+/**
+ * 核验问题（4B）。转发为主，两处有逻辑：
+ * [replaceForVersion] 先清这一版再写（重新核验同一版不留上一次的残留）；
+ * [markFixedForBlocks] 空名单直接返回——`blockId IN ()` 在 SQLite 里是语法错误。
+ */
+class DefaultVerificationIssueRepository(
+    private val dao: VerificationIssueDao,
+) : VerificationIssueRepository {
+    override fun observeActiveByChapter(chapterId: String): Flow<List<VerificationIssue>> =
+        dao.observeActiveByChapter(chapterId)
+
+    override suspend fun getActiveByChapter(chapterId: String): List<VerificationIssue> =
+        dao.getActiveByChapter(chapterId)
+
+    override suspend fun countActiveOpen(chapterId: String): Int =
+        dao.countActiveOpen(chapterId, IssueResolution.OPEN)
+
+    override fun observeActiveByProject(projectId: String): Flow<List<VerificationIssue>> =
+        dao.observeActiveByProject(projectId)
+
+    override suspend fun getByVersion(versionId: String): List<VerificationIssue> =
+        dao.getByVersion(versionId)
+
+    override fun observeByVersion(versionId: String): Flow<List<VerificationIssue>> =
+        dao.observeByVersion(versionId)
+
+    override suspend fun getAllVersionsByProject(projectId: String): List<VerificationIssue> =
+        dao.getAllVersionsByProject(projectId)
+
+    override suspend fun replaceForVersion(versionId: String, issues: List<VerificationIssue>) {
+        dao.deleteByVersion(versionId)
+        if (issues.isNotEmpty()) dao.upsertAll(issues)
+    }
+
+    override suspend fun upsertAll(issues: List<VerificationIssue>) = dao.upsertAll(issues)
+
+    override suspend fun accept(issueId: String) =
+        dao.updateResolution(issueId, IssueResolution.ACCEPTED)
+
+    override suspend fun markFixedForBlocks(versionId: String, blockIds: List<String>) {
+        if (blockIds.isEmpty()) return
+        dao.markFixedForBlocks(versionId, blockIds, IssueResolution.FIXED)
+    }
+
+    override suspend fun deleteByChapter(chapterId: String) = dao.deleteByChapter(chapterId)
+    override suspend fun deleteByProject(projectId: String) = dao.deleteByProject(projectId)
 }
 
 class DefaultStoryBibleRepository(private val dao: StoryBibleDao) : StoryBibleRepository {    override suspend fun get(projectId: String): StoryBible? = dao.get(projectId)

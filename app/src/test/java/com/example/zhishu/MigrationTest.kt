@@ -9,6 +9,9 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.CitationStatus
+import com.example.zhishu.domain.model.IssueResolution
+import com.example.zhishu.domain.model.IssueType
+import com.example.zhishu.domain.model.VerificationIssue
 import com.example.zhishu.search.DefaultSearchRepository
 import com.example.zhishu.search.SearchHitKind
 import kotlinx.coroutines.runBlocking
@@ -57,11 +60,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_7_8,
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
+                    AppDatabase.MIGRATION_10_11,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(10, db.openHelper.readableDatabase.version)
+            assertEquals(11, db.openHelper.readableDatabase.version)
 
             // 旧数据保留
             assertEquals("民法基础", db.projectDao().getById("p-1")?.title)
@@ -114,11 +118,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_7_8,
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
+                    AppDatabase.MIGRATION_10_11,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(10, db.openHelper.readableDatabase.version)
+            assertEquals(11, db.openHelper.readableDatabase.version)
             // 旧项目仍在，新列有默认值
             val project = db.projectDao().getById("p-1")
             assertEquals("民法基础", project?.title)
@@ -150,11 +155,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_7_8,
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
+                    AppDatabase.MIGRATION_10_11,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(10, db.openHelper.readableDatabase.version)
+            assertEquals(11, db.openHelper.readableDatabase.version)
             // 旧进度行保留，新列取默认值 0
             val old = db.readingProgressDao().getForProject("p-1")
             assertEquals("ch-1", old?.chapterId)
@@ -197,11 +203,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_7_8,
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
+                    AppDatabase.MIGRATION_10_11,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(10, db.openHelper.readableDatabase.version)
+            assertEquals(11, db.openHelper.readableDatabase.version)
 
             // ch-1 有题：标 READY，状态不动
             val withQuiz = db.chapterPlanDao().getById("ch-1")
@@ -249,11 +256,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_7_8,
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
+                    AppDatabase.MIGRATION_10_11,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(10, db.openHelper.readableDatabase.version)
+            assertEquals(11, db.openHelper.readableDatabase.version)
 
             // 每个现有章节都有一个初始版本，一章不落
             assertEquals(1, db.chapterVersionDao().countByChapter("ch-1"))
@@ -324,11 +332,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_7_8,
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
+                    AppDatabase.MIGRATION_10_11,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(10, db.openHelper.readableDatabase.version)
+            assertEquals(11, db.openHelper.readableDatabase.version)
 
             // 已发布章节：carryOver 是结尾状态，落在当前版本上；openingHook 留空
             val published = db.chapterPlanDao().getById("ch-1")
@@ -365,11 +374,11 @@ class MigrationTest {
         createV7Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_7_8, AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10)
+            .addMigrations(AppDatabase.MIGRATION_7_8, AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(10, db.openHelper.readableDatabase.version)
+            assertEquals(11, db.openHelper.readableDatabase.version)
 
             // 旧章节全部落在第一卷
             val plans = db.chapterPlanDao().getByProject("p-1")
@@ -410,11 +419,11 @@ class MigrationTest {
         createV8Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10)
+            .addMigrations(AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(10, db.openHelper.readableDatabase.version)
+            assertEquals(11, db.openHelper.readableDatabase.version)
 
             val byId = db.chapterVersionDao().getByChapter("ch-1").associateBy { it.id }
             // 有正文、比当前版本旧 → 被取代的历史正文
@@ -463,11 +472,11 @@ class MigrationTest {
         createV9Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_9_10)
+            .addMigrations(AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(10, db.openHelper.readableDatabase.version)
+            assertEquals(11, db.openHelper.readableDatabase.version)
 
             // 当前版本（ch-1-v3）的引用：一条对上了片段，一条对不上
             val active = db.citationDao().getActiveByChapter("ch-1").sortedBy { it.order }
@@ -525,12 +534,91 @@ class MigrationTest {
         createV9Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_9_10)
+            .addMigrations(AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11)
             .allowMainThreadQueries()
             .build()
         try {
             // 种子项目是 DOCUMENTS 模式（v2→v3 的默认值）
             assertFalse(db.chapterVersionDao().getById("ch-1-v3")?.usedModelKnowledge == true)
+        } finally {
+            db.close()
+        }
+    }
+
+    /**
+     * v10 → v11：核验问题落成一张表（4B）。
+     *
+     * 盯三件事：
+     * 1. 新表建起来且真能写读，`blockId` 可空（定位不到具体段落的问题也要能存）；
+     * 2. 旧的 `chapters.verificationNote` **原样保留**，不被拆成一批假的问题记录。
+     *    那段文字没有 blockId、没有原始类型，还很可能已经被 `take(5)` 截过，
+     *    回填出来的「本章还有 3 个问题」从第一天起就是不可信的数字；
+     * 3. 正文、引用、版本、进度一个字都没动。
+     */
+    @Test
+    fun migrate10To11_addsIssueTableWithoutFakingOldIssues() = runBlocking {
+        createV10Database()
+
+        val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_10_11)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            assertEquals(11, db.openHelper.readableDatabase.version)
+
+            // 旧说明原样留着，而且没有被回填成问题记录
+            assertEquals(
+                "[contradiction] 继承顺序说错了",
+                db.chapterPlanDao().getById("ch-1")?.verificationNote,
+            )
+            assertTrue(db.verificationIssueDao().getAllVersionsByProject("p-1").isEmpty())
+
+            // 新表可写可读：一条能定位到段落，一条定位不到
+            db.verificationIssueDao().upsertAll(
+                listOf(
+                    VerificationIssue(
+                        id = VerificationIssue.idFor("ch-1-v3", 0),
+                        projectId = "p-1",
+                        chapterId = "ch-1",
+                        versionId = "ch-1-v3",
+                        blockId = "b-v3",
+                        type = IssueType.CONTRADICTION,
+                        rawType = "contradiction",
+                        message = "这里的顺序与资料不符",
+                        suggestedFix = "改成配偶、子女、父母",
+                        createdAt = 1L,
+                    ),
+                    VerificationIssue(
+                        id = VerificationIssue.idFor("ch-1-v3", 1),
+                        projectId = "p-1",
+                        chapterId = "ch-1",
+                        versionId = "ch-1-v3",
+                        blockId = null,
+                        type = IssueType.BROKEN_DERIVATION,
+                        message = "全章的推演在中段断了一次",
+                        createdAt = 1L,
+                    ),
+                ),
+            )
+            val active = db.verificationIssueDao().getActiveByChapter("ch-1")
+            assertEquals(2, active.size)
+            assertEquals("b-v3", active[0].blockId)
+            assertTrue(active[0].isBlockScoped)
+            // 定位不到段落的问题存得下，而且明确不能单块重写
+            assertNull(active[1].blockId)
+            assertFalse(active[1].isBlockScoped)
+            assertEquals(2, db.verificationIssueDao().countActiveOpen("ch-1", IssueResolution.OPEN))
+
+            // 版本行的两个新列：旧版本都是整章生成的，没有派生来源
+            val version = db.chapterVersionDao().getById("ch-1-v3")
+            assertNull(version?.derivedFromVersionId)
+            assertEquals(emptyList<String>(), version?.rewrittenBlockIds)
+            assertFalse(version?.isPartialRewrite == true)
+
+            // 4A 建立的引用一条不少，正文一块不少，进度一个字没动
+            assertEquals(2, db.citationDao().getActiveByChapter("ch-1").size)
+            assertEquals(3, db.chapterBlockDao().countByProject("p-1"))
+            assertEquals("b-1", db.readingProgressDao().getForProject("p-1")?.blockId)
         } finally {
             db.close()
         }
@@ -789,6 +877,44 @@ class MigrationTest {
                 .build(),
         )
         helper.writableDatabase.use { it.version = 9 }
+        helper.close()
+    }
+
+    /**
+     * 造出一个真正的 v10 库：v9 库 + 执行 9→10，版本号置为 10。
+     *
+     * 顺带塞一条 4B 之前那种核验说明：一整章的问题被拼成一个字符串存在
+     * `chapters.verificationNote` 上。迁移之后它必须原样还在。
+     */
+    private fun createV10Database() {
+        val callback = object : SupportSQLiteOpenHelper.Callback(10) {
+            override fun onCreate(db: SupportSQLiteDatabase) {
+                seedV5(db)
+                AppDatabase.MIGRATION_5_6.migrate(db)
+                AppDatabase.MIGRATION_6_7.migrate(db)
+                AppDatabase.MIGRATION_7_8.migrate(db)
+                seedV8MultiVersionChapter(db)
+                AppDatabase.MIGRATION_8_9.migrate(db)
+                db.execSQL(
+                    "UPDATE chapter_blocks SET sourceRefs = '[\"c-1\",\"c-已经删掉的资料\"]' " +
+                        "WHERE id = 'b-v3'",
+                )
+                db.execSQL("UPDATE chapter_blocks SET sourceRefs = '[\"c-1\"]' WHERE id = 'b-v2'")
+                AppDatabase.MIGRATION_9_10.migrate(db)
+                db.execSQL(
+                    "UPDATE chapters SET verificationNote = '[contradiction] 继承顺序说错了' WHERE id = 'ch-1'",
+                )
+            }
+
+            override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+        }
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(dbName)
+                .callback(callback)
+                .build(),
+        )
+        helper.writableDatabase.use { it.version = 10 }
         helper.close()
     }
 

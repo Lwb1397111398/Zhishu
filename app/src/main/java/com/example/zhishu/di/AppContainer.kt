@@ -15,6 +15,7 @@ import com.example.zhishu.data.local.repo.DefaultReviewRepository
 import com.example.zhishu.data.local.repo.DefaultSettingsRepository
 import com.example.zhishu.data.local.repo.DefaultSourceRepository
 import com.example.zhishu.data.local.repo.DefaultStoryBibleRepository
+import com.example.zhishu.data.local.repo.DefaultVerificationIssueRepository
 import com.example.zhishu.data.prefs.LearningPrefs
 import com.example.zhishu.data.transfer.TransferManager
 import com.example.zhishu.domain.repository.ChapterRepository
@@ -27,6 +28,7 @@ import com.example.zhishu.domain.repository.ReviewRepository
 import com.example.zhishu.domain.repository.SettingsRepository
 import com.example.zhishu.domain.repository.SourceRepository
 import com.example.zhishu.domain.repository.StoryBibleRepository
+import com.example.zhishu.domain.repository.VerificationIssueRepository
 import com.example.zhishu.search.DefaultSearchRepository
 import com.example.zhishu.search.ParserServiceImpl
 import com.example.zhishu.search.SearchRepository
@@ -53,6 +55,8 @@ class AppContainer(context: Context) {
     )
     /** 正文块 ↔ 资料片段的引用关系（4A） */
     val citationRepository: CitationRepository = DefaultCitationRepository(database.citationDao())
+    val issueRepository: VerificationIssueRepository =
+        DefaultVerificationIssueRepository(database.verificationIssueDao())
     val storyBibleRepository: StoryBibleRepository = DefaultStoryBibleRepository(database.storyBibleDao())
     val quizRepository: QuizRepository = DefaultQuizRepository(database.quizDao(), database.answerRecordDao())
     val reviewRepository: ReviewRepository = DefaultReviewRepository(database.reviewItemDao())
@@ -84,6 +88,7 @@ class AppContainer(context: Context) {
         knowledgeRepository = knowledgeRepository,
         chapterRepository = chapterRepository,
         citationRepository = citationRepository,
+        issueRepository = issueRepository,
         storyBibleRepository = storyBibleRepository,
         quizRepository = quizRepository,
         reviewRepository = reviewRepository,

@@ -214,6 +214,10 @@ interface ChapterVersionDao {
     @Query("SELECT COUNT(*) FROM chapter_versions WHERE chapterId = :chapterId")
     suspend fun countByChapter(chapterId: String): Int
 
+    /** 只写「这一版重写过哪几块」，不碰状态与元数据（4B） */
+    @Query("UPDATE chapter_versions SET rewrittenBlockIds = :blockIds WHERE id = :versionId")
+    suspend fun updateRewrittenBlocks(versionId: String, blockIds: List<String>)
+
     companion object {
         /** 还没走完的版本状态 */
         val PENDING_STATUSES = listOf(
