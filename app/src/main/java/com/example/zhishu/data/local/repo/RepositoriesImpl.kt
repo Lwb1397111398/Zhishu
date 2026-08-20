@@ -185,20 +185,7 @@ class DefaultChapterRepository(
         wordTarget: Int,
     ) = planDao.updateEditableFields(id, title, plotGoal, learningGoals, wordTarget)
 
-    override fun observeBlocks(chapterId: String): Flow<List<ChapterBlock>> =
-        blockDao.observeByChapter(chapterId)
-
-    override suspend fun getBlocks(chapterId: String): List<ChapterBlock> =
-        blockDao.getByChapter(chapterId)
-
-    override suspend fun getBlocksByProject(projectId: String): List<ChapterBlock> =
-        blockDao.getByProject(projectId)
-
-    override suspend fun countBlocks(projectId: String): Int = blockDao.countByProject(projectId)
-
-    override suspend fun upsertBlocks(blocks: List<ChapterBlock>) = blockDao.upsertAll(blocks)
-
-    // --- 正文版本化（第三阶段 3A）---
+    // --- 正文读取（第三阶段 3A，命名在 3D 收紧）---
 
     override fun observeActiveBlocks(chapterId: String): Flow<List<ChapterBlock>> =
         blockDao.observeActiveBlocks(chapterId)
@@ -211,6 +198,26 @@ class DefaultChapterRepository(
 
     override suspend fun getActiveBlocksByProject(projectId: String): List<ChapterBlock> =
         blockDao.getActiveBlocksByProject(projectId)
+
+    override suspend fun countActiveBlocks(projectId: String): Int =
+        blockDao.countActiveByProject(projectId)
+
+    override suspend fun countActiveChars(projectId: String): Int =
+        blockDao.countActiveCharsByProject(projectId)
+
+    override suspend fun countActiveCharsForChapter(chapterId: String): Int =
+        blockDao.countActiveCharsByChapter(chapterId)
+
+    override suspend fun getAllVersionsBlocks(chapterId: String): List<ChapterBlock> =
+        blockDao.getAllVersionsByChapter(chapterId)
+
+    override suspend fun getAllVersionsBlocksByProject(projectId: String): List<ChapterBlock> =
+        blockDao.getAllVersionsByProject(projectId)
+
+    override suspend fun countAllVersionsBlocks(projectId: String): Int =
+        blockDao.countByProject(projectId)
+
+    override suspend fun upsertBlocks(blocks: List<ChapterBlock>) = blockDao.upsertAll(blocks)
 
     override suspend fun getActiveVersion(chapterId: String): ChapterVersion? =
         versionDao.getActive(chapterId)
@@ -292,9 +299,17 @@ class DefaultStoryBibleRepository(private val dao: StoryBibleDao) : StoryBibleRe
         projectId: String,
         runningState: String,
         coveredTitles: List<String>,
+        coveredNodeIds: List<String>,
         openThreads: List<String>,
         updatedAt: Long,
-    ) = dao.updateMemory(projectId, runningState, coveredTitles, openThreads, updatedAt)
+    ) = dao.updateMemory(
+        projectId = projectId,
+        runningState = runningState,
+        coveredTitles = coveredTitles,
+        coveredNodeIds = coveredNodeIds,
+        openThreads = openThreads,
+        updatedAt = updatedAt,
+    )
 
     override suspend fun clearForProject(projectId: String) = dao.clearByProject(projectId)
 }
@@ -353,7 +368,9 @@ class DefaultReviewRepository(private val dao: ReviewItemDao) : ReviewRepository
 
 class DefaultProgressRepository(private val dao: ReadingProgressDao) : ProgressRepository {
     override suspend fun get(projectId: String): ReadingProgress? = dao.getForProject(projectId)
+    override suspend fun saveAnchor(progress: ReadingProgress) = dao.saveAnchor(progress)
     override suspend fun save(progress: ReadingProgress) = dao.upsert(progress)
+    override suspend fun markNoticeShown(projectId: String) = dao.markNoticeShown(projectId)
     override suspend fun clearForProject(projectId: String) = dao.deleteByProject(projectId)
 }
 

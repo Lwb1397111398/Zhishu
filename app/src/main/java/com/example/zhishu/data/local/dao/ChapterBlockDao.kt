@@ -38,16 +38,22 @@ interface ChapterBlockDao {
     @Query("DELETE FROM chapter_block_fts WHERE blockId = :blockId")
     suspend fun deleteFtsForBlock(blockId: String)
 
-    @Query("SELECT * FROM chapter_blocks WHERE chapterId = :chapterId ORDER BY [order]")
-    fun observeByChapter(chapterId: String): Flow<List<ChapterBlock>>
+    // --- 全部历史版本（3D 起一律带 AllVersions / ByVersion 前后缀）---
+    //
+    // 这几条查出来的是**一章的全部版本正文叠在一起**，绝不能拿给阅读器、搜索或出题用。
+    // 唯一的合法用途是导出备份和按章清理。命名上带足警示，是因为 3A 之后
+    // 一个含糊的 getByChapter() 在代码里看起来和「读这一章的正文」一模一样。
 
-    @Query("SELECT * FROM chapter_blocks WHERE chapterId = :chapterId ORDER BY [order]")
-    suspend fun getByChapter(chapterId: String): List<ChapterBlock>
+    @Query("SELECT * FROM chapter_blocks WHERE chapterId = :chapterId ORDER BY versionId, [order]")
+    suspend fun getAllVersionsByChapter(chapterId: String): List<ChapterBlock>
+
+    /** 全项目全部历史版本正文。只用于导出备份 */
+    @Query("SELECT * FROM chapter_blocks WHERE projectId = :projectId ORDER BY chapterId, versionId, [order]")
+    suspend fun getAllVersionsByProject(projectId: String): List<ChapterBlock>
 
     // --- 当前版本正文（第三阶段 3A）---
     //
-    // 阅读器、知识点跳转、搜索一律走这几条。按 chapterId 直接查出来的是**全部历史版本**，
-    // 重生成过的章节会把两版正文叠在一起显示，所以那几条只留给按章清理和导出用。
+    // 阅读器、知识点跳转、搜索一律走这几条。
 
     @Query(
         "SELECT chapter_blocks.* FROM chapter_blocks " +
@@ -67,13 +73,9 @@ interface ChapterBlockDao {
     )
     suspend fun getActiveBlocks(chapterId: String): List<ChapterBlock>
 
-    /** 某个版本的正文，与章节当前指针无关。核验新版本、导出历史时用 */
+    /** 某个版本的正文，与章节当前指针无关。核验新版本、导出历史、局部重写时用 */
     @Query("SELECT * FROM chapter_blocks WHERE versionId = :versionId ORDER BY [order]")
     suspend fun getByVersion(versionId: String): List<ChapterBlock>
-
-    /** 全项目正文，用于建立「知识点 → 所属章节的哪一块」的跳转锚点 */
-    @Query("SELECT * FROM chapter_blocks WHERE projectId = :projectId ORDER BY chapterId, [order]")
-    suspend fun getByProject(projectId: String): List<ChapterBlock>
 
     /** 全项目当前版本正文。跳转锚点只能落在读者真的看得到的那一版上 */
     @Query(
@@ -113,19 +115,24 @@ interface ChapterBlockDao {
     @Query("DELETE FROM chapter_block_fts WHERE projectId = :projectId")
     suspend fun deleteFtsByProject(projectId: String)
 
-    /** 走 FTS 倒排索引，避免前后通配符导致的全表扫描（P2） */
+    /**
+     * 全部历史版本的全文检索（3D 起明确命名）。
+     *
+     * 不给业务用：它会命中读者已经看不到的旧版本正文。留着是因为
+     * [searchActiveByProjectMatch] 的查询计划断言需要一个对照。
+     */
     @Query(
         "SELECT chapter_blocks.* FROM chapter_block_fts " +
             "JOIN chapter_blocks ON chapter_blocks.id = chapter_block_fts.blockId " +
             "WHERE chapter_block_fts.projectId = :projectId AND chapter_block_fts.body MATCH :match " +
             "ORDER BY chapter_blocks.[order] LIMIT 50",
     )
-    suspend fun searchByProjectMatch(projectId: String, match: String): List<ChapterBlock>
+    suspend fun searchAllVersionsByProjectMatch(projectId: String, match: String): List<ChapterBlock>
 
     /**
-     * 只搜当前版本正文（第三阶段 3A）。
+     * 只搜当前版本正文（第三阶段 3A）。走 FTS 倒排索引，避免前后通配符导致全表扫描（P2）。
      *
-     * 被放弃的版本仍留在 FTS 索引里（正文块一个都不删），靠这里的 versionId 条件过滤掉——
+     * 被放弃/归档的版本仍留在 FTS 索引里（正文块一个都不删），靠这里的 versionId 条件过滤掉——
      * 否则搜索会命中一段读者已经看不到的旧正文，点进去还落不到任何位置。
      */
     @Query(
@@ -140,6 +147,36 @@ interface ChapterBlockDao {
 
     @Query("SELECT COUNT(*) FROM chapter_blocks WHERE projectId = :projectId")
     suspend fun countByProject(projectId: String): Int
+
+    /**
+     * 当前版本正文的块数与字数（3D）。
+     *
+     * 「本项目写了多少」必须只数当前版本：把历史版本一起算进去，
+     * 重生成过一章就凭空多出一整章的字数，进度条会显示写了两倍的量。
+     */
+    @Query(
+        "SELECT COUNT(*) FROM chapter_blocks " +
+            "JOIN chapters ON chapters.id = chapter_blocks.chapterId " +
+            "WHERE chapter_blocks.projectId = :projectId " +
+            "AND chapter_blocks.versionId = chapters.activeVersionId",
+    )
+    suspend fun countActiveByProject(projectId: String): Int
+
+    @Query(
+        "SELECT COALESCE(SUM(LENGTH(chapter_blocks.text)), 0) FROM chapter_blocks " +
+            "JOIN chapters ON chapters.id = chapter_blocks.chapterId " +
+            "WHERE chapter_blocks.projectId = :projectId " +
+            "AND chapter_blocks.versionId = chapters.activeVersionId",
+    )
+    suspend fun countActiveCharsByProject(projectId: String): Int
+
+    @Query(
+        "SELECT COALESCE(SUM(LENGTH(chapter_blocks.text)), 0) FROM chapter_blocks " +
+            "JOIN chapters ON chapters.id = chapter_blocks.chapterId " +
+            "WHERE chapter_blocks.chapterId = :chapterId " +
+            "AND chapter_blocks.versionId = chapters.activeVersionId",
+    )
+    suspend fun countActiveCharsByChapter(chapterId: String): Int
 
     @Query("SELECT COUNT(*) FROM chapter_block_fts WHERE projectId = :projectId")
     suspend fun countFtsByProject(projectId: String): Int

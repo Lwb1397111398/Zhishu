@@ -17,6 +17,7 @@ import com.example.zhishu.domain.model.ProjectStatus
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.SourceKind
+import java.io.File
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -88,6 +89,7 @@ class CarryOverSplitTest {
 
     /** 规划阶段写进 openingHook 而不是 carryOver——两种含义不再共用一列 */
     @Test
+    @Suppress("DEPRECATION")
     fun planning_writesOpeningHookNotCarryOver() = runBlocking {
         seedThroughBible()
         val plans = db.chapterPlanDao().getByProject("p-1").sortedBy { it.order }
@@ -193,6 +195,7 @@ class CarryOverSplitTest {
 
     /** 发布后只更新当前版本的 endingState，历史 carryOver 列不再被写 */
     @Test
+    @Suppress("DEPRECATION")
     fun publish_writesEndingStateOnVersionOnly() = runBlocking {
         seedThroughBible()
         val planId = db.chapterPlanDao().getByProject("p-1").sortedBy { it.order }.first().id
@@ -202,6 +205,75 @@ class CarryOverSplitTest {
         assertEquals("", db.chapterPlanDao().getById(planId)?.carryOver)
         // 开头钩子还是规划时那一句，没被结尾覆盖——这正是旧实现的病根
         assertEquals("从一封律师函开始", db.chapterPlanDao().getById(planId)?.openingHook)
+    }
+
+    /**
+     * 架构约束（3D）：业务代码不许读写 `carryOver`。
+     *
+     * 这一列现在只为旧数据库升级与旧备份导入而存在。它已经标了 `@Deprecated`，
+     * 但注释和 warning 挡不住所有人——尤其它的名字看起来正好像是「上一章的前情」。
+     * 所以这里直接扫源码：只有下面这份白名单里的文件可以出现它。
+     *
+     * 白名单的每一项都有明确理由：
+     * - `Chapter.kt`：字段声明本身；
+     * - `AppDatabase.kt`：v2→v3 建列、v5→v6 与 v6→v7 一次性搬运；
+     * - `TransferManager.kt`：旧备份（v4 及更早）导入，规则与上面两条迁移逐字一致。
+     *
+     * 提示词模板一律不许出现——那是最容易把两个含义接回去的地方。
+     */
+    @Test
+    fun carryOver_isNotReferencedByBusinessCode() {
+        val mainSources = sourceRoot().resolve("src/main")
+        val offenders = mainSources.walkTopDown()
+            .filter { it.isFile && it.extension == "kt" }
+            .filter { it.name !in CARRY_OVER_ALLOWLIST }
+            // 只看真正的代码：注释里提到它是好事（说明为什么不能用），不该算违规
+            .filter { stripComments(it.readText()).contains("carryOver") }
+            .map { it.name }
+            .toList()
+        assertEquals(emptyList<String>(), offenders)
+
+        val prompts = mainSources.resolve("assets/prompts").walkTopDown()
+            .filter { it.isFile && it.extension == "txt" }
+            .filter { it.readText().contains("carryOver") }
+            .map { it.name }
+            .toList()
+        assertEquals(emptyList<String>(), prompts)
+    }
+
+    /**
+     * 去掉行注释与块注释（含 KDoc）。
+     *
+     * 够用就行：这里只是为了把「注释里解释为什么不能用 carryOver」和
+     * 「代码里真的读写了它」分开，不需要一个完整的 Kotlin 词法分析器。
+     */
+    private fun stripComments(source: String): String = source
+        .replace(Regex("/\\*.*?\\*/", RegexOption.DOT_MATCHES_ALL), "")
+        .lines()
+        .joinToString("\n") { line -> line.substringBefore("//") }
+
+    /**
+     * 定位 app 模块目录。
+     *
+     * Gradle 跑单元测试时工作目录可能是仓库根也可能是 `app/`，
+     * 所以两种都试一下，而不是写死一个相对路径。
+     */
+    private fun sourceRoot(): File {
+        val cwd = File(System.getProperty("user.dir").orEmpty())
+        val candidates = listOf(cwd, cwd.resolve("app"), cwd.parentFile?.resolve("app"))
+        return candidates.filterNotNull().firstOrNull { it.resolve("src/main").isDirectory }
+            ?: error("找不到 app/src/main，工作目录是 $cwd")
+    }
+
+    private companion object {
+        val CARRY_OVER_ALLOWLIST = setOf(
+            // 字段声明本身
+            "Chapter.kt",
+            // 建列 + 两次一次性搬运（v2→v3 / v5→v6 / v6→v7）
+            "AppDatabase.kt",
+            // 旧备份导入，规则与上面的迁移逐字一致
+            "TransferManager.kt",
+        )
     }
 
     private suspend fun seedThroughBible() {

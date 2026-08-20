@@ -80,7 +80,7 @@ internal class VolumeRouter : ModelRouter {
      */
     private fun chapterJson(prompt: String): String {
         val node = NODE_IN_PROMPT.find(prompt)?.groupValues?.get(1)?.trim() ?: "继承"
-        return """{"title":"某一章","summary":"讲了$node","carryOver":"房子归属仍未决",""" +
+        return """{"title":"某一章","summary":"讲了$node","endingState":"房子归属仍未决",""" +
             """"runningStateUpdate":"案子推进了一步","coveredTitles":["$node"],"openThreads":[],""" +
             """"blocks":[{"type":"STORY","text":"老人立下遗嘱，子女各怀心思。","knowledgeNodeTitles":["$node"],"sourceRefs":["c-1"]},""" +
             """{"type":"EXPLANATION","text":"$node 是这一章要讲透的东西。","knowledgeNodeTitles":["$node"],"sourceRefs":["c-1"]}]}"""

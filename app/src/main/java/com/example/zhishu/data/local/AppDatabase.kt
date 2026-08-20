@@ -40,6 +40,9 @@ import com.example.zhishu.domain.model.SourceChunkFts
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.StoryBible
 import com.example.zhishu.search.SearchTokenizer
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.json.Json
 
 @Database(
     entities = [
@@ -61,7 +64,7 @@ import com.example.zhishu.search.SearchTokenizer
         ModelConfig::class,
         StoryBible::class,
     ],
-    version = 8,
+    version = 9,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -399,8 +402,133 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v8 → v9：版本系统加固（第三阶段 3D）。
+         *
+         * 三件事，都是把 3A~3C 留下的语义含糊处收干净：
+         *
+         * 1. **区分归档与放弃**。3A 的发布事务把同章其他版本一律写成 ABANDONED，
+         *    于是「成功过、只是被取代的旧正文」和「核验没过的失败尝试」混成了一个值。
+         *    后果很具体：UI 上「上次重新生成没通过」的提示会把每一次**成功**重生成
+         *    留下的旧版本也报成失败。现在旧发布版本改成 ARCHIVED。
+         *    旧数据修正规则：一个作废版本，如果它有正文块、而且**版本号比当前 active 版本小**，
+         *    那它就是被取代的历史正文 → ARCHIVED；剩下的（没有正文块的，或比 active 更新的）
+         *    是真的失败尝试 → 保持 ABANDONED。
+         *
+         * 2. **覆盖关系改用 nodeId**。chapters / chapter_versions / story_bibles 各加一列
+         *    coveredNodeIds。旧数据按标题回填：能在本项目知识地图里精确匹配到标题的补上 ID，
+         *    匹配不上的留空——那种情况不能猜，猜错了会把讲过的当成没讲过。
+         *
+         * 3. **阅读进度带上「正文换过版本」的痕迹**。只清 blockId 不够：用户明明读到一半、
+         *    回来却在开头，页面还一言不发，看起来就是进度丢了。
+         */
+        val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // 1. 归档 vs 放弃
+                db.execSQL(
+                    "UPDATE chapter_versions SET status = 'ARCHIVED' WHERE status = 'ABANDONED' " +
+                        // 有正文块 = 这一版真的写出来过
+                        "AND EXISTS (SELECT 1 FROM chapter_blocks WHERE chapter_blocks.versionId = chapter_versions.id) " +
+                        // 比当前 active 版本旧 = 是被取代，而不是失败
+                        "AND versionNumber < COALESCE((" +
+                        "SELECT active.versionNumber FROM chapter_versions AS active " +
+                        "JOIN chapters ON chapters.activeVersionId = active.id " +
+                        "WHERE chapters.id = chapter_versions.chapterId), 0)",
+                )
+
+                // 2. coveredNodeIds
+                db.execSQL("ALTER TABLE chapters ADD COLUMN coveredNodeIds TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE chapter_versions ADD COLUMN coveredNodeIds TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE story_bibles ADD COLUMN coveredNodeIds TEXT NOT NULL DEFAULT ''")
+                backfillCoveredNodeIds(db, table = "chapters", projectJoin = "chapters.projectId")
+                backfillCoveredNodeIds(
+                    db = db,
+                    table = "chapter_versions",
+                    projectJoin = "chapter_versions.projectId",
+                )
+
+                // 3. 进度提示
+                db.execSQL("ALTER TABLE reading_progress ADD COLUMN bodyUpdatedAt INTEGER NOT NULL DEFAULT 0")
+                db.execSQL(
+                    "ALTER TABLE reading_progress ADD COLUMN progressNoticeShown INTEGER NOT NULL DEFAULT 0",
+                )
+            }
+
+            /**
+             * 按标题回填 nodeId。
+             *
+             * 只在标题**精确唯一匹配**到本项目某个知识点时才补：标题重复或对不上的一律留空。
+             * 留空不等于「没讲过」——判断覆盖时两列都看（`coveredNodeIds` 优先，
+             * 空的时候回退到标题），所以留空是安全的，硬猜才危险。
+             */
+            private fun backfillCoveredNodeIds(
+                db: SupportSQLiteDatabase,
+                table: String,
+                projectJoin: String,
+            ) {
+                val rows = mutableListOf<Pair<String, String>>()
+                db.query("SELECT id, coveredTitles, $projectJoin FROM $table WHERE coveredTitles != ''")
+                    .use { cursor ->
+                        while (cursor.moveToNext()) {
+                            rows += Triple(
+                                cursor.getString(0),
+                                cursor.getString(1),
+                                cursor.getString(2),
+                            ).let { (id, titles, projectId) ->
+                                id to resolveIds(db, titles, projectId)
+                            }
+                        }
+                    }
+                rows.filter { it.second.isNotEmpty() }.forEach { (id, ids) ->
+                    db.execSQL(
+                        "UPDATE $table SET coveredNodeIds = ? WHERE id = ?",
+                        arrayOf(ids, id),
+                    )
+                }
+            }
+
+            /** Converters 把列表存成 JSON 数组，这里按同一个约定解析与拼接 */
+            private fun resolveIds(
+                db: SupportSQLiteDatabase,
+                titles: String,
+                projectId: String,
+            ): String {
+                if (projectId.isBlank()) return ""
+                val resolved = decodeList(titles)
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .mapNotNull { title -> lookupNodeId(db, projectId, title) }
+                    .distinct()
+                return if (resolved.isEmpty()) "" else LIST_JSON.encodeToString(LIST_SERIALIZER, resolved)
+            }
+
+            private fun decodeList(value: String): List<String> = runCatching {
+                if (value.isBlank()) emptyList() else LIST_JSON.decodeFromString(LIST_SERIALIZER, value)
+            }.getOrDefault(emptyList())
+
+            private fun lookupNodeId(
+                db: SupportSQLiteDatabase,
+                projectId: String,
+                title: String,
+            ): String? {
+                db.query(
+                    "SELECT id FROM knowledge_nodes WHERE projectId = ? AND title = ? LIMIT 2",
+                    arrayOf(projectId, title),
+                ).use { cursor ->
+                    if (!cursor.moveToNext()) return null
+                    val id = cursor.getString(0)
+                    // 同名两个节点：无法可靠判断指的是哪个，宁可留空
+                    return if (cursor.moveToNext()) null else id
+                }
+            }
+        }
+
         /** 迁移出来的初始版本 ID 后缀。测试与导入兼容逻辑共用同一个约定。 */
         const val INITIAL_VERSION_SUFFIX = "-v1"
+
+        /** 迁移里手工拼列表时用的 JSON 编解码，与 [Converters] 保持一致 */
+        val LIST_JSON = Json
+        val LIST_SERIALIZER = ListSerializer(String.serializer())
 
         fun build(context: Context): AppDatabase =
             Room.databaseBuilder(context.applicationContext, AppDatabase::class.java, DATABASE_NAME)
@@ -412,6 +540,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_5_6,
                     MIGRATION_6_7,
                     MIGRATION_7_8,
+                    MIGRATION_8_9,
                 )
                 .build()
     }

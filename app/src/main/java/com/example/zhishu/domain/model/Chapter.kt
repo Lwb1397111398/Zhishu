@@ -90,13 +90,27 @@ data class ChapterPlan(
      * 发布后存「本章结束后的故事状态」。同一列两种含义，读的时候只能靠章节状态去猜。
      *
      * 第三阶段 3B 起彻底拆开：开头钩子 → [openingHook]，结尾状态 → [ChapterVersion.endingState]。
-     * 这一列不再读也不再写，只留着不破坏旧数据。
+     * 这一列只为旧数据库升级与旧备份导入而保留，业务代码一律不读不写
+     * （`CarryOverSplitTest` 有一条架构断言在守这件事，3D）。
      */
+    @Deprecated(
+        message = "语义已拆分：开头钩子用 openingHook，结尾状态用 ChapterVersion.endingState。" +
+            "这一列只用于旧数据库/旧备份兼容，业务代码不要读写。",
+        replaceWith = ReplaceWith("openingHook"),
+    )
     @ColumnInfo(defaultValue = "")
     val carryOver: String = "",
-    /** 本章实际讲到的知识点标题，供后续章节避免重复讲解 */
+    /** 本章实际讲到的知识点标题。只用于展示与旧数据兼容，判断「讲过没讲过」看 [coveredNodeIds] */
     @ColumnInfo(defaultValue = "")
     val coveredTitles: List<String> = emptyList(),
+    /**
+     * 本章实际讲到的知识点 ID（3D）。
+     *
+     * 覆盖关系的唯一判据。标题会被用户改名，ID 不会——
+     * 按标题判断的后果是改一次名字，讲过的知识点全变回「还没讲」，续卷把它们再排一遍。
+     */
+    @ColumnInfo(defaultValue = "")
+    val coveredNodeIds: List<String> = emptyList(),
     /** 无资料模式下模型自报的「需要你去核对权威出处」的断言 */
     @ColumnInfo(defaultValue = "")
     val unverifiedClaims: List<String> = emptyList(),

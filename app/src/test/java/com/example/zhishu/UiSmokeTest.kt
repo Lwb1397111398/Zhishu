@@ -50,7 +50,7 @@ class UiSmokeTest {
         assertEquals(3, plans.size)
         assertTrue(plans.all { it.status == ChapterStatus.PUBLISHED })
 
-        val blocks = plans.flatMap { app.container.chapterRepository.getBlocks(it.id) }
+        val blocks = plans.flatMap { app.container.chapterRepository.getActiveBlocks(it.id) }
         assertEquals(10, blocks.size)
 
         val quizzes = app.container.quizRepository.getByProject(project.id)

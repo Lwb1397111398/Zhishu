@@ -92,5 +92,22 @@ data class ReadingProgress(
     /** [blockId] 这一块顶部相对视口的偏移（像素），只在同一块内部微调位置 */
     @ColumnInfo(defaultValue = "0")
     val blockOffset: Int = 0,
+    /**
+     * 这一章的正文最近一次被换成新版本的时刻（3D）。0 表示从来没换过。
+     *
+     * 用来给一次性提示「本章已更新，从章首开始阅读」提供依据。
+     * 只清掉 blockId 是不够的：用户会看到自己明明读到一半、回来却在开头，
+     * 而页面对此一言不发——那看起来就是进度丢了。
+     * 提示看过之后由 [progressNoticeShown] 记下来，不再重复出现。
+     */
+    @ColumnInfo(defaultValue = "0")
+    val bodyUpdatedAt: Long = 0L,
+    /** [bodyUpdatedAt] 对应的提示是否已经给用户看过。看过就不再提 */
+    @ColumnInfo(defaultValue = "0")
+    val progressNoticeShown: Boolean = false,
     val updatedAt: Long,
-)
+) {
+    /** 该不该给一次「本章已更新」的提示 */
+    val needsBodyUpdatedNotice: Boolean
+        get() = bodyUpdatedAt > 0L && !progressNoticeShown
+}

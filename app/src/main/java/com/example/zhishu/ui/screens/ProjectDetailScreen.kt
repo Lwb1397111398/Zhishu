@@ -820,6 +820,8 @@ private fun OutlineTab(
     val failedRegenerations by vm.failedRegenerations.collectAsState()
     // 「继续下一卷」的入口状态（3C）
     val nextVolume by vm.nextVolume.collectAsState()
+    // 统计只数当前版本正文（3D）
+    val stats by vm.stats.collectAsState()
     val volumeCount = plans.map { it.volumeIndex }.distinct().size
     // 进度按「正文可读」算，不因为缺自测题就少算一章
     val published = plans.count { it.isReadable }
@@ -843,10 +845,13 @@ private fun OutlineTab(
             ) {
                 Column(Modifier.weight(1f)) {
                     Text(
-                        if (volumeCount > 1) {
-                            "共 $volumeCount 卷 · ${plans.size} 章 · 已完成 $published 章"
-                        } else {
-                            "共 ${plans.size} 章 · 已完成 $published 章"
+                        buildString {
+                            if (volumeCount > 1) append("共 $volumeCount 卷 · ")
+                            append("${plans.size} 章 · 已完成 $published 章")
+                            // 字数只算当前版本，重生成过的章节不会被算两遍（3D）
+                            if (stats.activeChars > 0) {
+                                append(" · 已写 ${stats.activeChars / 1000} 千字")
+                            }
                         },
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -887,6 +892,23 @@ private fun OutlineTab(
             }
             Spacer(Modifier.height(8.dp))
             NextVolumeCard(availability = nextVolume, onPlan = { vm.planNextVolume() })
+            // 讲过、但对不上现存知识点的内容：如实说明，不当成「还没讲」（3D）
+            if (stats.unresolvedCoverage > 0) {
+                Spacer(Modifier.height(8.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        "有 ${stats.unresolvedCoverage} 处讲过的内容对不上现在的知识点" +
+                            "（多半是知识点改过名）。它们不会被当成没讲过，也不会重复安排。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(10.dp),
+                    )
+                }
+            }
             Spacer(Modifier.height(8.dp))
             LazyColumn {
                 if (bible != null) {

@@ -206,9 +206,11 @@ class ChapterVersioningTest {
         assertNotEquals(oldVersionId, newVersionId)
         assertEquals(2, db.chapterVersionDao().getById(newVersionId)?.versionNumber)
         assertEquals(ChapterVersionStatus.PUBLISHED, db.chapterVersionDao().getById(newVersionId)?.status)
-        // 旧版本被标作废但正文块一个不少
+        // 旧版本被归档而不是作废，正文块一个不少（3D）：
+        // 它成功过、读者真的读过它，只是现在有了更新的一版。
+        // 记成 ABANDONED 的话，「上次重新生成没通过」的提示会把这次**成功**也报成失败
         assertEquals(
-            ChapterVersionStatus.ABANDONED,
+            ChapterVersionStatus.ARCHIVED,
             db.chapterVersionDao().getById(oldVersionId)?.status,
         )
         val keptOldBlocks = db.chapterBlockDao().getByVersion(oldVersionId)
@@ -331,7 +333,7 @@ class ChapterVersioningTest {
         assertNull(saved?.blockId)
         assertEquals(0, saved?.blockOffset)
         // 旧块本身没被删，只是不再作为阅读锚点
-        assertTrue(db.chapterBlockDao().getByChapter(planId).any { it.id == oldBlockId })
+        assertTrue(db.chapterBlockDao().getAllVersionsByChapter(planId).any { it.id == oldBlockId })
     }
 
     /** 别的章节被重生成时，本章的阅读进度不受影响 */

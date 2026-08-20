@@ -98,18 +98,13 @@ interface ChapterRepository {
         learningGoals: List<String>,
         wordTarget: Int,
     )
-    fun observeBlocks(chapterId: String): Flow<List<ChapterBlock>>
-    suspend fun getBlocks(chapterId: String): List<ChapterBlock>
-    /** 全项目正文，用于建立知识点到正文块的跳转锚点 */
-    suspend fun getBlocksByProject(projectId: String): List<ChapterBlock>
-    suspend fun countBlocks(projectId: String): Int
-    suspend fun upsertBlocks(blocks: List<ChapterBlock>)
-
-    // --- 正文版本化（第三阶段 3A）---
+    // --- 正文读取（第三阶段 3A，命名在 3D 收紧）---
     //
-    // 命名刻意区分「当前正文」与「全部历史版本」：
-    // observeActiveBlocks / getActiveBlocks 是读者看到的那一版，
-    // getBlocks / getBlocksByProject 是含历史版本的全部正文，只用于导出和按章清理。
+    // 「当前正文」与「全部历史版本」在命名上必须一眼分得开，历史版本一律带
+    // AllVersions / ByVersion：业务层（阅读器、导览、搜索、跳转、出题、核验、统计、
+    // 首页继续阅读）只允许调 Active 系列；AllVersions 系列只用于导出备份与按章清理。
+    // 3A 之后一个含糊的 getBlocks() 在代码里看起来和「读这一章的正文」一模一样，
+    // 这是最容易悄悄读错、而且错了不会报错的地方。
 
     /** 阅读器订阅这一条：只吐当前 activeVersion 的正文块 */
     fun observeActiveBlocks(chapterId: String): Flow<List<ChapterBlock>>
@@ -117,11 +112,27 @@ interface ChapterRepository {
     /** 当前 activeVersion 的正文块。没有 activeVersion 时是空列表 */
     suspend fun getActiveBlocks(chapterId: String): List<ChapterBlock>
 
-    /** 指定版本的正文块，与章节当前指针无关。核验新版本时用 */
+    /** 指定版本的正文块，与章节当前指针无关。核验新版本、局部重写时用 */
     suspend fun getBlocksByVersion(versionId: String): List<ChapterBlock>
 
     /** 全项目当前版本正文。知识点跳转锚点只能落在读者看得到的那一版上 */
     suspend fun getActiveBlocksByProject(projectId: String): List<ChapterBlock>
+
+    /** 当前版本的块数与字数。统计「写了多少」一律用它，不能把历史版本算两遍 */
+    suspend fun countActiveBlocks(projectId: String): Int
+    suspend fun countActiveChars(projectId: String): Int
+    suspend fun countActiveCharsForChapter(chapterId: String): Int
+
+    /** 一章的**全部历史版本**正文。只用于导出备份 */
+    suspend fun getAllVersionsBlocks(chapterId: String): List<ChapterBlock>
+
+    /** 全项目**全部历史版本**正文。只用于导出备份 */
+    suspend fun getAllVersionsBlocksByProject(projectId: String): List<ChapterBlock>
+
+    /** 全部历史版本的块数。只用于导出核对与测试 */
+    suspend fun countAllVersionsBlocks(projectId: String): Int
+
+    suspend fun upsertBlocks(blocks: List<ChapterBlock>)
 
     suspend fun getActiveVersion(chapterId: String): ChapterVersion?
     suspend fun getVersion(versionId: String): ChapterVersion?
@@ -173,6 +184,8 @@ interface StoryBibleRepository {
         projectId: String,
         runningState: String,
         coveredTitles: List<String>,
+        /** 覆盖关系的判据（3D）。标题会被改名，ID 不会 */
+        coveredNodeIds: List<String>,
         openThreads: List<String>,
         updatedAt: Long,
     )
@@ -214,7 +227,18 @@ interface ReviewRepository {
 
 interface ProgressRepository {
     suspend fun get(projectId: String): ReadingProgress?
+
+    /**
+     * 只写阅读位置（3D）。
+     *
+     * 不用整行 upsert：阅读器每停一秒写一次位置，整行写回会把
+     * 「正文换过版本」的痕迹一起冲掉，那条「本章已更新」的提示就再也不出现了。
+     */
+    suspend fun saveAnchor(progress: ReadingProgress)
     suspend fun save(progress: ReadingProgress)
+
+    /** 「本章已更新，从章首开始」这条提示已经给用户看过，不再重复出现 */
+    suspend fun markNoticeShown(projectId: String)
     suspend fun clearForProject(projectId: String)
 }
 

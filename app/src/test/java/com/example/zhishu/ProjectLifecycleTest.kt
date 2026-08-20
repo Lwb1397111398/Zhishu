@@ -41,12 +41,12 @@ class ProjectLifecycleTest {
     fun deleteProject_removesEverythingIncludingBlocks() = runBlocking {
         DemoSeeder.seed(container)
         val projectId = container.projectRepository.observeAll().first().first().id
-        assertEquals(10, container.chapterRepository.countBlocks(projectId))
+        assertEquals(10, container.chapterRepository.countAllVersionsBlocks(projectId))
 
         deleteProjectCompletely(container, projectId)
 
         assertNull(container.projectRepository.get(projectId))
-        assertEquals(0, container.chapterRepository.countBlocks(projectId))
+        assertEquals(0, container.chapterRepository.countAllVersionsBlocks(projectId))
         assertEquals(0, container.sourceRepository.countChunks(projectId))
         assertTrue(container.chapterRepository.getPlans(projectId).isEmpty())
         assertTrue(container.knowledgeRepository.getByProject(projectId).isEmpty())
@@ -54,7 +54,7 @@ class ProjectLifecycleTest {
         assertTrue(container.reviewRepository.getByProject(projectId).isEmpty())
         assertNull(container.progressRepository.get(projectId))
         // 按章节 ID 直查也必须为空
-        assertTrue(container.chapterRepository.getBlocks("c1").isEmpty())
+        assertTrue(container.chapterRepository.getAllVersionsBlocks("c1").isEmpty())
     }
 
     /** 从知识页进入搜索没有带 projectId 时，应自动选中唯一项目（N10） */

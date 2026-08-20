@@ -78,6 +78,6 @@ class OptionalReviewTest {
 
         // 后续章节依然是已发布、可读状态
         assertTrue(plans.drop(1).all { it.status == ChapterStatus.PUBLISHED })
-        assertTrue(container.chapterRepository.getBlocks(plans[1].id).isNotEmpty())
+        assertTrue(container.chapterRepository.getActiveBlocks(plans[1].id).isNotEmpty())
     }
 }

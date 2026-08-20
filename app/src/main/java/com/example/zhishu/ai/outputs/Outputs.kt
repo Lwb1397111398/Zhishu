@@ -97,8 +97,14 @@ data class ChapterOutput(
     val title: String,
     val summary: String = "",
     val blocks: List<BlockDto> = emptyList(),
-    /** 本章结束时的处境，下一章唯一的前情提要（问题5） */
-    val carryOver: String = "",
+    /**
+     * 本章结束时的处境，下一章唯一的前情提要（问题5）。
+     *
+     * 3D 起字段名从 `carryOver` 改成 `endingState`：那个旧名字在数据库里
+     * 曾经同时表示「开头钩子」和「结尾状态」两件事，提示词里继续沿用它，
+     * 迟早又有人把两个含义接回去。这里存的只有一件事——结尾状态。
+     */
+    val endingState: String = "",
     val coveredTitles: List<String> = emptyList(),
     val openThreads: List<String> = emptyList(),
     /** 改写后的累积状态，替换而非追加，长度受预算约束（问题5） */

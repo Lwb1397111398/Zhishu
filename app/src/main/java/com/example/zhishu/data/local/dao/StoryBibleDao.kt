@@ -21,12 +21,14 @@ interface StoryBibleDao {
     /** 只更新滚动记忆，不覆盖世界观等固定设定（N13 同源原则） */
     @Query(
         "UPDATE story_bibles SET runningState = :runningState, coveredTitles = :coveredTitles, " +
+            "coveredNodeIds = :coveredNodeIds, " +
             "openThreads = :openThreads, updatedAt = :updatedAt WHERE projectId = :projectId",
     )
     suspend fun updateMemory(
         projectId: String,
         runningState: String,
         coveredTitles: List<String>,
+        coveredNodeIds: List<String>,
         openThreads: List<String>,
         updatedAt: Long,
     )

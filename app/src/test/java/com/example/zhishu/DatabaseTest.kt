@@ -53,8 +53,8 @@ class DatabaseTest {
     }
 
     @Test
-    fun databaseVersion_isEight() {
-        assertEquals(8, db.openHelper.readableDatabase.version)
+    fun databaseVersion_isNine() {
+        assertEquals(9, db.openHelper.readableDatabase.version)
     }
 
     @Test
@@ -188,7 +188,7 @@ class DatabaseTest {
         val loadedPlans = db.chapterPlanDao().getByProject("p-1")
         assertEquals(1, loadedPlans.size)
         assertEquals(ChapterStatus.PUBLISHED, loadedPlans[0].status)
-        val loadedBlocks = db.chapterBlockDao().getByChapter("ch-1")
+        val loadedBlocks = db.chapterBlockDao().getAllVersionsByChapter("ch-1")
         assertEquals(BlockType.STORY, loadedBlocks[0].blockType)
     }
 
@@ -208,7 +208,7 @@ class DatabaseTest {
         db.chapterPlanDao().clearByProject("p-1")
         db.chapterBlockDao().deleteByProject("p-1")
         assertEquals(0, db.chapterBlockDao().countByProject("p-1"))
-        assertTrue(db.chapterBlockDao().getByChapter("ch-1").isEmpty())
+        assertTrue(db.chapterBlockDao().getAllVersionsByChapter("ch-1").isEmpty())
     }
 
     @Test

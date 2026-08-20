@@ -171,7 +171,7 @@ class GenerationTest {
         assertTrue(result.isSuccess)
         val loaded = db.chapterPlanDao().getById(plan.id)
         assertEquals(ChapterStatus.PUBLISHED, loaded?.status)
-        val blocks = db.chapterBlockDao().getByChapter(plan.id)
+        val blocks = db.chapterBlockDao().getAllVersionsByChapter(plan.id)
         assertTrue(blocks.isNotEmpty())
         // 正文块必须带 projectId，删除项目时才能清理（N6）
         assertTrue(blocks.all { it.projectId == "p-1" })
@@ -229,7 +229,7 @@ class GenerationTest {
         assertTrue(loaded?.quizNote.orEmpty().isNotBlank())
         assertTrue(db.quizDao().getByProject("p-1").isEmpty())
         // 正文块在库里，能读
-        assertTrue(db.chapterBlockDao().getByChapter(plan.id).isNotEmpty())
+        assertTrue(db.chapterBlockDao().getAllVersionsByChapter(plan.id).isNotEmpty())
     }
 
     /** 题目数量不足最低要求：仍然只影响测验状态（第二阶段） */
@@ -317,7 +317,7 @@ class GenerationTest {
         // 指针换到了新版本，旧版本的正文块一个都没被删
         val secondVersion = db.chapterPlanDao().getById(plan.id)?.activeVersionId
         assertNotEquals(firstVersion, secondVersion)
-        assertEquals(firstCount * 2, db.chapterBlockDao().getByChapter(plan.id).size)
+        assertEquals(firstCount * 2, db.chapterBlockDao().getAllVersionsByChapter(plan.id).size)
         assertEquals(firstCount, db.chapterBlockDao().getByVersion(firstVersion.orEmpty()).size)
     }
 

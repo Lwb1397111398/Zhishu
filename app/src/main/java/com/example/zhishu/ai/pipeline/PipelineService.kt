@@ -273,7 +273,7 @@ class PipelineService(
                 remaining = currentVolumeChapters.count { !it.isReadable },
             )
         }
-        val pending = pendingNodeTitles(projectId, plans)
+        val pending = coverageReport(projectId, plans).pendingNodes
         return if (pending.isEmpty()) {
             // 主线讲完了。仍然可以继续，但要和「继续主线」明确区分开，
             // 否则模型会被无止境地要求「再来一卷」
@@ -307,8 +307,9 @@ class PipelineService(
 
         val allNodes = knowledgeRepository.getByProject(projectId)
         if (allNodes.isEmpty()) return Result.failure(IllegalStateException("知识地图为空"))
-        val pendingTitles = pendingNodeTitles(projectId, plans)
-        val pendingNodes = allNodes.filter { it.title in pendingTitles }
+        val coverage = coverageReport(projectId, plans)
+        val pendingNodes = coverage.pendingNodes
+        val pendingTitles = coverage.pendingTitles
         val bible = storyBibleRepository.get(projectId) ?: StoryBible(projectId = projectId)
         // 上一章的结尾只取它当前版本的（3B）；没有就明说，不伪造
         val lastChapter = plans.maxByOrNull { it.order }
@@ -387,20 +388,30 @@ class PipelineService(
         fallback.ifBlank { "第${volumeIndex + 1}卷" }
 
     /**
-     * 还没被任何章节安排到的知识点标题。
+     * 还没被任何章节安排到、也没有讲过的知识点（3D 起按 nodeId 判断）。
      *
-     * 只看章节计划里的 nodeIds 与已发布章节实际讲到的标题：
      * 「安排过但还没写」也算已安排，否则续卷会把当前卷正要讲的东西再排一遍。
+     * 判据从标题换成了 ID：标题是用户能改的，改一次名字就会让讲过的内容
+     * 全部变回「还没讲」，续卷把它们重新排一遍（详见 [NodeCoverage]）。
      */
-    private suspend fun pendingNodeTitles(projectId: String, plans: List<ChapterPlan>): Set<String> {
-        val allNodes = knowledgeRepository.getByProject(projectId)
-        val plannedIds = plans.flatMap { it.nodeIds }.toSet()
-        val coveredTitles = plans.flatMap { it.coveredTitles }.map { it.trim() }.toSet()
-        return allNodes
-            .filter { it.id !in plannedIds && it.title.trim() !in coveredTitles }
-            .map { it.title }
-            .toSet()
-    }
+    private suspend fun coverageReport(
+        projectId: String,
+        plans: List<ChapterPlan>,
+    ): NodeCoverage.CoverageReport = NodeCoverage.report(
+        nodes = knowledgeRepository.getByProject(projectId),
+        plans = plans,
+        bible = storyBibleRepository.get(projectId),
+    )
+
+    /**
+     * 「讲过、但对不上任何现存知识点」的标题（3D）。
+     *
+     * 一般是知识点改过名，或知识地图被重新生成过。这类内容不能当成「没讲过」——
+     * 那会让续卷把已经讲透的东西再排一遍；也不能当成覆盖了某个节点——
+     * 不知道是哪个。所以如实列出来，由用户确认。
+     */
+    suspend fun unresolvedCoverageTitles(projectId: String): List<String> =
+        coverageReport(projectId, chapterRepository.getPlans(projectId)).unresolvedTitles
 
     suspend fun generateChapter(
         projectId: String,
@@ -595,17 +606,26 @@ class PipelineService(
             .distinct()
             .take(MAX_UNVERIFIED_CLAIMS)
         val endingState = ContextBudget.clamp(
-            output.carryOver.ifBlank { output.summary },
+            output.endingState.ifBlank { output.summary },
             ContextBudget.CARRY_OVER_LIMIT,
         )
+        // 本章讲到的知识点：ID 是判据，标题只用于展示（3D）。
+        // 模型只会给标题，这里映射成 ID，映射不上的丢掉——
+        // 台账里塞一个不存在的 ID 等于永久少讲一个知识点，而且看不出错在哪
+        val coveredTitles = output.coveredTitles.ifEmpty { nodes.map { it.title } }
+        val coveredIds = coveredTitles.mapNotNull { titleToId[it.trim()] }
+            .ifEmpty { nodes.map { it.id } }
+            .distinct()
 
-        // 原子切换：版本置 PUBLISHED、旧版本置 ABANDONED、章节指针改指向新版本、
-        // 章节展示元数据同步换掉。中途断电不会出现「章节指向一个没发布的版本」（3A）
+        // 原子切换：新版本置 PUBLISHED、上一版发布正文置 ARCHIVED（不是 ABANDONED——
+        // 那一版成功过，只是被取代了）、章节指针改指向新版本、章节展示元数据同步换掉。
+        // 中途断电不会出现「章节指向一个没发布的版本」（3A/3D）
         chapterRepository.publishVersionAtomically(
             version = version.copy(
                 summary = output.summary,
                 endingState = endingState,
-                coveredTitles = output.coveredTitles.ifEmpty { nodes.map { it.title } },
+                coveredTitles = coveredTitles,
+                coveredNodeIds = coveredIds,
                 unverifiedClaims = unverified,
                 verificationNote = if (unverified.isEmpty()) {
                     ""
@@ -619,7 +639,7 @@ class PipelineService(
         // 推进滚动记忆：runningState 被改写而不是追加，因此长度不随章数增长（问题5）。
         // 这三步都只依赖「正文通过核验」，与出题成败无关——否则出题失败会让
         // 下一章续写不上、知识点跳不到正文。
-        advanceMemory(bible, output)
+        advanceMemory(bible, output, coveredIds, allNodes.map { it.id }.toSet())
         writeBackNodeChapters(projectId, planId, blocks)
         scheduleReviews(projectId, blocks)
         refreshProjectStatus(projectId)
@@ -701,8 +721,14 @@ class PipelineService(
     /**
      * 把本章产出并入滚动记忆（问题5）。
      * runningState 取模型改写后的新版本并强制截断到预算内，避免它逐章变长。
+     * 覆盖台账同时记 ID 与标题：ID 是判据，标题只喂给模型看（3D）。
      */
-    private suspend fun advanceMemory(bible: StoryBible, output: ChapterOutput) {
+    private suspend fun advanceMemory(
+        bible: StoryBible,
+        output: ChapterOutput,
+        coveredIds: List<String>,
+        knownNodeIds: Set<String>,
+    ) {
         val nextState = output.runningStateUpdate.ifBlank {
             // 模型没给改写版本时退回「旧状态 + 本章摘要」再截断，仍然受预算约束
             listOf(bible.runningState, output.summary).filter { it.isNotBlank() }.joinToString(" ")
@@ -711,6 +737,11 @@ class PipelineService(
             projectId = bible.projectId,
             runningState = ContextBudget.clamp(nextState, ContextBudget.RUNNING_STATE_LIMIT),
             coveredTitles = ContextBudget.mergeCovered(bible.coveredTitles, output.coveredTitles),
+            coveredNodeIds = NodeCoverage.mergeCoveredIds(
+                existing = bible.coveredNodeIds,
+                added = coveredIds,
+                knownIds = knownNodeIds,
+            ),
             openThreads = ContextBudget.mergeThreads(
                 existing = bible.openThreads,
                 added = output.openThreads,

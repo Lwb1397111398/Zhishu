@@ -45,7 +45,7 @@ internal class ScriptedRouter : ModelRouter {
     enum class Phase { MAP, BIBLE, CHAPTER, VERIFY, QUIZ }
 
     var chapterJson: String =
-        """{"title":"第一章","summary":"老人立下遗嘱","carryOver":"遗嘱真伪待查",""" +
+        """{"title":"第一章","summary":"老人立下遗嘱","endingState":"遗嘱真伪待查",""" +
             """"runningStateUpdate":"林默接手案子","coveredTitles":["意思表示"],"openThreads":[],""" +
             """"blocks":[{"type":"STORY","text":"老人立下遗嘱，子女各怀心思。","knowledgeNodeTitles":["意思表示"],"sourceRefs":["c-1"]},""" +
             """{"type":"EXPLANATION","text":"意思表示是民事法律行为的核心要素。","knowledgeNodeTitles":["意思表示"],"sourceRefs":["c-1"]}]}"""

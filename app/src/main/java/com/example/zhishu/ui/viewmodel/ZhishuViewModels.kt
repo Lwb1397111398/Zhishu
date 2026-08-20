@@ -346,11 +346,15 @@ class ProjectDetailViewModel(
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), GenerationUiState())
 
     /**
-     * 章节 ID → 最近一次「重新生成没成功」的说明（第三阶段 3A）。
+     * 章节 ID → 最近一次「重新生成没成功」的说明（第三阶段 3A，判据在 3D 收紧）。
      *
      * 3A 之后重生成失败不再改动章节状态——旧正文照样可读，这是对的。
      * 但如果什么都不说，用户点了重新生成、等了半天、页面一动不动，会以为是自己没点上。
      * 所以问题绑在新版本上，由这里单独读出来展示，而不是去覆盖当前发布版本的核验说明。
+     *
+     * 只认真正的 [ChapterVersionStatus.ABANDONED]：3D 之前发布事务把被取代的旧正文
+     * 也写成 ABANDONED，于是每一次**成功**的重生成都会在这里留下一条「失败」提示。
+     * 被取代的旧版本现在是 ARCHIVED，不进这个判据。
      */
     val failedRegenerations: StateFlow<Map<String, String>> =
         plans.map { buildFailedRegenerationNotes(it) }
@@ -381,6 +385,35 @@ class ProjectDetailViewModel(
             plan.id to latestFailure.verificationNote
         }.toMap()
     }
+
+    /**
+     * 项目进度统计（3D）。
+     *
+     * 字数只数**当前版本**：把历史版本一起算进去，重生成过一章就凭空多出一整章的量，
+     * 显示出来的就是一个自己也解释不了的数字。
+     *
+     * [unresolvedCoverage] 是「讲过、但对不上任何现存知识点」的条数——
+     * 通常是知识点改过名或知识地图重新生成过。这类内容既不能算覆盖了某个节点，
+     * 也不该被当成「没讲过」（否则续卷会把它们重讲一遍），所以如实报出来让用户判断。
+     */
+    data class ProjectStats(
+        val activeChars: Int = 0,
+        val unresolvedCoverage: Int = 0,
+    )
+
+    val stats: StateFlow<ProjectStats> =
+        plans.map { current ->
+            if (current.isEmpty()) {
+                ProjectStats()
+            } else {
+                ProjectStats(
+                    activeChars = container.chapterRepository.countActiveChars(projectId),
+                    unresolvedCoverage = container.pipeline
+                        .unresolvedCoverageTitles(projectId)
+                        .size,
+                )
+            }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ProjectStats())
 
     /**
      * 「继续下一卷」入口的状态（第三阶段 3C）。
@@ -665,6 +698,16 @@ class ReaderViewModel(
     private val _savedAnchor = MutableStateFlow<ReadAnchor?>(null)
     val savedAnchor: StateFlow<ReadAnchor?> = _savedAnchor
 
+    /**
+     * 「本章已更新，从章首开始阅读」——一次性提示（3D）。
+     *
+     * 正文换版本时进度锚点被清回章首（旧 blockId 属于上一版正文，在新正文里不存在）。
+     * 光清不说的话，用户明明读到一半、回来却在开头，页面还一言不发，
+     * 看起来就是进度丢了。看过一次就不再提，靠 `progressNoticeShown` 记账。
+     */
+    private val _bodyUpdatedNotice = MutableStateFlow(false)
+    val bodyUpdatedNotice: StateFlow<Boolean> = _bodyUpdatedNotice
+
     private var lastSaved: ReadAnchor? = null
 
     init { load() }
@@ -686,6 +729,18 @@ class ReaderViewModel(
             } else {
                 ReadAnchor(null, 0)
             }
+            // 提示只对「进度记的就是这一章」有意义：换到别的章本来就从头读
+            _bodyUpdatedNotice.value = saved?.chapterId == chapterId && saved.needsBodyUpdatedNotice
+        }
+    }
+
+    /** 提示已展示，落库记账，下次进来不再提 */
+    fun consumeBodyUpdatedNotice() {
+        if (!_bodyUpdatedNotice.value) return
+        _bodyUpdatedNotice.value = false
+        viewModelScope.launch {
+            val projectId = chapter.value?.projectId ?: return@launch
+            container.progressRepository.markNoticeShown(projectId)
         }
     }
 
@@ -695,7 +750,8 @@ class ReaderViewModel(
         lastSaved = anchor
         viewModelScope.launch {
             val plan = chapter.value ?: return@launch
-            container.progressRepository.save(
+            // 只写位置。整行 upsert 会把 bodyUpdatedAt / progressNoticeShown 冲掉（3D）
+            container.progressRepository.saveAnchor(
                 ReadingProgress(
                     id = plan.projectId,
                     projectId = plan.projectId,

@@ -56,7 +56,9 @@ class TransferManager(private val container: AppContainer) {
                 // 版本行与全部历史正文都导出：只导 active 版本的话，
                 // 恢复出来的库就再也没有「上一版正文」可查了（第三阶段 3A）
                 versions += container.chapterRepository.getVersionsByProject(project.id)
-                projectPlans.forEach { plan -> blocks += container.chapterRepository.getBlocks(plan.id) }
+                projectPlans.forEach { plan ->
+                    blocks += container.chapterRepository.getAllVersionsBlocks(plan.id)
+                }
                 val projectQuizzes = container.quizRepository.getByProject(project.id)
                 quizzes += projectQuizzes
                 // 导出真实答题记录，而不是伪造 restored-* 记录
@@ -222,6 +224,11 @@ class TransferManager(private val container: AppContainer) {
                     }
                 },
             blocks = rawBlocks,
+            // 覆盖关系按标题补 ID（3D）：只在标题在本项目里唯一时才补，
+            // 重名或对不上的留空——留空会被界面报成「待确认」，硬猜会把讲过的当成没讲过
+            titleToNodeId = knowledge.groupBy { it.projectId to it.title.trim() }
+                .filterValues { it.size == 1 }
+                .mapValues { (_, group) -> group.first().id },
         )
         val planIds = planProject.keys
         val quizzes = decodeList<Quiz>(files, "quizzes.json")
@@ -281,9 +288,11 @@ class TransferManager(private val container: AppContainer) {
         plans: List<ChapterPlan>,
         imported: List<ChapterVersion>,
         blocks: List<ChapterBlock>,
+        titleToNodeId: Map<Pair<String, String>, String>,
     ): VersionedChapters {
         val now = System.currentTimeMillis()
         val byChapter = imported.groupBy { it.chapterId }
+        val blocksByVersion = blocks.groupBy { it.versionId }
         val versions = mutableListOf<ChapterVersion>()
         val activeVersionOf = mutableMapOf<String, String>()
         val fallbackVersionOf = mutableMapOf<String, String>()
@@ -293,7 +302,6 @@ class TransferManager(private val container: AppContainer) {
             val chapterVersions = existing.ifEmpty {
                 listOf(initialVersionFor(plan, now))
             }
-            versions += chapterVersions
             // 兜底版本：优先已发布的那一个，否则最后一个。孤儿正文块挂到它上面
             val fallback = chapterVersions.lastOrNull { it.status == ChapterVersionStatus.PUBLISHED }
                 ?: chapterVersions.last()
@@ -307,6 +315,22 @@ class TransferManager(private val container: AppContainer) {
                 ?: chapterVersions.lastOrNull { it.status == ChapterVersionStatus.PUBLISHED }
                     ?.takeIf { plan.isReadable }
             if (resolved != null) activeVersionOf[plan.id] = resolved.id
+
+            // 归档 vs 放弃（3D）：v4 备份里被取代的旧正文一律记成 ABANDONED。
+            // 有正文块、且比当前指针那一版旧 → 它成功过，只是被取代 → ARCHIVED。
+            // 判据与 v8→v9 迁移逐字一致，否则同一份数据「升级上来」和「导入进来」结果会不同。
+            val activeNumber = resolved?.versionNumber ?: 0
+            versions += chapterVersions.map { version ->
+                val supersededBody = version.status == ChapterVersionStatus.ABANDONED &&
+                    version.versionNumber < activeNumber &&
+                    blocksByVersion[version.id].orEmpty().isNotEmpty()
+                version.copy(
+                    status = if (supersededBody) ChapterVersionStatus.ARCHIVED else version.status,
+                    coveredNodeIds = version.coveredNodeIds.ifEmpty {
+                        resolveNodeIds(version.projectId, version.coveredTitles, titleToNodeId)
+                    },
+                )
+            }
         }
 
         val versionIds = versions.map { it.id }.toSet()
@@ -315,9 +339,12 @@ class TransferManager(private val container: AppContainer) {
                 plan.copy(
                     activeVersionId = activeVersionOf[plan.id],
                     // v4 及更早的备份没有 openingHook：未发布章节的 carryOver 装的就是开头钩子，
-                    // 按 v6→v7 的同一条规则补上（3B）
-                    openingHook = plan.openingHook.ifBlank {
-                        if (plan.isReadable) "" else plan.carryOver
+                    // 按 v6→v7 的同一条规则补上（3B）。
+                    // 这是全项目**唯一**两处允许读 carryOver 的地方（另一处见 initialVersionFor），
+                    // 因为它们处理的就是那一列还有含义的旧数据（3D）
+                    openingHook = plan.openingHook.ifBlank { legacyOpeningHook(plan) },
+                    coveredNodeIds = plan.coveredNodeIds.ifEmpty {
+                        resolveNodeIds(plan.projectId, plan.coveredTitles, titleToNodeId)
                     },
                 )
             },
@@ -334,6 +361,23 @@ class TransferManager(private val container: AppContainer) {
         )
     }
 
+    /**
+     * 旧备份的覆盖关系按标题补 ID（3D）。
+     *
+     * 只在标题于本项目内唯一时才补。对不上的不补也不丢：标题仍然留在 coveredTitles 里，
+     * 界面上会把这类内容列成「待确认」，由用户判断——直接当成「没讲过」会让续卷
+     * 把已经讲透的东西再讲一遍。
+     */
+    private fun resolveNodeIds(
+        projectId: String,
+        titles: List<String>,
+        titleToNodeId: Map<Pair<String, String>, String>,
+    ): List<String> = titles
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .mapNotNull { titleToNodeId[projectId to it] }
+        .distinct()
+
     /** 旧备份补出来的初始版本。endingState 只在章节可读时才取 carryOver（未发布时它装的是开头钩子） */
     private fun initialVersionFor(plan: ChapterPlan, now: Long): ChapterVersion = ChapterVersion(
         id = plan.id + AppDatabase.INITIAL_VERSION_SUFFIX,
@@ -347,15 +391,29 @@ class TransferManager(private val container: AppContainer) {
         },
         title = plan.title,
         summary = plan.summary,
-        // 旧备份里 carryOver 是双重语义列：已发布章节装的是结尾状态，
-        // 未发布章节装的是开头钩子。只有前者能搬进版本（3B 的迁移规则）
-        endingState = if (plan.isReadable) plan.carryOver else "",
+        endingState = legacyEndingState(plan),
         coveredTitles = plan.coveredTitles,
+        coveredNodeIds = plan.coveredNodeIds,
         unverifiedClaims = plan.unverifiedClaims,
         verificationNote = plan.verificationNote,
         createdAt = now,
         updatedAt = now,
     )
+
+    /**
+     * 旧备份里 `carryOver` 是双重语义列：已发布章节装的是结尾状态，未发布章节装的是开头钩子。
+     *
+     * 这个函数和 [legacyOpeningHook] 是全项目唯一允许读那一列的两处（3D）——
+     * 它们处理的正是那一列还有含义的旧数据，规则与 v5→v6 / v6→v7 迁移逐字一致。
+     * 集中在这里也让「业务代码不读 carryOver」这条约束可以被测试检查。
+     */
+    @Suppress("DEPRECATION")
+    private fun legacyEndingState(plan: ChapterPlan): String =
+        if (plan.isReadable) plan.carryOver else ""
+
+    @Suppress("DEPRECATION")
+    private fun legacyOpeningHook(plan: ChapterPlan): String =
+        if (plan.isReadable) "" else plan.carryOver
 
     private class VersionedChapters(
         val plans: List<ChapterPlan>,
@@ -419,11 +477,14 @@ class TransferManager(private val container: AppContainer) {
     )
 
     companion object {
-        // v5：章节带上分卷字段、故事总纲带上 currentVolumeIndex（第三阶段 3C）。
+        // v6：版本状态区分 ARCHIVED / ABANDONED，覆盖关系带上 coveredNodeIds，
+        //     阅读进度带上「正文换过版本」的痕迹（第三阶段 3D）。
+        // v5：章节带上分卷字段、故事总纲带上 currentVolumeIndex（3C）。
         // v4 加入 chapter_versions.json 与 versionId（3A）。
-        // 仍能读 v1~v4 备份——缺失的版本信息按「每章一个初始版本」补齐，
-        // 缺失的分卷字段一律落在第一卷。
-        const val FORMAT_VERSION = 5
+        // 仍能读 v1~v5 备份——缺失的版本信息按「每章一个初始版本」补齐，
+        // 缺失的分卷字段一律落在第一卷，缺失的 coveredNodeIds 按标题唯一匹配补齐，
+        // v5 里被取代的旧正文（记成 ABANDONED）按与 v8→v9 迁移相同的判据改成 ARCHIVED。
+        const val FORMAT_VERSION = 6
         const val MAX_ENTRIES = 64
         const val MAX_ENTRY_BYTES = 32 * 1024 * 1024
         const val MAX_TOTAL_BYTES = 128L * 1024 * 1024

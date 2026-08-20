@@ -12,6 +12,7 @@ import com.example.zhishu.search.DefaultSearchRepository
 import com.example.zhishu.search.SearchHitKind
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -53,11 +54,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_5_6,
                 AppDatabase.MIGRATION_6_7,
                 AppDatabase.MIGRATION_7_8,
+                AppDatabase.MIGRATION_8_9,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(8, db.openHelper.readableDatabase.version)
+            assertEquals(9, db.openHelper.readableDatabase.version)
 
             // 旧数据保留
             assertEquals("民法基础", db.projectDao().getById("p-1")?.title)
@@ -108,11 +110,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_5_6,
                 AppDatabase.MIGRATION_6_7,
                 AppDatabase.MIGRATION_7_8,
+                AppDatabase.MIGRATION_8_9,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(8, db.openHelper.readableDatabase.version)
+            assertEquals(9, db.openHelper.readableDatabase.version)
             // 旧项目仍在，新列有默认值
             val project = db.projectDao().getById("p-1")
             assertEquals("民法基础", project?.title)
@@ -142,11 +145,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_5_6,
                 AppDatabase.MIGRATION_6_7,
                 AppDatabase.MIGRATION_7_8,
+                AppDatabase.MIGRATION_8_9,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(8, db.openHelper.readableDatabase.version)
+            assertEquals(9, db.openHelper.readableDatabase.version)
             // 旧进度行保留，新列取默认值 0
             val old = db.readingProgressDao().getForProject("p-1")
             assertEquals("ch-1", old?.chapterId)
@@ -187,11 +191,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_5_6,
                 AppDatabase.MIGRATION_6_7,
                 AppDatabase.MIGRATION_7_8,
+                AppDatabase.MIGRATION_8_9,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(8, db.openHelper.readableDatabase.version)
+            assertEquals(9, db.openHelper.readableDatabase.version)
 
             // ch-1 有题：标 READY，状态不动
             val withQuiz = db.chapterPlanDao().getById("ch-1")
@@ -237,11 +242,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_5_6,
                 AppDatabase.MIGRATION_6_7,
                 AppDatabase.MIGRATION_7_8,
+                AppDatabase.MIGRATION_8_9,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(8, db.openHelper.readableDatabase.version)
+            assertEquals(9, db.openHelper.readableDatabase.version)
 
             // 每个现有章节都有一个初始版本，一章不落
             assertEquals(1, db.chapterVersionDao().countByChapter("ch-1"))
@@ -307,11 +313,15 @@ class MigrationTest {
         createV6Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_6_7, AppDatabase.MIGRATION_7_8)
+            .addMigrations(
+                AppDatabase.MIGRATION_6_7,
+                AppDatabase.MIGRATION_7_8,
+                AppDatabase.MIGRATION_8_9,
+            )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(8, db.openHelper.readableDatabase.version)
+            assertEquals(9, db.openHelper.readableDatabase.version)
 
             // 已发布章节：carryOver 是结尾状态，落在当前版本上；openingHook 留空
             val published = db.chapterPlanDao().getById("ch-1")
@@ -348,11 +358,11 @@ class MigrationTest {
         createV7Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_7_8)
+            .addMigrations(AppDatabase.MIGRATION_7_8, AppDatabase.MIGRATION_8_9)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(8, db.openHelper.readableDatabase.version)
+            assertEquals(9, db.openHelper.readableDatabase.version)
 
             // 旧章节全部落在第一卷
             val plans = db.chapterPlanDao().getByProject("p-1")
@@ -377,6 +387,57 @@ class MigrationTest {
                 ),
             )
             assertEquals(2, db.storyBibleDao().get("p-1")?.currentVolumeIndex)
+        } finally {
+            db.close()
+        }
+    }
+
+    /**
+     * v8 → v9：版本系统加固（3D）。三条修正规则各验一遍。
+     *
+     * 造出来的 v8 库里，ch-1 有三个版本：v1 有正文、v2 有正文、v3 是当前发布版本，
+     * 而 v1/v2 在 3D 之前都被写成了 ABANDONED。另外还有一个没有正文的失败尝试。
+     */
+    @Test
+    fun migrate8To9_separatesArchivedFromAbandonedAndBackfillsNodeIds() = runBlocking {
+        createV8Database()
+
+        val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_8_9)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            assertEquals(9, db.openHelper.readableDatabase.version)
+
+            val byId = db.chapterVersionDao().getByChapter("ch-1").associateBy { it.id }
+            // 有正文、比当前版本旧 → 被取代的历史正文
+            assertEquals(ChapterVersionStatus.ARCHIVED, byId["ch-1-v1"]?.status)
+            assertEquals(ChapterVersionStatus.ARCHIVED, byId["ch-1-v2"]?.status)
+            // 当前发布版本一动不动
+            assertEquals(ChapterVersionStatus.PUBLISHED, byId["ch-1-v3"]?.status)
+            // 没有正文 → 从来没写出来过，仍然是失败尝试
+            assertEquals(ChapterVersionStatus.ABANDONED, byId["ch-1-v4"]?.status)
+
+            // 覆盖关系按标题唯一匹配补出 ID
+            val plan = db.chapterPlanDao().getById("ch-1")
+            assertEquals(listOf("n-1"), plan?.coveredNodeIds)
+            assertEquals(listOf("继承"), plan?.coveredTitles)
+            assertEquals(listOf("n-1"), byId["ch-1-v3"]?.coveredNodeIds)
+            // 对不上任何节点的标题不硬猜：留空，由界面报「待确认」
+            assertEquals(emptyList<String>(), db.chapterPlanDao().getById("ch-2")?.coveredNodeIds)
+            assertEquals(listOf("一个已经没有的知识点"), db.chapterPlanDao().getById("ch-2")?.coveredTitles)
+
+            // 阅读进度新列可用，且旧位置一个字没动
+            val progress = db.readingProgressDao().getForProject("p-1")
+            assertEquals("b-1", progress?.blockId)
+            assertEquals(24, progress?.blockOffset)
+            assertEquals(0L, progress?.bodyUpdatedAt)
+            assertFalse(progress?.needsBodyUpdatedNotice == true)
+
+            // 正文、测验一条不少
+            assertEquals(3, db.chapterBlockDao().countByProject("p-1"))
+            assertEquals(1, db.chapterBlockDao().getActiveBlocks("ch-1").size)
+            assertEquals(1, db.quizDao().getActiveByChapter("ch-1").size)
         } finally {
             db.close()
         }
@@ -573,6 +634,77 @@ class MigrationTest {
         )
         helper.writableDatabase.use { it.version = 7 }
         helper.close()
+    }
+
+    /**
+     * 造出一个真正的 v8 库：v5 库 + 依次执行 5→6、6→7、7→8，版本号置为 8。
+     *
+     * 额外造出「多版本正文」这个 3D 要修正的局面：v5→v6 只会给每章建一个 v1，
+     * 这里手工再加 v2/v3/v4，并且按 3D 之前的写法把被取代的旧版本记成 ABANDONED。
+     */
+    private fun createV8Database() {
+        val callback = object : SupportSQLiteOpenHelper.Callback(8) {
+            override fun onCreate(db: SupportSQLiteDatabase) {
+                seedV5(db)
+                AppDatabase.MIGRATION_5_6.migrate(db)
+                AppDatabase.MIGRATION_6_7.migrate(db)
+                AppDatabase.MIGRATION_7_8.migrate(db)
+                seedV8MultiVersionChapter(db)
+            }
+
+            override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+        }
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(dbName)
+                .callback(callback)
+                .build(),
+        )
+        helper.writableDatabase.use { it.version = 8 }
+        helper.close()
+    }
+
+    /**
+     * 3D 之前的真实数据形态：一章被重生成过两次，
+     * 旧版本（成功过、被取代）和失败尝试都记成 ABANDONED，从数据上分不出来。
+     */
+    private fun seedV8MultiVersionChapter(db: SupportSQLiteDatabase) {
+        fun version(number: Int, status: String) = db.execSQL(
+            "INSERT INTO chapter_versions (id, chapterId, projectId, versionNumber, status, title, " +
+                "summary, endingState, coveredTitles, unverifiedClaims, verificationNote, " +
+                "createdAt, updatedAt) VALUES " +
+                "('ch-1-v$number','ch-1','p-1',$number,'$status','第一章','摘要','结尾'," +
+                "'[\"继承\"]','[]','',1,1)",
+        )
+        // v1 已由 5→6 建好，这里补 v2/v3/v4
+        db.execSQL("UPDATE chapter_versions SET status = 'ABANDONED' WHERE id = 'ch-1-v1'")
+        version(2, "ABANDONED")
+        version(3, "PUBLISHED")
+        // v4：没有任何正文块，是一次真正没写出来的失败尝试
+        version(4, "ABANDONED")
+        db.execSQL("UPDATE chapters SET activeVersionId = 'ch-1-v3' WHERE id = 'ch-1'")
+        // v1 的正文块由 5→6 绑好了；给 v2 与 v3 各补一块
+        db.execSQL(
+            "INSERT INTO chapter_blocks (id, chapterId, versionId, projectId, [order], text, " +
+                "blockType, knowledgeNodeIds, sourceRefs) VALUES " +
+                "('b-v2','ch-1','ch-1-v2','p-1',0,'第二版正文','STORY','[]','[]')",
+        )
+        db.execSQL(
+            "INSERT INTO chapter_blocks (id, chapterId, versionId, projectId, [order], text, " +
+                "blockType, knowledgeNodeIds, sourceRefs) VALUES " +
+                "('b-v3','ch-1','ch-1-v3','p-1',0,'第三版正文','STORY','[]','[]')",
+        )
+        db.execSQL("UPDATE quizzes SET versionId = 'ch-1-v3' WHERE chapterId = 'ch-1'")
+        // 知识地图里只有「继承」一个节点
+        db.execSQL(
+            "INSERT INTO knowledge_nodes (id, projectId, parentId, title, definition, prerequisites, " +
+                "related, confusions, examples, sourceRefs, chapterIds, mastery, confirmed, depth, " +
+                "[order], arisesFrom, leadsTo) VALUES " +
+                "('n-1','p-1',NULL,'继承','财产转移制度','[]','[]','[]','[]','[]','[]',0,1,1,0,'','')",
+        )
+        // 覆盖关系：ch-1 的标题能对上知识点，ch-2 的对不上（模拟改过名）
+        db.execSQL("UPDATE chapters SET coveredTitles = '[\"继承\"]' WHERE id = 'ch-1'")
+        db.execSQL("UPDATE chapters SET coveredTitles = '[\"一个已经没有的知识点\"]' WHERE id = 'ch-2'")
     }
 
     private companion object {

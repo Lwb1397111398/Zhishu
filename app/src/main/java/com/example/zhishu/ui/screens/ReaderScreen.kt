@@ -75,6 +75,9 @@ import kotlinx.coroutines.launch
 /** LazyColumn 里正文块前面的固定项数（章节标题头），块索引 = 列表索引 - 这个数 */
 private const val HEADER_ITEMS = 1
 
+/** 「本章已更新」提示至少停留这么久再记账，避免用户还没看到就消失 */
+private const val NOTICE_LINGER_MILLIS = 4000L
+
 @OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
 @Composable
 fun ReaderScreen(
@@ -98,6 +101,7 @@ fun ReaderScreen(
     val nextChapterId by vm.nextChapterId.collectAsState()
     val savedAnchor by vm.savedAnchor.collectAsState()
     val quizCount by vm.quizCount.collectAsState()
+    val bodyUpdatedNotice by vm.bodyUpdatedNotice.collectAsState()
 
     var selectedNode by remember { mutableStateOf<KnowledgeNode?>(null) }
     var showOutline by remember { mutableStateOf(false) }
@@ -150,6 +154,15 @@ fun ReaderScreen(
         if (highlightBlockId != null) {
             delay(2600)
             highlightBlockId = null
+        }
+    }
+
+    // 「本章已更新」看到了就记账，下次进来不再提（3D）。
+    // 等正文真的渲染出来再消费，否则页面还空着就已经把提示销掉了
+    LaunchedEffect(bodyUpdatedNotice, blocks) {
+        if (bodyUpdatedNotice && blocks.isNotEmpty()) {
+            delay(NOTICE_LINGER_MILLIS)
+            vm.consumeBodyUpdatedNotice()
         }
     }
 
@@ -258,6 +271,23 @@ fun ReaderScreen(
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        // 正文换过版本：说清楚为什么回到了章首（3D）。
+                        // 只说一次，中性底色，不做成警告——正文更新是好事，不是出错
+                        if (bodyUpdatedNotice) {
+                            Spacer(Modifier.height(12.dp))
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(
+                                    "本章正文已更新，从章首开始阅读。",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(10.dp),
+                                )
+                            }
+                        }
                     }
                 }
                 items(visibleBlocks, key = { it.id }) { block ->

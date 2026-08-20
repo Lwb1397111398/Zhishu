@@ -81,6 +81,7 @@ object DemoSeeder {
                 ),
                 runningState = "林晓继承了姑母半套房；发现一份三年前立、但立嘱人当时已患病的遗嘱；庭审最终认定遗嘱无效，按法定继承处理。",
                 coveredTitles = listOf("继承", "遗产范围", "遗嘱继承", "法定继承"),
+                coveredNodeIds = listOf("n-inheritance", "n-estate", "n-will", "n-legal"),
                 openThreads = emptyList(),
                 updatedAt = now,
             ),
@@ -155,6 +156,7 @@ object DemoSeeder {
                 wordTarget = 1200, status = ChapterStatus.PUBLISHED, summary = "主角收到律师函，遗产继承故事开场。",
                 derivationChain = "人去世，财产不能悬空 → 于是有了继承 → 但要先划清什么算遗产",
                 coveredTitles = listOf("继承", "遗产范围"),
+                coveredNodeIds = listOf("n-inheritance", "n-estate"),
             ),
             ChapterPlan(
                 id = "c2", projectId = PROJECT_ID, order = 2, title = "尘封的遗嘱",
@@ -164,6 +166,7 @@ object DemoSeeder {
                 wordTarget = 1200, status = ChapterStatus.PUBLISHED, summary = "发现遗嘱，遗嘱效力成为悬念。",
                 derivationChain = "法律尊重死者意愿 → 于是允许遗嘱 → 但遗嘱有瑕疵时要判断效力",
                 coveredTitles = listOf("遗嘱继承"),
+                coveredNodeIds = listOf("n-will"),
             ),
             ChapterPlan(
                 id = "c3", projectId = PROJECT_ID, order = 3, title = "最后的庭审",
@@ -173,6 +176,7 @@ object DemoSeeder {
                 wordTarget = 1200, status = ChapterStatus.PUBLISHED, summary = "庭审定音，知识闭环。",
                 derivationChain = "遗嘱被判无效 → 回到法定继承 → 按顺序确定谁能拿",
                 coveredTitles = listOf("法定继承", "遗产范围"),
+                coveredNodeIds = listOf("n-legal", "n-estate"),
             ),
         )
         // 演示数据也走版本化（第三阶段 3A）：每章一个已发布版本，
@@ -190,6 +194,7 @@ object DemoSeeder {
                     summary = plan.summary,
                     endingState = DEMO_ENDING_STATES[plan.id].orEmpty(),
                     coveredTitles = plan.coveredTitles,
+                    coveredNodeIds = plan.coveredNodeIds,
                     createdAt = now,
                     updatedAt = now,
                 )

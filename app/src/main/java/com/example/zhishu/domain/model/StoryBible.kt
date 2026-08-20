@@ -8,8 +8,8 @@ import kotlinx.serialization.Serializable
  * 故事总纲 + 滚动记忆（问题5）。
  *
  * 一个项目只有一行。生成第 N 章时喂给模型的上下文固定为：
- * 本行（压缩后的全局设定 + 累积状态）+ 上一章的 [ChapterPlan.summary]/[ChapterPlan.carryOver]
- * + 本章知识群，**不携带任何章节正文**。
+ * 本行（压缩后的全局设定 + 累积状态）+ 上一章**当前版本**的
+ * [ChapterVersion.endingState] + 本章知识群，**不携带任何章节正文**。
  * 因此单章 token 成本与已生成章数无关，生成到几百章也不会膨胀。
  */
 @Serializable
@@ -33,8 +33,16 @@ data class StoryBible(
      * 这是「后面的故事顺着前面发展、又不断开」与「上下文不膨胀」能同时成立的关键。
      */
     val runningState: String = "",
-    /** 已讲完的知识点标题台账，用于去重与复习 */
+    /** 已讲完的知识点标题台账。只用于喂给模型「别重复讲」，判断覆盖看 [coveredNodeIds] */
     val coveredTitles: List<String> = emptyList(),
+    /**
+     * 已讲完的知识点 ID 台账（3D）。
+     *
+     * 覆盖关系的判据。标题会被用户改名，ID 不会——
+     * 只按标题记账的话，改一次知识点名字，讲过的内容就全变回「还没讲」。
+     */
+    @androidx.room.ColumnInfo(defaultValue = "")
+    val coveredNodeIds: List<String> = emptyList(),
     /** 尚未展开的悬念钩子，下一章优先回收 */
     val openThreads: List<String> = emptyList(),
     /**

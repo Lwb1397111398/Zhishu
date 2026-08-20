@@ -74,7 +74,7 @@ class TransferTest {
         val plans = container.chapterRepository.getPlans(projectId)
         assertEquals(3, plans.size)
         assertTrue(plans.all { it.status == ChapterStatus.PUBLISHED })
-        assertEquals(10, container.chapterRepository.countBlocks(projectId))
+        assertEquals(10, container.chapterRepository.countAllVersionsBlocks(projectId))
         assertEquals(4, container.quizRepository.getByProject(projectId).size)
         assertEquals(1, container.sourceRepository.countChunks(projectId))
     }
@@ -100,11 +100,11 @@ class TransferTest {
                 ),
             ),
         )
-        assertEquals(11, container.chapterRepository.countBlocks(projectId))
+        assertEquals(11, container.chapterRepository.countAllVersionsBlocks(projectId))
 
         assertTrue(transfer.import(app, uri).isSuccess)
-        assertEquals(10, container.chapterRepository.countBlocks(projectId))
-        assertTrue(container.chapterRepository.getBlocks("c1").none { it.id == "stale-block" })
+        assertEquals(10, container.chapterRepository.countAllVersionsBlocks(projectId))
+        assertTrue(container.chapterRepository.getAllVersionsBlocks("c1").none { it.id == "stale-block" })
     }
 
     /** 畸形 JSON 必须整体回滚，不留半份数据（N7） */
@@ -146,7 +146,7 @@ class TransferTest {
             )
         }
         assertTrue(transfer.import(app, Uri.fromFile(file)).isSuccess)
-        assertEquals(0, container.chapterRepository.countBlocks("t-p"))
+        assertEquals(0, container.chapterRepository.countAllVersionsBlocks("t-p"))
     }
 
     /** 条目数超限的 ZIP 直接拒绝（N7） */
@@ -357,7 +357,7 @@ class TransferTest {
         DemoSeeder.seed(container)
         val file = File(workDir, "manifest.zip")
         assertTrue(transfer.export(app, Uri.fromFile(file)).isSuccess)
-        assertEquals(5, TransferManager.FORMAT_VERSION)
+        assertEquals(6, TransferManager.FORMAT_VERSION)
 
         var manifest = ""
         ZipInputStream(file.inputStream()).use { zip ->
@@ -368,7 +368,7 @@ class TransferTest {
                 entry = zip.nextEntry
             }
         }
-        assertTrue(manifest.contains("\"formatVersion\": 5"))
+        assertTrue(manifest.contains("\"formatVersion\": 6"))
     }
 
     /** 分卷字段能导出也能恢复（第三阶段 3C） */
@@ -395,6 +395,105 @@ class TransferTest {
         assertEquals("讲清法定继承", restored?.volumeGoal)
         assertEquals(0, container.chapterRepository.getPlan("c1")?.volumeIndex)
         assertEquals(1, container.storyBibleRepository.get(projectId)?.currentVolumeIndex)
+    }
+
+    /**
+     * v5 备份（formatVersion 5）导入时，被取代的旧正文改成 ARCHIVED（3D）。
+     *
+     * 判据必须与 v8→v9 迁移逐字一致：有正文块、且版本号比当前指针那一版旧。
+     * 不一致的话，同一份数据「升级上来」和「导入进来」会得到两种结果——
+     * 一边显示「上次重新生成失败」，一边不显示。
+     */
+    @Test
+    fun import_v5Backup_marksSupersededBodiesAsArchived() = runBlocking {
+        val file = File(workDir, "v5-versions.zip")
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun put(name: String, body: String) {
+                zip.putNextEntry(ZipEntry(name))
+                zip.write(body.toByteArray())
+                zip.closeEntry()
+            }
+            put("manifest.json", """{"app":"zhishu","formatVersion":5,"exportedAt":0,"projects":1}""")
+            put(
+                "projects.json",
+                """[{"id":"v5-p","title":"旧档","topic":"t","baseline":"b","depth":"d",""" +
+                    """"dailyMinutes":10,"targetDays":7,"genre":"悬疑","status":"READY","createdAt":1,"updatedAt":1}]""",
+            )
+            put(
+                "knowledge.json",
+                """[{"id":"v5-n","projectId":"v5-p","title":"继承","definition":"d"}]""",
+            )
+            put(
+                "chapters.json",
+                """[{"id":"v5-c","projectId":"v5-p","order":1,"title":"第一章","status":"PUBLISHED",""" +
+                    """"activeVersionId":"v5-c-v2","coveredTitles":["继承"]}]""",
+            )
+            // v1 有正文、被取代；v3 没有正文、是真失败。两者在 v5 备份里都是 ABANDONED
+            put(
+                "chapter_versions.json",
+                """[{"id":"v5-c-v1","chapterId":"v5-c","projectId":"v5-p","versionNumber":1,""" +
+                    """"status":"ABANDONED","title":"第一章","createdAt":1,"updatedAt":1},""" +
+                    """{"id":"v5-c-v2","chapterId":"v5-c","projectId":"v5-p","versionNumber":2,""" +
+                    """"status":"PUBLISHED","title":"第一章","coveredTitles":["继承"],"createdAt":1,"updatedAt":1},""" +
+                    """{"id":"v5-c-v3","chapterId":"v5-c","projectId":"v5-p","versionNumber":3,""" +
+                    """"status":"ABANDONED","title":"第一章","createdAt":1,"updatedAt":1}]""",
+            )
+            put(
+                "blocks.json",
+                """[{"id":"v5-b1","chapterId":"v5-c","versionId":"v5-c-v1","projectId":"v5-p",""" +
+                    """"order":0,"text":"第一版正文","blockType":"STORY"},""" +
+                    """{"id":"v5-b2","chapterId":"v5-c","versionId":"v5-c-v2","projectId":"v5-p",""" +
+                    """"order":0,"text":"第二版正文","blockType":"STORY"}]""",
+            )
+        }
+        assertTrue(transfer.import(app, Uri.fromFile(file)).isSuccess)
+
+        val byId = container.chapterRepository.getVersions("v5-c").associateBy { it.id }
+        // 有正文 + 比当前版本旧 → 被取代的历史正文
+        assertEquals(ChapterVersionStatus.ARCHIVED, byId["v5-c-v1"]?.status)
+        assertEquals(ChapterVersionStatus.PUBLISHED, byId["v5-c-v2"]?.status)
+        // 没有正文 → 从来没写出来过，仍是失败尝试
+        assertEquals(ChapterVersionStatus.ABANDONED, byId["v5-c-v3"]?.status)
+        // 旧版本正文一块不删，也不会被当成当前正文
+        assertEquals(1, container.chapterRepository.getBlocksByVersion("v5-c-v1").size)
+        assertEquals("第二版正文", container.chapterRepository.getActiveBlocks("v5-c").single().text)
+        // 覆盖关系按标题唯一匹配补出 ID
+        assertEquals(listOf("v5-n"), container.chapterRepository.getPlan("v5-c")?.coveredNodeIds)
+        assertEquals(listOf("v5-n"), byId["v5-c-v2"]?.coveredNodeIds)
+    }
+
+    /** 对不上任何知识点的覆盖标题不硬猜 ID，也不丢掉（3D） */
+    @Test
+    fun import_unmatchableCoveredTitle_leavesNodeIdsEmpty() = runBlocking {
+        val file = File(workDir, "unmatched-coverage.zip")
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun put(name: String, body: String) {
+                zip.putNextEntry(ZipEntry(name))
+                zip.write(body.toByteArray())
+                zip.closeEntry()
+            }
+            put("manifest.json", """{"app":"zhishu","formatVersion":5,"exportedAt":0,"projects":1}""")
+            put(
+                "projects.json",
+                """[{"id":"um-p","title":"旧档","topic":"t","baseline":"b","depth":"d",""" +
+                    """"dailyMinutes":10,"targetDays":7,"genre":"悬疑","status":"READY","createdAt":1,"updatedAt":1}]""",
+            )
+            put(
+                "knowledge.json",
+                """[{"id":"um-n","projectId":"um-p","title":"继承","definition":"d"}]""",
+            )
+            put(
+                "chapters.json",
+                """[{"id":"um-c","projectId":"um-p","order":1,"title":"第一章","status":"QUEUED",""" +
+                    """"coveredTitles":["一个已经改过名的知识点"]}]""",
+            )
+        }
+        assertTrue(transfer.import(app, Uri.fromFile(file)).isSuccess)
+
+        val plan = container.chapterRepository.getPlan("um-c")
+        assertTrue(plan?.coveredNodeIds.orEmpty().isEmpty())
+        // 标题没被丢掉：界面据此报「有内容对不上知识点」，而不是当成没讲过
+        assertEquals(listOf("一个已经改过名的知识点"), plan?.coveredTitles)
     }
 
     private suspend fun firstProjectId(): String =

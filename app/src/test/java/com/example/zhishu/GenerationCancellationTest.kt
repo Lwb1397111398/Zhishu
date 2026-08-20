@@ -94,7 +94,7 @@ class GenerationCancellationTest {
         assertFalse(plan?.status == ChapterStatus.RUNNING)
         assertTrue(plan?.verificationNote.orEmpty().contains("取消"))
         // 正文一个字都没写进来
-        assertTrue(db.chapterBlockDao().getByChapter(planId).isEmpty())
+        assertTrue(db.chapterBlockDao().getAllVersionsByChapter(planId).isEmpty())
     }
 
     /** 要求 5：核验阶段取消 → 正文已写入但未核验，标 NEEDS_REVIEW 并说明清楚 */
@@ -109,7 +109,7 @@ class GenerationCancellationTest {
         assertEquals(ChapterStatus.NEEDS_REVIEW, plan?.status)
         assertTrue(plan?.verificationNote.orEmpty().contains("尚未完成核验"))
         // 正文块留在库里，用户可以看到写到哪儿了
-        assertTrue(db.chapterBlockDao().getByChapter(planId).isNotEmpty())
+        assertTrue(db.chapterBlockDao().getAllVersionsByChapter(planId).isNotEmpty())
     }
 
     /**
@@ -159,7 +159,7 @@ class GenerationCancellationTest {
         val plan = db.chapterPlanDao().getById(planId)
         assertEquals(ChapterStatus.PUBLISHED, plan?.status)
         assertTrue(plan?.isReadable == true)
-        assertTrue(db.chapterBlockDao().getByChapter(planId).isNotEmpty())
+        assertTrue(db.chapterBlockDao().getAllVersionsByChapter(planId).isNotEmpty())
         // 滚动记忆也已经推进，下一章能接着写
         assertTrue(db.storyBibleDao().get("p-1")?.runningState.orEmpty().isNotBlank())
     }
@@ -198,7 +198,7 @@ class GenerationCancellationTest {
         router.failAt = ScriptedRouter.Phase.QUIZ
         assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
         assertEquals(QuizState.FAILED, db.chapterPlanDao().getById(planId)?.quizState)
-        val bodyText = db.chapterBlockDao().getByChapter(planId).first().text
+        val bodyText = db.chapterBlockDao().getAllVersionsByChapter(planId).first().text
 
         // 重新出题：这次让出题成功
         router.failAt = null
@@ -209,7 +209,7 @@ class GenerationCancellationTest {
         assertEquals(listOf(ScriptedRouter.Phase.QUIZ), router.calls)
         assertEquals(QuizState.READY, db.chapterPlanDao().getById(planId)?.quizState)
         // 正文一字未动
-        assertEquals(bodyText, db.chapterBlockDao().getByChapter(planId).first().text)
+        assertEquals(bodyText, db.chapterBlockDao().getAllVersionsByChapter(planId).first().text)
         assertEquals(3, db.quizDao().getByChapter(planId).size)
     }
 
