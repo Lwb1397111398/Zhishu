@@ -7,6 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -269,6 +270,8 @@ private fun SourcesTab(
 ) {
     var showText by remember { mutableStateOf(false) }
     var showUrl by remember { mutableStateOf(false) }
+    // 正在编辑来源信息的那份资料（4A）
+    var editingSource by remember { mutableStateOf<SourceDocument?>(null) }
     val modelKnowledge = project?.usesModelKnowledge == true
 
     LazyColumn(
@@ -326,11 +329,32 @@ private fun SourcesTab(
                 }
             } else {
                 items(sources, key = { it.id }) { source ->
-                    SourceCard(source = source, onDelete = { vm.deleteSource(source.id) })
+                    SourceCard(
+                        source = source,
+                        onEditMeta = { editingSource = source },
+                        onDelete = { vm.deleteSource(source.id) },
+                    )
                 }
             }
         }
         item { Spacer(Modifier.height(16.dp)) }
+    }
+
+    editingSource?.let { source ->
+        SourceMetaDialog(
+            source = source,
+            onConfirm = { versionLabel, jurisdiction, effectiveFrom, legalVersion ->
+                vm.updateSourceMeta(
+                    sourceId = source.id,
+                    versionLabel = versionLabel,
+                    jurisdiction = jurisdiction,
+                    effectiveFrom = effectiveFrom,
+                    legalVersion = legalVersion,
+                )
+                editingSource = null
+            },
+            onDismiss = { editingSource = null },
+        )
     }
 
     if (showText) {
@@ -475,7 +499,11 @@ private fun OneTapCard(
 }
 
 @Composable
-private fun SourceCard(source: SourceDocument, onDelete: () -> Unit) {
+private fun SourceCard(
+    source: SourceDocument,
+    onEditMeta: () -> Unit,
+    onDelete: () -> Unit,
+) {
     Card(modifier = Modifier.padding(vertical = 6.dp)) {
         Row(
             Modifier
@@ -495,12 +523,115 @@ private fun SourceCard(source: SourceDocument, onDelete: () -> Unit) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                // 版本、法域、生效时间（4A）。法律这类内容离开这三样就没有对错可言，
+                // 所以填了就一定显示出来，没填就提示可以补
+                val meta = listOfNotNull(
+                    source.versionLabelForDisplay,
+                    source.jurisdiction?.takeIf { it.isNotBlank() },
+                    source.effectiveFrom?.takeIf { it.isNotBlank() }?.let { "$it 起施行" },
+                ).joinToString(" · ")
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    meta.ifBlank { "未填版本 / 法域 / 生效时间" },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (meta.isBlank()) {
+                        MaterialTheme.colorScheme.outline
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
+                Spacer(Modifier.height(4.dp))
+                TextButton(
+                    onClick = onEditMeta,
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                ) { Text("填写来源信息", style = MaterialTheme.typography.labelMedium) }
             }
             IconButton(onClick = onDelete) {
                 Icon(Icons.Default.Delete, contentDescription = "删除资料", tint = MaterialTheme.colorScheme.error)
             }
         }
     }
+}
+
+/**
+ * 填写来源元数据（4A）。
+ *
+ * 四栏都可以留空——大多数资料不需要它们。但对法律、税务、医疗这类内容，
+ * 「哪个法域、什么时候起施行、哪一次修订」决定了正文里那句话到底对不对，
+ * 而这些只有用户知道：模型不该猜，我们也不该替它猜。
+ * 填过之后它们会一起进提示词，也会显示在阅读器的来源面板上。
+ */
+@Composable
+private fun SourceMetaDialog(
+    source: SourceDocument,
+    onConfirm: (String, String, String, String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var versionLabel by remember { mutableStateOf(source.versionLabel.orEmpty()) }
+    var jurisdiction by remember { mutableStateOf(source.jurisdiction.orEmpty()) }
+    var effectiveFrom by remember { mutableStateOf(source.effectiveFrom.orEmpty()) }
+    var legalVersion by remember { mutableStateOf(source.legalVersion.orEmpty()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("来源信息") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text(
+                    "都可以留空。填了之后，生成和核验会知道这份资料的适用范围，" +
+                        "阅读时也能看到「这一段出自哪个版本、哪个地区」。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = versionLabel,
+                    onValueChange = { versionLabel = it },
+                    label = { Text("文档版本") },
+                    placeholder = { Text("第 3 版 / 2024 修订本") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = legalVersion,
+                    onValueChange = { legalVersion = it },
+                    label = { Text("法律版本") },
+                    placeholder = { Text("2020 年修正") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = jurisdiction,
+                    onValueChange = { jurisdiction = it },
+                    label = { Text("法域 / 适用地区") },
+                    placeholder = { Text("中国大陆") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = effectiveFrom,
+                    onValueChange = { effectiveFrom = it },
+                    label = { Text("生效时间") },
+                    // 原样保存用户写的形式：资料上写「2021 年 1 月 1 日施行」就是精确到日，
+                    // 换算成时间戳要凭空补出时区和时分秒
+                    placeholder = { Text("2021-01-01") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(versionLabel, jurisdiction, effectiveFrom, legalVersion) },
+            ) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
 }
 
 @Composable

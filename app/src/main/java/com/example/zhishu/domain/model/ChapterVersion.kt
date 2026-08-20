@@ -103,6 +103,16 @@ data class ChapterVersion(
     @ColumnInfo(defaultValue = "")
     val coveredNodeIds: List<String> = emptyList(),
     val unverifiedClaims: List<String> = emptyList(),
+    /**
+     * 这一版正文是不是在「AI 自备知识」模式下写出来的（4A）。
+     *
+     * 记在版本上而不是现查项目设置：用户完全可能先用无资料模式写了前五章，
+     * 之后才导入资料。那时候现查项目会说「有资料」，于是前五章看起来
+     * 都是有出处的——它们一条引用都没有，因为当时确实没有资料可引。
+     * 阅读器要说清「本章包含 AI 自备知识」，只能靠写作当时的这个事实。
+     */
+    @ColumnInfo(defaultValue = "0")
+    val usedModelKnowledge: Boolean = false,
     /** 本版本自己的核验问题。不覆盖当前发布版本的说明——那是另一份正文的事 */
     val verificationNote: String = "",
     val createdAt: Long,

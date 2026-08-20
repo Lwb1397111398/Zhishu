@@ -6,6 +6,7 @@ import com.example.zhishu.ai.ConfiguredModelRouter
 import com.example.zhishu.ai.pipeline.PipelineService
 import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.data.local.repo.DefaultChapterRepository
+import com.example.zhishu.data.local.repo.DefaultCitationRepository
 import com.example.zhishu.data.local.repo.DefaultKnowledgeRepository
 import com.example.zhishu.data.local.repo.DefaultProgressRepository
 import com.example.zhishu.data.local.repo.DefaultProjectRepository
@@ -17,6 +18,7 @@ import com.example.zhishu.data.local.repo.DefaultStoryBibleRepository
 import com.example.zhishu.data.prefs.LearningPrefs
 import com.example.zhishu.data.transfer.TransferManager
 import com.example.zhishu.domain.repository.ChapterRepository
+import com.example.zhishu.domain.repository.CitationRepository
 import com.example.zhishu.domain.repository.KnowledgeRepository
 import com.example.zhishu.domain.repository.ProgressRepository
 import com.example.zhishu.domain.repository.ProjectRepository
@@ -49,6 +51,8 @@ class AppContainer(context: Context) {
         blockDao = database.chapterBlockDao(),
         versionDao = database.chapterVersionDao(),
     )
+    /** 正文块 ↔ 资料片段的引用关系（4A） */
+    val citationRepository: CitationRepository = DefaultCitationRepository(database.citationDao())
     val storyBibleRepository: StoryBibleRepository = DefaultStoryBibleRepository(database.storyBibleDao())
     val quizRepository: QuizRepository = DefaultQuizRepository(database.quizDao(), database.answerRecordDao())
     val reviewRepository: ReviewRepository = DefaultReviewRepository(database.reviewItemDao())
@@ -79,6 +83,7 @@ class AppContainer(context: Context) {
         sourceRepository = sourceRepository,
         knowledgeRepository = knowledgeRepository,
         chapterRepository = chapterRepository,
+        citationRepository = citationRepository,
         storyBibleRepository = storyBibleRepository,
         quizRepository = quizRepository,
         reviewRepository = reviewRepository,

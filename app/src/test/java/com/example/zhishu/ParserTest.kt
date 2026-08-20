@@ -155,6 +155,58 @@ class ParserTest {
         }
     }
 
+    /**
+     * Markdown 资料解析出来的片段带上章节路径（4A）。
+     *
+     * 没有它，引用只能说「出自这份讲义」——一份两百页的讲义，
+     * 用户拿着这句话没法核对任何东西。
+     */
+    @Test
+    fun markdownParse_recordsSectionPath() = runBlocking {
+        val parser = ParserServiceImpl(webFetcher = NoopFetcher())
+        val text = "# 第三章 合同的订立\n## 第二节 要约\n要约是希望与他人订立合同的意思表示。"
+        val result = parser.parse(
+            projectId = "p-1",
+            input = SourceInput.FileBytes("讲义", "note.md", text.toByteArray(), SourceKind.MARKDOWN),
+        )
+        assertEquals(
+            "第三章 合同的订立 > 第二节 要约",
+            result.chunks.single().sectionPath,
+        )
+        // 非 PDF 资料没有页码，不假装有
+        assertEquals(null, result.chunks.single().pageNumber)
+    }
+
+    /**
+     * 网页抓取保留标题结构（4A）。
+     *
+     * 原来是 `body().text()`，整页被压成一行，分块只能按字数硬切，
+     * 引用回去只能说「出自这个网页」。保留 `## 小标题` 之后，
+     * 分块才认得出层级，来源才能说到「这一节」。
+     */
+    @Test
+    fun urlParse_keepsHeadingStructure() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody(
+                    "<html><head><title>民法百科</title></head><body>" +
+                        "<nav>导航栏不是资料</nav>" +
+                        "<h2>要约</h2><p>要约是希望与他人订立合同的意思表示。</p>" +
+                        "</body></html>",
+                ),
+        )
+        val parser = ParserServiceImpl(webFetcher = plainHttpFetcher())
+        val result = parser.parse(
+            projectId = "p-1",
+            input = SourceInput.Url(server.url("/page").toString()),
+        )
+        assertEquals("要约", result.chunks.single().sectionPath)
+        assertTrue(result.chunks.single().text.contains("意思表示"))
+        // 导航栏被剔掉，不会被当成资料内容引用
+        assertFalse(result.chunks.single().text.contains("导航栏"))
+    }
+
     private fun plainHttpFetcher(): WebFetcher = JsoupWebFetcher(requireHttps = false)
 
     private class NoopFetcher : WebFetcher {

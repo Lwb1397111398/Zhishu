@@ -10,6 +10,8 @@ import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.ChapterVersionStatus
+import com.example.zhishu.domain.model.Citation
+import com.example.zhishu.domain.model.CitationStatus
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.Quiz
@@ -41,6 +43,7 @@ class TransferManager(private val container: AppContainer) {
             val plans = mutableListOf<ChapterPlan>()
             val versions = mutableListOf<ChapterVersion>()
             val blocks = mutableListOf<ChapterBlock>()
+            val citations = mutableListOf<Citation>()
             val quizzes = mutableListOf<Quiz>()
             val reviews = mutableListOf<ReviewItem>()
             val progress = mutableListOf<ReadingProgress>()
@@ -59,6 +62,9 @@ class TransferManager(private val container: AppContainer) {
                 projectPlans.forEach { plan ->
                     blocks += container.chapterRepository.getAllVersionsBlocks(plan.id)
                 }
+                // 引用同样导出全部历史版本：正文都留着了，引用只留当前版本的话，
+                // 恢复出来的旧版本会变成一段没有出处的正文（4A）
+                citations += container.citationRepository.getAllVersionsByProject(project.id)
                 val projectQuizzes = container.quizRepository.getByProject(project.id)
                 quizzes += projectQuizzes
                 // 导出真实答题记录，而不是伪造 restored-* 记录
@@ -85,6 +91,7 @@ class TransferManager(private val container: AppContainer) {
             entries["chapters.json"] = json.encodeToString(plans)
             entries["chapter_versions.json"] = json.encodeToString(versions)
             entries["blocks.json"] = json.encodeToString(blocks)
+            entries["citations.json"] = json.encodeToString(citations)
             entries["quizzes.json"] = json.encodeToString(quizzes)
             entries["answers.json"] = json.encodeToString(answers)
             entries["reviews.json"] = json.encodeToString(reviews)
@@ -230,6 +237,13 @@ class TransferManager(private val container: AppContainer) {
                 .filterValues { it.size == 1 }
                 .mapValues { (_, group) -> group.first().id },
         )
+        // 引用关系（4A）。v6 及更早的备份没有 citations.json，
+        // 这时按正文块自己的 sourceRefs 重建，规则与 v9→v10 迁移逐字一致
+        val citations = normalizeCitations(
+            blocks = versioned.blocks,
+            imported = decodeList<Citation>(files, "citations.json"),
+            knownChunkIds = chunks.map { it.id }.toSet(),
+        )
         val planIds = planProject.keys
         val quizzes = decodeList<Quiz>(files, "quizzes.json")
             .filter { it.projectId in projectIds && it.chapterId in planIds }
@@ -264,7 +278,10 @@ class TransferManager(private val container: AppContainer) {
             knowledge = knowledge,
             plans = versioned.plans,
             versions = versioned.versions,
-            blocks = versioned.blocks,
+            // 块的 sourceRefs 只留真的解析到的片段，与 citations 保持一致：
+            // 同一件事有两种表示时，它们不一致的那天就是 bug 出现的那天
+            blocks = citations.blocks,
+            citations = citations.citations,
             quizzes = quizzes,
             answers = answers,
             reviews = reviews,
@@ -415,6 +432,69 @@ class TransferManager(private val container: AppContainer) {
     private fun legacyOpeningHook(plan: ChapterPlan): String =
         if (plan.isReadable) "" else plan.carryOver
 
+    /**
+     * 把导入的引用关系整理成「每条引用都挂在真实存在的块上、
+     * 解析不到片段的一律记成未确认」（4A）。
+     *
+     * 三种输入：
+     * - v7 备份：自带 citations.json，按导入值重建，只重新判定 chunkId 是否仍然存在；
+     * - v1~v6 备份：没有引用表，按块的 sourceRefs 重建，与 v9→v10 迁移同一条规则；
+     * - 改坏的备份：引用指向不存在的块 → 丢掉（那条引用已经没有归属了）；
+     *   引用指向不存在的片段 → **不丢**，记成未确认。
+     *
+     * 两者的区别值得说清楚：块不存在意味着这条引用连「哪句话需要出处」都答不上来，
+     * 留着没有任何信息量；片段不存在则仍然在说一件真事——
+     * 「这段话当初有出处，现在对不上了」，那正是未确认状态要表达的。
+     *
+     * 引用 ID 一律用 [Citation.idFor] 重算，不沿用备份里的值：
+     * 同一份数据从迁移、导入、重新生成三条路径进来必须得到同一个 ID，
+     * 否则同一条引用会在库里躺两份。
+     */
+    private fun normalizeCitations(
+        blocks: List<ChapterBlock>,
+        imported: List<Citation>,
+        knownChunkIds: Set<String>,
+    ): NormalizedCitations {
+        val byBlock = imported.groupBy { it.blockId }
+        val citations = mutableListOf<Citation>()
+        val rebuiltBlocks = blocks.map { block ->
+            val refs = byBlock[block.id]
+                ?.sortedBy { it.order }
+                // 引用标识：优先原样保留的 rawRef，其次导入值里的 chunkId。
+                // 旧的 UNCONFIRMED 引用只有 rawRef，新的 RESOLVED 引用两者都有
+                ?.map { it.rawRef.ifBlank { it.chunkId.orEmpty() } }
+                ?: block.sourceRefs
+            val resolved = mutableListOf<String>()
+            val seen = mutableSetOf<String>()
+            var order = 0
+            refs.map { it.trim() }.filter { it.isNotEmpty() }.forEach { ref ->
+                if (!seen.add(ref)) return@forEach
+                val known = ref in knownChunkIds
+                if (known) resolved += ref
+                citations += Citation(
+                    id = Citation.idFor(block.id, order),
+                    projectId = block.projectId,
+                    chapterId = block.chapterId,
+                    // 引用属于块所在的那一版。备份里的 versionId 可能因为块被重挂而过时
+                    versionId = block.versionId,
+                    blockId = block.id,
+                    chunkId = if (known) ref else null,
+                    rawRef = ref,
+                    status = if (known) CitationStatus.RESOLVED else CitationStatus.UNCONFIRMED,
+                    order = order,
+                )
+                order += 1
+            }
+            block.copy(sourceRefs = resolved)
+        }
+        return NormalizedCitations(blocks = rebuiltBlocks, citations = citations)
+    }
+
+    private class NormalizedCitations(
+        val blocks: List<ChapterBlock>,
+        val citations: List<Citation>,
+    )
+
     private class VersionedChapters(
         val plans: List<ChapterPlan>,
         val versions: List<ChapterVersion>,
@@ -429,6 +509,7 @@ class TransferManager(private val container: AppContainer) {
             payload.projects.forEach { project ->
                 container.sourceRepository.deleteByProject(project.id)
                 container.knowledgeRepository.clearForProject(project.id)
+                container.citationRepository.deleteByProject(project.id)
                 container.chapterRepository.clearBlocksForProject(project.id)
                 container.chapterRepository.clearVersionsForProject(project.id)
                 container.chapterRepository.clearPlansForProject(project.id)
@@ -450,6 +531,8 @@ class TransferManager(private val container: AppContainer) {
             // 版本行先于正文块写入，保证「块 → 版本 → 章节」这条链在事务内始终自洽
             if (payload.versions.isNotEmpty()) container.chapterRepository.upsertVersions(payload.versions)
             if (payload.blocks.isNotEmpty()) container.chapterRepository.upsertBlocks(payload.blocks)
+            // 引用在块之后写入，同一个事务内「引用 → 块 → 版本 → 章节」这条链始终自洽
+            if (payload.citations.isNotEmpty()) container.citationRepository.upsertAll(payload.citations)
             if (payload.quizzes.isNotEmpty()) container.quizRepository.upsertAll(payload.quizzes)
             payload.answers.forEach { container.quizRepository.recordAnswer(it) }
             if (payload.reviews.isNotEmpty()) container.reviewRepository.upsertAll(payload.reviews)
@@ -469,6 +552,7 @@ class TransferManager(private val container: AppContainer) {
         val plans: List<ChapterPlan>,
         val versions: List<ChapterVersion>,
         val blocks: List<ChapterBlock>,
+        val citations: List<Citation>,
         val quizzes: List<Quiz>,
         val answers: List<AnswerRecord>,
         val reviews: List<ReviewItem>,
@@ -477,6 +561,8 @@ class TransferManager(private val container: AppContainer) {
     )
 
     companion object {
+        // v7：加入 citations.json（正文块 ↔ 资料片段的引用关系），
+        //     来源带上法域/生效时间/法律版本，片段带上页码/章节/段落序号（第四阶段 4A）。
         // v6：版本状态区分 ARCHIVED / ABANDONED，覆盖关系带上 coveredNodeIds，
         //     阅读进度带上「正文换过版本」的痕迹（第三阶段 3D）。
         // v5：章节带上分卷字段、故事总纲带上 currentVolumeIndex（3C）。
@@ -484,7 +570,9 @@ class TransferManager(private val container: AppContainer) {
         // 仍能读 v1~v5 备份——缺失的版本信息按「每章一个初始版本」补齐，
         // 缺失的分卷字段一律落在第一卷，缺失的 coveredNodeIds 按标题唯一匹配补齐，
         // v5 里被取代的旧正文（记成 ABANDONED）按与 v8→v9 迁移相同的判据改成 ARCHIVED。
-        const val FORMAT_VERSION = 6
+        // 仍能读 v1~v6 备份：没有 citations.json 时按块的 sourceRefs 重建引用，
+        // 缺失的来源元数据与片段定位一律留空（旧片段的页码无从倒推，硬填会让用户翻错页）。
+        const val FORMAT_VERSION = 7
         const val MAX_ENTRIES = 64
         const val MAX_ENTRY_BYTES = 32 * 1024 * 1024
         const val MAX_TOTAL_BYTES = 128L * 1024 * 1024

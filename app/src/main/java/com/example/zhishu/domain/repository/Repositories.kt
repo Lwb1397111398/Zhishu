@@ -6,6 +6,7 @@ import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.ChapterVersionStatus
+import com.example.zhishu.domain.model.Citation
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
@@ -40,8 +41,64 @@ interface SourceRepository {
     suspend fun getChunksByIds(projectId: String, ids: Collection<String>): List<SourceChunk>
     suspend fun countChunks(projectId: String): Int
     suspend fun findDuplicate(hash: String): SourceDocument?
+
+    /**
+     * 只写用户填的来源元数据：文档版次、法域、生效时间、法律版本（4A）。
+     * 解析结果（哈希、状态、抓取时间）不在其中——那不是用户该改的东西。
+     */
+    suspend fun updateMeta(
+        sourceId: String,
+        versionLabel: String?,
+        jurisdiction: String?,
+        effectiveFrom: String?,
+        legalVersion: String?,
+    )
+
     suspend fun delete(sourceId: String)
     suspend fun deleteByProject(projectId: String)
+}
+
+/**
+ * 正文块与资料片段的引用关系（第四阶段 4A）。
+ *
+ * 与 3D 定下的命名规矩一致：当前阅读只走 Active 系列，
+ * 读历史版本必须写明 ByVersion / AllVersions。
+ */
+interface CitationRepository {
+    /** 阅读器订阅这一条：只吐当前 activeVersion 的引用 */
+    fun observeActiveByChapter(chapterId: String): Flow<List<Citation>>
+    suspend fun getActiveByChapter(chapterId: String): List<Citation>
+
+    /** 本章当前版本的引用条数：可定位的 / 需人工核对的 */
+    suspend fun countActiveResolved(chapterId: String): Int
+    suspend fun countActiveUnconfirmed(chapterId: String): Int
+
+    /** 引用了某个片段的**当前版本**正文块。资料 → 正文的回跳方向 */
+    suspend fun getActiveByChunk(projectId: String, chunkId: String): List<Citation>
+
+    /** 全项目当前版本的引用。项目级统计与未核实内容筛选用 */
+    suspend fun getActiveByProject(projectId: String): List<Citation>
+
+    /** 指定版本的引用。核验与局部重写用，与章节当前指针无关 */
+    suspend fun getByVersion(versionId: String): List<Citation>
+
+    /** 全项目**全部历史版本**的引用。只用于导出备份 */
+    suspend fun getAllVersionsByProject(projectId: String): List<Citation>
+
+    /** 换掉某一版的引用，历史版本一律保留 */
+    suspend fun replaceForVersion(versionId: String, citations: List<Citation>)
+
+    suspend fun upsertAll(citations: List<Citation>)
+    suspend fun deleteByChapter(chapterId: String)
+    suspend fun deleteByProject(projectId: String)
+
+    /**
+     * 资料被删掉后，引用它的引用降级为「未确认」而不是被删掉（4A）。
+     *
+     * 正文里那段话还在，它当初确实有依据。删掉引用会让那一段看起来
+     * 从来没打算给出处，读者也就不会想到去核对。
+     */
+    suspend fun unconfirmForSource(sourceId: String)
 }
 
 interface KnowledgeRepository {

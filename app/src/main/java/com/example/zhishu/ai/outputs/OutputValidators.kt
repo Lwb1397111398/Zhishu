@@ -105,17 +105,22 @@ object OutputValidators {
         if (knowledgeBlocks.isNotEmpty() && unmapped.size == knowledgeBlocks.size) {
             return Result.failure(ModelError.Invalid("章节的知识讲解段落没有关联到任何既有知识点"))
         }
-        // 引用的资料片段必须属于本项目
-        val cleaned = blocks.map { block ->
-            block.copy(sourceRefs = block.sourceRefs.filter { it in validChunkIds }.distinct())
-        }
+        // 引用不在这里过滤（4A）。
+        //
+        // 原来这一步会把对不上片段的引用静默丢掉：问题随之消失，正文里那句
+        // 需要出处的话变成了没人管的断言，阅读器还会显示「本段无引用」。
+        // 现在原样交给 CitationResolver，由它记成 RESOLVED 或 UNCONFIRMED。
+        // 校验这一层只判断「有没有可追溯的引用」这件事本身。
         if (requireSourceRefs) {
-            val factBlocks = cleaned.filter { it.type == BlockType.FACT }
-            if (factBlocks.isNotEmpty() && factBlocks.all { it.sourceRefs.isEmpty() }) {
+            val factBlocks = blocks.filter { it.type == BlockType.FACT }
+            val traceable = factBlocks.filter { block ->
+                block.sourceRefs.any { it.trim() in validChunkIds }
+            }
+            if (factBlocks.isNotEmpty() && traceable.isEmpty()) {
                 return Result.failure(ModelError.Invalid("原始事实段落缺少可追溯的资料引用"))
             }
         }
-        return Result.success(output.copy(blocks = cleaned))
+        return Result.success(output.copy(blocks = blocks))
     }
 
     fun validateQuizSet(

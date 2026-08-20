@@ -7,6 +7,8 @@ import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.ChapterVersionStatus
+import com.example.zhishu.domain.model.Citation
+import com.example.zhishu.domain.model.CitationStatus
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.ParseStatus
 import com.example.zhishu.domain.model.Project
@@ -97,6 +99,10 @@ object DemoSeeder {
                 fetchedAt = now,
                 contentHash = "demo-hash-1",
                 parseStatus = ParseStatus.PARSED,
+                // 时效敏感来源长什么样，示例数据里要能看到（4A）
+                jurisdiction = "中国大陆",
+                effectiveFrom = "2021-01-01",
+                legalVersion = "2020 年颁布",
             ),
             listOf(
                 SourceChunk(
@@ -105,6 +111,8 @@ object DemoSeeder {
                     projectId = PROJECT_ID,
                     ordinal = 0,
                     text = sourceText,
+                    sectionPath = "第六编 继承 > 第一章 一般规定",
+                    paragraphIndex = 0,
                 ),
             ),
         )
@@ -233,7 +241,27 @@ object DemoSeeder {
                 text = "遗嘱因立嘱人无行为能力而无效，房子最终按法定继承处理。林晓和姑母的护工相视一笑——遗产从来不只是财产，更是一段被记住的关系。",
                 knowledgeNodeIds = listOf("n-legal", "n-estate")),
         )
-        container.chapterRepository.upsertBlocks(blocks.map { it.copy(versionId = demoVersionId(it.chapterId)) })
+        val versionedBlocks = blocks.map { it.copy(versionId = demoVersionId(it.chapterId)) }
+        container.chapterRepository.upsertBlocks(versionedBlocks)
+        // 演示数据也要有引用关系（4A），否则来源面板在示例项目里永远是空的。
+        // 引用只从块自己的 sourceRefs 生成，不给任何块编一个它没引的出处
+        container.citationRepository.upsertAll(
+            versionedBlocks.flatMap { block ->
+                block.sourceRefs.mapIndexed { order, chunkId ->
+                    Citation(
+                        id = Citation.idFor(block.id, order),
+                        projectId = PROJECT_ID,
+                        chapterId = block.chapterId,
+                        versionId = block.versionId,
+                        blockId = block.id,
+                        chunkId = chunkId,
+                        rawRef = chunkId,
+                        status = CitationStatus.RESOLVED,
+                        order = order,
+                    )
+                }
+            },
+        )
 
         container.quizRepository.upsertAll(
             listOf(

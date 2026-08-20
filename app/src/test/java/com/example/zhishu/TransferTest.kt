@@ -8,6 +8,8 @@ import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.ChapterVersionStatus
+import com.example.zhishu.domain.model.Citation
+import com.example.zhishu.domain.model.CitationStatus
 import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.ui.viewmodel.DemoSeeder
@@ -357,7 +359,7 @@ class TransferTest {
         DemoSeeder.seed(container)
         val file = File(workDir, "manifest.zip")
         assertTrue(transfer.export(app, Uri.fromFile(file)).isSuccess)
-        assertEquals(6, TransferManager.FORMAT_VERSION)
+        assertEquals(7, TransferManager.FORMAT_VERSION)
 
         var manifest = ""
         ZipInputStream(file.inputStream()).use { zip ->
@@ -368,7 +370,7 @@ class TransferTest {
                 entry = zip.nextEntry
             }
         }
-        assertTrue(manifest.contains("\"formatVersion\": 6"))
+        assertTrue(manifest.contains("\"formatVersion\": 7"))
     }
 
     /** 分卷字段能导出也能恢复（第三阶段 3C） */
@@ -494,6 +496,157 @@ class TransferTest {
         assertTrue(plan?.coveredNodeIds.orEmpty().isEmpty())
         // 标题没被丢掉：界面据此报「有内容对不上知识点」，而不是当成没讲过
         assertEquals(listOf("一个已经改过名的知识点"), plan?.coveredTitles)
+    }
+
+    /**
+     * 引用关系随备份往返（4A）。
+     *
+     * 三件事：当前版本的引用回来了、历史版本的引用也回来了、
+     * 未确认引用仍然是未确认——把它「修好」成 RESOLVED 才是最糟的结果，
+     * 那等于恢复出来的库比原库更自信，而依据一点没多。
+     */
+    @Test
+    fun exportThenImport_roundTripsCitations() = runBlocking {
+        DemoSeeder.seed(container)
+        val projectId = firstProjectId()
+        val blocks = container.chapterRepository.getAllVersionsBlocks("c1")
+        val chunkId = container.sourceRepository.getChunksByProject(projectId).first().id
+        container.citationRepository.upsertAll(
+            listOf(
+                Citation(
+                    id = Citation.idFor(blocks.first().id, 0),
+                    projectId = projectId,
+                    chapterId = "c1",
+                    versionId = blocks.first().versionId,
+                    blockId = blocks.first().id,
+                    chunkId = chunkId,
+                    rawRef = chunkId,
+                    status = CitationStatus.RESOLVED,
+                    order = 0,
+                ),
+                Citation(
+                    id = Citation.idFor(blocks.first().id, 1),
+                    projectId = projectId,
+                    chapterId = "c1",
+                    versionId = blocks.first().versionId,
+                    blockId = blocks.first().id,
+                    chunkId = null,
+                    rawRef = "《民法典》第1123条",
+                    status = CitationStatus.UNCONFIRMED,
+                    order = 1,
+                ),
+            ),
+        )
+
+        val file = File(workDir, "citations.zip")
+        val uri = Uri.fromFile(file)
+        assertTrue(transfer.export(app, uri).isSuccess)
+        container.citationRepository.deleteByProject(projectId)
+        assertTrue(container.citationRepository.getActiveByProject(projectId).isEmpty())
+
+        assertTrue(transfer.import(app, uri).isSuccess)
+        // 只看我们造的那一块：同章其他块的 sourceRefs 也会被重建成引用（这本身是对的）
+        val restored = container.citationRepository.getActiveByChapter("c1")
+            .filter { it.blockId == blocks.first().id }
+            .sortedBy { it.order }
+        assertEquals(2, restored.size)
+        assertEquals(CitationStatus.RESOLVED, restored[0].status)
+        assertEquals(chunkId, restored[0].chunkId)
+        // 未确认的还是未确认，原始标识一字不改
+        assertEquals(CitationStatus.UNCONFIRMED, restored[1].status)
+        assertNull(restored[1].chunkId)
+        assertEquals("《民法典》第1123条", restored[1].rawRef)
+    }
+
+    /**
+     * v6 及更早的备份没有 citations.json，按块的 sourceRefs 重建（4A）。
+     *
+     * 规则与 v9→v10 迁移逐字一致：对得上现存片段的记 RESOLVED，
+     * 对不上的记 UNCONFIRMED 而不是丢掉。两边不一致的话，同一份数据
+     * 「升级上来」和「导入进来」会得到两种可信度。
+     */
+    @Test
+    fun import_v6Backup_rebuildsCitationsFromSourceRefs() = runBlocking {
+        val file = File(workDir, "v6-citations.zip")
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun put(name: String, body: String) {
+                zip.putNextEntry(ZipEntry(name))
+                zip.write(body.toByteArray())
+                zip.closeEntry()
+            }
+            put("manifest.json", """{"app":"zhishu","formatVersion":6,"exportedAt":0,"projects":1}""")
+            put(
+                "projects.json",
+                """[{"id":"v6-p","title":"旧档","topic":"t","baseline":"b","depth":"d",""" +
+                    """"dailyMinutes":10,"targetDays":7,"genre":"悬疑","status":"READY","createdAt":1,"updatedAt":1}]""",
+            )
+            put(
+                "sources.json",
+                """[{"id":"v6-src","projectId":"v6-p","title":"讲义","kind":"TEXT","fetchedAt":1,""" +
+                    """"contentHash":"h","parseStatus":"PARSED"}]""",
+            )
+            put(
+                "chunks.json",
+                """[{"id":"v6-chunk","sourceId":"v6-src","projectId":"v6-p","ordinal":0,"text":"原文"}]""",
+            )
+            put(
+                "chapters.json",
+                """[{"id":"v6-c","projectId":"v6-p","order":1,"title":"第一章","status":"PUBLISHED",""" +
+                    """"activeVersionId":"v6-c-v1"}]""",
+            )
+            put(
+                "chapter_versions.json",
+                """[{"id":"v6-c-v1","chapterId":"v6-c","projectId":"v6-p","versionNumber":1,""" +
+                    """"status":"PUBLISHED","title":"第一章","createdAt":1,"updatedAt":1}]""",
+            )
+            // 一个真片段 + 一个已经不存在的片段
+            put(
+                "blocks.json",
+                """[{"id":"v6-b","chapterId":"v6-c","versionId":"v6-c-v1","projectId":"v6-p",""" +
+                    """"order":0,"text":"正文","blockType":"FACT",""" +
+                    """"sourceRefs":["v6-chunk","已经删掉的片段"]}]""",
+            )
+        }
+        assertTrue(transfer.import(app, Uri.fromFile(file)).isSuccess)
+
+        val citations = container.citationRepository.getActiveByChapter("v6-c").sortedBy { it.order }
+        assertEquals(2, citations.size)
+        assertEquals(CitationStatus.RESOLVED, citations[0].status)
+        assertEquals("v6-chunk", citations[0].chunkId)
+        assertEquals(CitationStatus.UNCONFIRMED, citations[1].status)
+        assertEquals("已经删掉的片段", citations[1].rawRef)
+        // 块的 sourceRefs 只留真的对上的那个，与引用表保持一致
+        assertEquals(
+            listOf("v6-chunk"),
+            container.chapterRepository.getActiveBlocks("v6-c").single().sourceRefs,
+        )
+    }
+
+    /** 来源元数据（法域、生效时间、法律版本）随备份往返（4A） */
+    @Test
+    fun exportThenImport_roundTripsSourceMetadata() = runBlocking {
+        DemoSeeder.seed(container)
+        val projectId = firstProjectId()
+        val sourceId = container.sourceRepository.getByProject(projectId).first().id
+        container.sourceRepository.updateMeta(
+            sourceId = sourceId,
+            versionLabel = "第 3 版",
+            jurisdiction = "中国大陆",
+            effectiveFrom = "2021-01-01",
+            legalVersion = "2020 年修正",
+        )
+
+        val file = File(workDir, "source-meta.zip")
+        val uri = Uri.fromFile(file)
+        assertTrue(transfer.export(app, uri).isSuccess)
+        container.sourceRepository.deleteByProject(projectId)
+        assertTrue(transfer.import(app, uri).isSuccess)
+
+        val restored = container.sourceRepository.getByProject(projectId).single { it.id == sourceId }
+        assertEquals("中国大陆", restored.jurisdiction)
+        assertEquals("2021-01-01", restored.effectiveFrom)
+        assertEquals("2020 年修正", restored.legalVersion)
+        assertTrue(restored.isTimeSensitive)
     }
 
     private suspend fun firstProjectId(): String =

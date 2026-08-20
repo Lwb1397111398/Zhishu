@@ -40,6 +40,7 @@ import java.util.UUID
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
@@ -59,6 +60,8 @@ private fun now(): Long = System.currentTimeMillis()
  */
 internal suspend fun deleteProjectCompletely(container: AppContainer, projectId: String) {
     container.inTransaction {
+        // 引用先删：它同时指向正文块和资料片段，两头都要没了才没有意义（4A）
+        container.citationRepository.deleteByProject(projectId)
         container.chapterRepository.clearBlocksForProject(projectId)
         container.chapterRepository.clearVersionsForProject(projectId)
         container.chapterRepository.clearPlansForProject(projectId)
@@ -500,9 +503,40 @@ class ProjectDetailViewModel(
         }
     }
 
-    fun deleteSource(sourceId: String) {
+    /**
+     * 保存用户填的来源元数据（4A）。
+     *
+     * 只写这四栏。解析结果（哈希、状态、抓取时间）不给改——那不是用户该动的东西，
+     * 一次手误就能让一份好资料显示成解析失败。
+     */
+    fun updateSourceMeta(
+        sourceId: String,
+        versionLabel: String,
+        jurisdiction: String,
+        effectiveFrom: String,
+        legalVersion: String,
+    ) {
         viewModelScope.launch {
-            container.sourceRepository.delete(sourceId)
+            container.sourceRepository.updateMeta(
+                sourceId = sourceId,
+                versionLabel = versionLabel,
+                jurisdiction = jurisdiction,
+                effectiveFrom = effectiveFrom,
+                legalVersion = legalVersion,
+            )
+            _message.value = "已保存来源信息。生成与核验都会用到它。"
+        }
+    }
+
+    fun deleteSource(sourceId: String) {        viewModelScope.launch {
+            // 引用这份资料的正文块不动，只把引用降级成「未确认」（4A）。
+            // 正文里那段话还在，它当初确实有依据；删掉引用会让它看起来
+            // 从来没打算给出处，读者也就不会想到去核对
+            container.inTransaction {
+                container.citationRepository.unconfirmForSource(sourceId)
+                container.sourceRepository.delete(sourceId)
+            }
+            _message.value = "已删除资料。引用过它的正文段落会标为「需要核对」，正文不受影响。"
         }
     }
 
@@ -708,9 +742,56 @@ class ReaderViewModel(
     private val _bodyUpdatedNotice = MutableStateFlow(false)
     val bodyUpdatedNotice: StateFlow<Boolean> = _bodyUpdatedNotice
 
+    /**
+     * 每个正文块的来源（4A）。blockId → 汇总。
+     *
+     * 只含当前 activeVersion 的引用：历史版本的引用留在库里，
+     * 但混进来会让「本章有几处来源」这个数字变得没有意义，
+     * 点过去还会打开读者看不到的正文。
+     */
+    private val _blockSources = MutableStateFlow<Map<String, BlockSourceSummary>>(emptyMap())
+    val blockSources: StateFlow<Map<String, BlockSourceSummary>> = _blockSources
+
     private var lastSaved: ReadAnchor? = null
 
-    init { load() }
+    init {
+        load()
+        observeSources()
+    }
+
+    /**
+     * 引用、片段、资料三张表拼成按块分组的来源信息。
+     *
+     * 跟着正文块流重算：重生成发布后 blocks 会换一批新 ID，
+     * 旧的来源汇总必须一起换掉，否则阅读器会拿上一版的来源去配新正文。
+     */
+    private fun observeSources() {
+        viewModelScope.launch {
+            blocks.collectLatest { currentBlocks ->
+                if (currentBlocks.isEmpty()) {
+                    _blockSources.value = emptyMap()
+                    return@collectLatest
+                }
+                val projectId = currentBlocks.first().projectId
+                val citations = container.citationRepository.getActiveByChapter(chapterId)
+                val chunkIds = citations.mapNotNull { it.chunkId }.distinct()
+                val chunks = container.sourceRepository
+                    .getChunksByIds(projectId, chunkIds)
+                    .associateBy { it.id }
+                val documents = container.sourceRepository.getByProject(projectId)
+                    .associateBy { it.id }
+                // 「这一版是不是 AI 自备知识写的」记在版本上而不是项目设置上（4A）
+                val version = container.chapterRepository.getActiveVersion(chapterId)
+                _blockSources.value = BlockSourceSummary.build(
+                    blockIds = currentBlocks.map { it.id },
+                    citations = citations,
+                    chunks = chunks,
+                    documents = documents,
+                    modelKnowledge = version?.usedModelKnowledge ?: false,
+                )
+            }
+        }
+    }
 
     private fun load() {
         viewModelScope.launch {

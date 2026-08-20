@@ -61,10 +61,16 @@ import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.KnowledgeNode
+import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.ui.common.InfoRow
 import com.example.zhishu.ui.common.UnverifiedClaimsCard
 import com.example.zhishu.ui.common.rememberZhishuViewModel
+import com.example.zhishu.ui.viewmodel.BlockSource
+import com.example.zhishu.ui.viewmodel.BlockSourceSummary
 import com.example.zhishu.ui.viewmodel.ReaderViewModel
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
@@ -102,11 +108,14 @@ fun ReaderScreen(
     val savedAnchor by vm.savedAnchor.collectAsState()
     val quizCount by vm.quizCount.collectAsState()
     val bodyUpdatedNotice by vm.bodyUpdatedNotice.collectAsState()
+    val blockSources by vm.blockSources.collectAsState()
 
     var selectedNode by remember { mutableStateOf<KnowledgeNode?>(null) }
     var showOutline by remember { mutableStateOf(false) }
     var highlightBlockId by remember { mutableStateOf(targetBlockId) }
     var restored by remember(chapterId) { mutableStateOf(false) }
+    // 打开哪一块的来源面板（4A）。默认不展开，阅读体验优先
+    var sourceBlockId by remember(chapterId) { mutableStateOf<String?>(null) }
 
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
@@ -296,7 +305,9 @@ fun ReaderScreen(
                         dense = dense,
                         nodes = nodes,
                         highlighted = block.id == highlightBlockId,
+                        sourceSummary = blockSources[block.id],
                         onOpenNode = { selectedNode = it },
+                        onOpenSources = { sourceBlockId = block.id },
                     )
                 }
                 item(key = "__footer__") {
@@ -347,7 +358,145 @@ fun ReaderScreen(
             )
         }
     }
+
+    // 来源面板（4A）：这一段从哪来，能不能核对，要不要核对
+    sourceBlockId?.let { blockId ->
+        val summary = blockSources[blockId]
+        ModalBottomSheet(onDismissRequest = { sourceBlockId = null }) {
+            BlockSourceSheet(summary = summary)
+        }
+    }
 }
+
+/**
+ * 一个正文块的来源明细（4A）。
+ *
+ * 三种情况说三种话，不混在一起：
+ * - 可定位的引用：资料名、页码/章节、版本与法域、原文摘录；
+ * - 未确认的引用：模型给的标识原样列出，并说明我们没能对上；
+ * - 一条引用都没有：区分「AI 自备知识」和「没标来源」——前者是设计如此，后者是缺口。
+ */
+@Composable
+private fun BlockSourceSheet(summary: BlockSourceSummary?) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp)
+            .padding(bottom = 32.dp),
+    ) {
+        Text("这一段从哪来", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(12.dp))
+
+        if (summary == null || !summary.hasAnything) {
+            Text(
+                if (summary?.modelKnowledge == true) {
+                    "本项目采用「AI 自备知识」模式，这一段没有用户资料作为出处。" +
+                        "章末列出的待核实内容值得你自己对一遍权威出处。"
+                } else {
+                    "这一段没有标注来源。它可能是故事情节，也可能是没能对上资料的讲解——" +
+                        "涉及具体规则时建议自己核对一次。"
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            return@Column
+        }
+
+        summary.sources.forEach { source ->
+            SourceEntry(source)
+            Spacer(Modifier.height(12.dp))
+        }
+    }
+}
+
+@Composable
+private fun SourceEntry(source: BlockSource) {
+    Surface(
+        color = if (source.needsManualCheck) {
+            MaterialTheme.colorScheme.tertiaryContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant
+        },
+        shape = MaterialTheme.shapes.medium,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            if (source.needsManualCheck) {
+                // 说清楚发生了什么，而不是只挂一个「未确认」标签：
+                // 用户需要知道这是「模型给的出处对不上」，不是「系统出错了」
+                Text(
+                    "未能匹配到资料，需要你自己核对",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "模型给出的出处标识：${source.citation.rawRef}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "可能是引用的资料已被删除，也可能是模型自己凑了一个标识。" +
+                        "这一段的内容仍然可读，但它的出处没有得到确认。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                )
+                return@Column
+            }
+
+            Text(
+                source.title,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(Modifier.height(4.dp))
+            if (source.locator.isNotBlank()) {
+                Text(
+                    source.locator,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (source.versionInfo.isNotBlank()) {
+                Text(
+                    source.versionInfo,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            source.document?.let { document ->
+                Text(
+                    "${sourceOriginLabel(document)} · 取得于 ${formatSourceDay(document.fetchedAt)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (source.excerpt.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    source.excerpt.take(SOURCE_EXCERPT_CHARS),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
+    }
+}
+
+/** 「你的文件 / 你抓取的网页 / 你粘贴的文本」——用户要能一眼看出是不是自己的资料 */
+private fun sourceOriginLabel(document: SourceDocument): String = when {
+    !document.fileName.isNullOrBlank() -> "你的文件：${document.fileName}"
+    !document.url.isNullOrBlank() -> "你抓取的网页：${document.url}"
+    else -> "你粘贴的文本"
+}
+
+private fun formatSourceDay(ts: Long): String =
+    SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(ts))
+
+/** 来源面板里原文摘录的长度上限。够核对就行，不必把整个片段搬过来 */
+private const val SOURCE_EXCERPT_CHARS = 600
 
 /** 章末：只给「自测」和「下一章」两个出口，不做任务式提示 */
 @Composable
@@ -524,7 +673,9 @@ private fun BlockContent(
     dense: Boolean,
     nodes: List<KnowledgeNode>,
     highlighted: Boolean,
+    sourceSummary: BlockSourceSummary?,
     onOpenNode: (KnowledgeNode) -> Unit,
+    onOpenSources: () -> Unit,
 ) {
     // 命中的块闪一下底色，让人一眼看到"就是这里"
     val highlightColor by animateColorAsState(
@@ -618,6 +769,29 @@ private fun BlockContent(
                         )
                     }
                 }
+            }
+        }
+
+        // 来源入口（4A）。克制显示：密集模式下有来源就给入口；
+        // 安静模式下只在**存在未确认引用**时出现——那件事读者应该知道，
+        // 而「这一段有 3 处正常来源」不该在故事阅读中反复打断视线
+        if (sourceSummary != null && sourceSummary.hasAnything &&
+            (dense || sourceSummary.unconfirmedCount > 0)
+        ) {
+            Spacer(Modifier.height(4.dp))
+            TextButton(
+                onClick = onOpenSources,
+                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+            ) {
+                Text(
+                    sourceSummary.label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (sourceSummary.unconfirmedCount > 0) {
+                        MaterialTheme.colorScheme.tertiary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
             }
         }
     }

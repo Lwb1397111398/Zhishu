@@ -28,8 +28,10 @@ import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.ReviewItem
 import com.example.zhishu.domain.model.ReviewStatus
 import com.example.zhishu.domain.model.SourceChunk
+import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.StoryBible
 import com.example.zhishu.domain.repository.ChapterRepository
+import com.example.zhishu.domain.repository.CitationRepository
 import com.example.zhishu.domain.repository.KnowledgeRepository
 import com.example.zhishu.domain.repository.ProjectRepository
 import com.example.zhishu.domain.repository.QuizRepository
@@ -48,6 +50,8 @@ class PipelineService(
     private val sourceRepository: SourceRepository,
     private val knowledgeRepository: KnowledgeRepository,
     private val chapterRepository: ChapterRepository,
+    /** 正文块 ↔ 资料片段的引用关系（4A）。发布哪一版正文，就写哪一版的引用 */
+    private val citationRepository: CitationRepository,
     private val storyBibleRepository: StoryBibleRepository,
     private val quizRepository: QuizRepository,
     private val reviewRepository: ReviewRepository,
@@ -77,6 +81,8 @@ class PipelineService(
             }
         }
 
+        // 片段的来源与定位信息一起喂给模型（4A）
+        loadSourceMeta(projectId)
         val template = prompts.load(
             if (modelKnowledge) PROMPT_KNOWLEDGE_MAP_MODEL else PROMPT_KNOWLEDGE_MAP,
         )
@@ -215,6 +221,9 @@ class PipelineService(
         // 这里没有已发布章节（上面已经拦过），清理是安全的：
         // 清掉的只是上一次规划出来、还一个字都没写的章节计划
         chapterRepository.clearVersionsForProject(projectId)
+        // 引用跟着正文块一起清。留着的话它们会指向不存在的块，
+        // 「这份资料被哪几段引用了」就会给出点不开的结果（4A）
+        citationRepository.deleteByProject(projectId)
         chapterRepository.clearBlocksForProject(projectId)
         chapterRepository.clearPlansForProject(projectId)
         chapterRepository.upsertPlans(plans)
@@ -495,6 +504,8 @@ class PipelineService(
         val allNodes = knowledgeRepository.getByProject(projectId)
         val nodes = plan.nodeIds.mapNotNull { id -> allNodes.firstOrNull { it.id == id } }
         val chunks = if (modelKnowledge) emptyList() else loadChunksForNodes(projectId, nodes)
+        // 片段的来源、页码、版本、法域要一起喂给模型（4A）
+        loadSourceMeta(projectId)
 
         val bible = storyBibleRepository.get(projectId) ?: StoryBible(projectId = projectId)
         val plans = chapterRepository.getPlans(projectId)
@@ -557,7 +568,7 @@ class PipelineService(
             return Result.failure(it)
         }
 
-        val blocks = output.blocks.mapIndexed { index, block ->
+        val rawBlocks = output.blocks.mapIndexed { index, block ->
             ChapterBlock(
                 id = idFactory(),
                 chapterId = planId,
@@ -567,13 +578,34 @@ class PipelineService(
                 text = block.text,
                 blockType = block.type,
                 knowledgeNodeIds = block.knowledgeNodeTitles.mapNotNull { titleToId[it.trim()] }.distinct(),
-                sourceRefs = block.sourceRefs.filter { it in validChunkIds }.distinct(),
+                // sourceRefs 先留空，下面按解析结果回填——能不能解析到真实片段
+                // 由 CitationResolver 一处说了算，这里不重复一遍那套判断（4A）
             )
+        }
+        // 引用关系落成独立的行（4A）：解析到片段的记 RESOLVED，
+        // 对不上任何片段的记 UNCONFIRMED，而不是像以前那样静默丢掉。
+        // 丢掉的后果是正文里那句需要出处的话变成了没人管的断言，
+        // 而阅读器还会显示「本段无引用」——看起来跟模型本来就没打算给出处一样。
+        val citations = CitationResolver.resolve(
+            projectId = projectId,
+            chapterId = planId,
+            versionId = version.id,
+            blocks = rawBlocks.mapIndexed { index, block ->
+                CitationResolver.BlockRefs(
+                    blockId = block.id,
+                    rawRefs = output.blocks[index].sourceRefs,
+                )
+            },
+            validChunkIds = validChunkIds,
+        )
+        val blocks = rawBlocks.map { block ->
+            block.copy(sourceRefs = citations.resolvedByBlock[block.id].orEmpty())
         }
         // 新正文写进新版本，旧版本的块一个都不删（第三阶段 3A）。
         // 这就是「重生成会覆盖已发布正文」这个风险的根治办法：两版正文挂在不同
         // versionId 上共存，阅读器只认 chapters.activeVersionId 指的那一版。
         chapterRepository.upsertBlocks(blocks)
+        citationRepository.replaceForVersion(version.id, citations.citations)
         attempt.bodyWritten = true
         chapterRepository.updateVersionStatus(version.id, ChapterVersionStatus.VERIFYING, now = clock())
         if (!attempt.hadReadableBody) {
@@ -627,6 +659,9 @@ class PipelineService(
                 coveredTitles = coveredTitles,
                 coveredNodeIds = coveredIds,
                 unverifiedClaims = unverified,
+                // 记住这一版是在什么知识模式下写出来的（4A）。用户以后补了资料，
+                // 也不能让这一版看起来像是有出处的——它当时一条引用都引不到
+                usedModelKnowledge = modelKnowledge,
                 verificationNote = if (unverified.isEmpty()) {
                     ""
                 } else {
@@ -776,6 +811,9 @@ class PipelineService(
                 .replace("{blocks}", body)
         } else {
             val chunks = loadChunksForNodes(projectId, nodes)
+            // 核验也要看到片段的页码、章节、版本、法域（4A）：
+            // 「这条规则只在某个法域成立」这类问题，没有元数据是核不出来的
+            loadSourceMeta(projectId)
             prompts.load(PROMPT_VERIFY)
                 .replace("{derivationChain}", derivation)
                 .replace("{learningGoals}", plan.learningGoals.joinToString("；"))
@@ -987,9 +1025,43 @@ class PipelineService(
 
     private fun formatChunks(chunks: List<SourceChunk>): String {
         if (chunks.isEmpty()) return "（本项目采用 AI 自备知识模式，没有用户资料）"
-        return chunks.take(MAX_CHUNKS).joinToString("\n\n") {
-            "[片段ID: ${it.id}]\n${it.text.take(CHUNK_EXCERPT)}"
+        return chunks.take(MAX_CHUNKS).joinToString("\n\n") { chunk ->
+            "[片段ID: ${chunk.id}]${sourceIdentity(chunk)}\n${chunk.text.take(CHUNK_EXCERPT)}"
         }
+    }
+
+    /**
+     * 片段的结构化来源标识（4A）。
+     *
+     * 模型看到的不再只是一串 UUID，而是「出自哪份资料的哪一页哪一节、什么版本、
+     * 哪个法域、什么时候拿到的」。两个用处：引用能落到具体位置；模型自己知道
+     * 「这份资料只适用于某个法域和某个时间之后」，不会把它讲成普适规则。
+     *
+     * 元数据来自 [sourceMetaCache]，它在每次生成开始时按项目装一次。
+     */
+    private fun sourceIdentity(chunk: SourceChunk): String {
+        val document = sourceMetaCache[chunk.sourceId]
+        val parts = buildList {
+            document?.title?.takeIf { it.isNotBlank() }?.let { add(it) }
+            add(chunk.locatorLabel)
+            document?.versionLabelForDisplay?.let { add("版本：$it") }
+            document?.jurisdiction?.takeIf { it.isNotBlank() }?.let { add("法域：$it") }
+            document?.effectiveFrom?.takeIf { it.isNotBlank() }?.let { add("生效：$it") }
+        }
+        return if (parts.isEmpty()) "" else " 来源：" + parts.joinToString(" · ")
+    }
+
+    /**
+     * 本次生成用到的资料元数据，sourceId → 资料行。
+     *
+     * 之所以是一个字段而不是参数：`formatChunks` 被章节、核验、知识地图三处调用，
+     * 每处都多穿一个参数只是把同一件事说三遍。生成是单线程顺序执行的，
+     * 每次进入前 [loadSourceMeta] 会整体换掉它。
+     */
+    private var sourceMetaCache: Map<String, SourceDocument> = emptyMap()
+
+    private suspend fun loadSourceMeta(projectId: String) {
+        sourceMetaCache = sourceRepository.getByProject(projectId).associateBy { it.id }
     }
 
     /** 节点连带来处与去处一起给模型，推演才接得上（问题2） */
@@ -1022,7 +1094,20 @@ class PipelineService(
             规则内容本身可以讲清楚，但不要伪造出处。
             """.trimIndent()
         } else {
-            "资料片段（引用时把片段ID填进对应 block 的 sourceRefs）：\n" + formatChunks(chunks)
+            // 「编一个 ID 会被记成未确认」这句话必须写明（4A）。
+            // 不写的话模型没有任何理由不去凑一个看起来像的 ID——它以前那么做的时候，
+            // 那条引用被静默丢掉，正文里那句话就成了没有出处的断言。
+            buildString {
+                appendLine("资料片段。引用时把**上面出现过的**片段ID原样填进对应 block 的 sourceRefs：")
+                appendLine()
+                appendLine(formatChunks(chunks))
+                appendLine()
+                appendLine("关于引用（4A，必须遵守）：")
+                appendLine("- 只能填上面列出的片段ID，原样复制，不要改写、拼接或缩短。")
+                appendLine("- 不要编造片段ID。编出来的 ID 会被记成「未确认引用」直接展示给读者，不会变成来源。")
+                appendLine("- 每个 FACT 段落至少引一个真实片段；讲解性段落引用它实际依据的片段。")
+                append("- 引用不到资料、只能靠常识说的内容，宁可不引，也不要引一个不相干的片段充数。")
+            }
         }
 
     private fun unverifiedSection(modelKnowledge: Boolean): String =

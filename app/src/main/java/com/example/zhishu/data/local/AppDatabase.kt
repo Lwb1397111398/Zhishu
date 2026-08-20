@@ -11,6 +11,7 @@ import com.example.zhishu.data.local.dao.AnswerRecordDao
 import com.example.zhishu.data.local.dao.ChapterBlockDao
 import com.example.zhishu.data.local.dao.ChapterPlanDao
 import com.example.zhishu.data.local.dao.ChapterVersionDao
+import com.example.zhishu.data.local.dao.CitationDao
 import com.example.zhishu.data.local.dao.KnowledgeConflictDao
 import com.example.zhishu.data.local.dao.KnowledgeGapDao
 import com.example.zhishu.data.local.dao.KnowledgeNodeDao
@@ -27,6 +28,7 @@ import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterBlockFts
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterVersion
+import com.example.zhishu.domain.model.Citation
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
@@ -57,6 +59,7 @@ import kotlinx.serialization.json.Json
         ChapterVersion::class,
         ChapterBlock::class,
         ChapterBlockFts::class,
+        Citation::class,
         Quiz::class,
         AnswerRecord::class,
         ReviewItem::class,
@@ -64,7 +67,7 @@ import kotlinx.serialization.json.Json
         ModelConfig::class,
         StoryBible::class,
     ],
-    version = 9,
+    version = 10,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -78,6 +81,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun chapterPlanDao(): ChapterPlanDao
     abstract fun chapterVersionDao(): ChapterVersionDao
     abstract fun chapterBlockDao(): ChapterBlockDao
+    abstract fun citationDao(): CitationDao
     abstract fun quizDao(): QuizDao
     abstract fun answerRecordDao(): AnswerRecordDao
     abstract fun reviewItemDao(): ReviewItemDao
@@ -526,6 +530,125 @@ abstract class AppDatabase : RoomDatabase() {
         /** 迁移出来的初始版本 ID 后缀。测试与导入兼容逻辑共用同一个约定。 */
         const val INITIAL_VERSION_SUFFIX = "-v1"
 
+        /**
+         * v9 → v10：来源与引用可追溯（第四阶段 4A）。
+         *
+         * 要回答的问题是「这一段内容从哪来」。在 4A 之前只能回答一半：
+         * `chapter_blocks.sourceRefs` 里躺着几个片段 ID，而片段本身不知道自己
+         * 在原资料的第几页第几节，模型给的对不上的引用又在校验时被静默丢掉了。
+         *
+         * 四件事：
+         *
+         * 1. **来源元数据**。sources 增加 jurisdiction / effectiveFrom / legalVersion。
+         *    法律、税务这类内容离开法域和生效时间就没有对错可言。
+         * 2. **片段定位**。source_chunks 增加 pageNumber / sectionPath / paragraphIndex。
+         *    旧片段留空——它们是用当年那套不记位置的分块逻辑切出来的，
+         *    页码和章节无从倒推。硬填一个数字会让用户翻到错误的页码，
+         *    比承认「这份资料是早先导入的，只能定位到段落」糟得多。
+         * 3. **引用关系表**。按 `versionId + blockId + chunkId` 绑定，
+         *    并把现有 sourceRefs 全部回填进去（含历史版本，一条不丢）。
+         *    回填时对不上片段的引用记成 UNCONFIRMED 而不是丢掉：
+         *    那正是这张表存在的理由。
+         * 4. **本章是不是 AI 自备知识写的**。chapter_versions 增加 usedModelKnowledge，
+         *    按项目当前的 sourceMode 回填——这是旧数据能给出的唯一依据。
+         */
+        val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // 1. 来源元数据（可空，旧资料就是没填）
+                db.execSQL("ALTER TABLE sources ADD COLUMN jurisdiction TEXT")
+                db.execSQL("ALTER TABLE sources ADD COLUMN effectiveFrom TEXT")
+                db.execSQL("ALTER TABLE sources ADD COLUMN legalVersion TEXT")
+
+                // 2. 片段定位
+                db.execSQL("ALTER TABLE source_chunks ADD COLUMN pageNumber INTEGER")
+                db.execSQL("ALTER TABLE source_chunks ADD COLUMN sectionPath TEXT")
+                db.execSQL("ALTER TABLE source_chunks ADD COLUMN paragraphIndex INTEGER NOT NULL DEFAULT 0")
+
+                // 3. 这一版正文写的时候有没有资料可引
+                db.execSQL(
+                    "ALTER TABLE chapter_versions ADD COLUMN usedModelKnowledge INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "UPDATE chapter_versions SET usedModelKnowledge = 1 WHERE projectId IN " +
+                        "(SELECT id FROM projects WHERE sourceMode = 'MODEL')",
+                )
+
+                // 4. 引用关系表
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `citations` (" +
+                        "`id` TEXT NOT NULL, `projectId` TEXT NOT NULL, `chapterId` TEXT NOT NULL, " +
+                        "`versionId` TEXT NOT NULL, `blockId` TEXT NOT NULL, `chunkId` TEXT, " +
+                        "`rawRef` TEXT NOT NULL DEFAULT '', `status` TEXT NOT NULL, " +
+                        "`order` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_citations_versionId` ON `citations` (`versionId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_citations_blockId` ON `citations` (`blockId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_citations_chunkId` ON `citations` (`chunkId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_citations_projectId` ON `citations` (`projectId`)")
+                backfillCitations(db)
+            }
+
+            /**
+             * 把 `chapter_blocks.sourceRefs` 里的引用搬进 citations 表。
+             *
+             * 全部版本都搬，不只是当前版本：历史版本的引用要保留（4A 的明确要求），
+             * 而且 4B 的局部重写会从历史版本派生草稿，那时需要知道旧块引了什么。
+             *
+             * 对不上现存片段的引用记成 UNCONFIRMED。旧库里这种情况一定存在——
+             * 用户删掉一份资料，引用它的正文块还留着 sourceRefs。
+             * 以前这只是几个查不到的 ID；现在它是一句能说出口的话：
+             * 「这一段引的资料已经不在了」。
+             */
+            private fun backfillCitations(db: SupportSQLiteDatabase) {
+                val knownChunkIds = mutableSetOf<String>()
+                db.query("SELECT id FROM source_chunks").use { cursor ->
+                    while (cursor.moveToNext()) knownChunkIds += cursor.getString(0)
+                }
+
+                val rows = mutableListOf<Array<Any?>>()
+                db.query(
+                    "SELECT id, projectId, chapterId, versionId, sourceRefs FROM chapter_blocks " +
+                        "WHERE sourceRefs != '' AND sourceRefs != '[]'",
+                ).use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val blockId = cursor.getString(0)
+                        val projectId = cursor.getString(1)
+                        val chapterId = cursor.getString(2)
+                        val versionId = cursor.getString(3)
+                        decodeList(cursor.getString(4))
+                            .map { it.trim() }
+                            .filter { it.isNotEmpty() }
+                            .distinct()
+                            .forEachIndexed { order, ref ->
+                                rows += arrayOf<Any?>(
+                                    "$blockId#$order",
+                                    projectId,
+                                    chapterId,
+                                    versionId,
+                                    blockId,
+                                    if (ref in knownChunkIds) ref else null,
+                                    ref,
+                                    if (ref in knownChunkIds) "RESOLVED" else "UNCONFIRMED",
+                                    order,
+                                )
+                            }
+                    }
+                }
+                rows.forEach { args ->
+                    db.execSQL(
+                        "INSERT OR REPLACE INTO citations " +
+                            "(id, projectId, chapterId, versionId, blockId, chunkId, rawRef, status, `order`) " +
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        args,
+                    )
+                }
+            }
+
+            /** Converters 把列表存成 JSON 数组，这里按同一个约定解析 */
+            private fun decodeList(value: String): List<String> = runCatching {
+                if (value.isBlank()) emptyList() else LIST_JSON.decodeFromString(LIST_SERIALIZER, value)
+            }.getOrDefault(emptyList())
+        }
         /** 迁移里手工拼列表时用的 JSON 编解码，与 [Converters] 保持一致 */
         val LIST_JSON = Json
         val LIST_SERIALIZER = ListSerializer(String.serializer())
@@ -541,6 +664,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_6_7,
                     MIGRATION_7_8,
                     MIGRATION_8_9,
+                    MIGRATION_9_10,
                 )
                 .build()
     }

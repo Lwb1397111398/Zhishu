@@ -25,7 +25,7 @@ class ParserServiceImpl(
         fetchedAt: Long,
     ): ParseResult {
         // URL 抓取自身已切 IO，这里再包一层保证文件解析与分块也不在主线程
-        val (source, rawText) = when (input) {
+        val (source, pages) = when (input) {
             is SourceInput.Url -> {
                 val page = webFetcher.fetch(input.url)
                 SourceDocument(
@@ -38,7 +38,7 @@ class ParserServiceImpl(
                     versionLabel = null,
                     contentHash = HashUtils.sha256(page.text),
                     parseStatus = if (page.text.isBlank()) ParseStatus.FAILED else ParseStatus.PARSED,
-                ) to page.text
+                ) to onePage(page.text)
             }
 
             is SourceInput.Text -> withContext(ioDispatcher) {
@@ -50,7 +50,7 @@ class ParserServiceImpl(
                     fetchedAt = fetchedAt,
                     contentHash = HashUtils.sha256(input.text),
                     parseStatus = ParseStatus.PARSED,
-                ) to input.text
+                ) to onePage(input.text)
             }
 
             is SourceInput.FileBytes -> withContext(ioDispatcher) {
@@ -58,25 +58,33 @@ class ParserServiceImpl(
             }
         }
 
-        if (rawText.isBlank()) {
+        if (pages.all { it.text.isBlank() }) {
             val status = if (source.kind == SourceKind.PDF) ParseStatus.SCAN_ONLY else ParseStatus.FAILED
             return ParseResult(source.copy(parseStatus = status), emptyList())
         }
         val chunks = withContext(ioDispatcher) {
-            Chunker.chunk(sourceId = source.id, text = rawText, projectId = projectId)
+            Chunker.chunkPages(sourceId = source.id, pages = pages, projectId = projectId)
         }
         return ParseResult(source, chunks)
     }
+
+    /** 没有页码概念的资料（纯文本、Markdown、网页）：整份算一「页」，页码留空 */
+    private fun onePage(text: String): List<SourcePage> = listOf(SourcePage(pageNumber = 0, text = text))
 
     private fun parseFile(
         projectId: String,
         input: SourceInput.FileBytes,
         fetchedAt: Long,
-    ): Pair<SourceDocument, String> {
+    ): Pair<SourceDocument, List<SourcePage>> {
         return when (input.kind) {
             SourceKind.PDF -> {
-                val text = extractPdfText(input.bytes)
-                val status = if (text.length < 20) ParseStatus.SCAN_ONLY else ParseStatus.PARSED
+                val pages = extractPdfPages(input.bytes)
+                val totalLength = pages.sumOf { it.text.length }
+                val status = if (totalLength < MIN_PDF_TEXT_LENGTH) {
+                    ParseStatus.SCAN_ONLY
+                } else {
+                    ParseStatus.PARSED
+                }
                 SourceDocument(
                     id = UUID.randomUUID().toString(),
                     projectId = projectId,
@@ -86,7 +94,7 @@ class ParserServiceImpl(
                     fetchedAt = fetchedAt,
                     contentHash = HashUtils.sha256(input.bytes),
                     parseStatus = status,
-                ) to text
+                ) to pages
             }
 
             else -> {
@@ -100,18 +108,35 @@ class ParserServiceImpl(
                     fetchedAt = fetchedAt,
                     contentHash = HashUtils.sha256(input.bytes),
                     parseStatus = if (text.isBlank()) ParseStatus.FAILED else ParseStatus.PARSED,
-                ) to text
+                ) to onePage(text)
             }
         }
     }
 
-    private fun extractPdfText(bytes: ByteArray): String {
+    /**
+     * 逐页抽取 PDF 文本（4A）。
+     *
+     * 原来是一次 `getText(document)` 拿到整本的文本，页码信息在那一步就被抹掉了——
+     * 于是引用只能说「出自这份 PDF」，用户拿着一份三百页的资料无从核对。
+     * 现在按页抽，页码直接跟着片段走。
+     */
+    private fun extractPdfPages(bytes: ByteArray): List<SourcePage> {
         return try {
             PDDocument.load(bytes).use { document ->
-                PDFTextStripper().getText(document)
+                val stripper = PDFTextStripper()
+                (1..document.numberOfPages).map { page ->
+                    stripper.startPage = page
+                    stripper.endPage = page
+                    SourcePage(pageNumber = page, text = stripper.getText(document))
+                }
             }
         } catch (e: Exception) {
-            ""
+            emptyList()
         }
+    }
+
+    private companion object {
+        /** 抽出来的文字少于这个数就当扫描件——排版空白比正文还多的 PDF 引用不了 */
+        const val MIN_PDF_TEXT_LENGTH = 20
     }
 }

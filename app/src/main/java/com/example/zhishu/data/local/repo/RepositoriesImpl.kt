@@ -4,6 +4,7 @@ import com.example.zhishu.data.local.dao.AnswerRecordDao
 import com.example.zhishu.data.local.dao.ChapterBlockDao
 import com.example.zhishu.data.local.dao.ChapterPlanDao
 import com.example.zhishu.data.local.dao.ChapterVersionDao
+import com.example.zhishu.data.local.dao.CitationDao
 import com.example.zhishu.data.local.dao.KnowledgeConflictDao
 import com.example.zhishu.data.local.dao.KnowledgeGapDao
 import com.example.zhishu.data.local.dao.KnowledgeNodeDao
@@ -21,6 +22,8 @@ import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.ChapterVersionStatus
+import com.example.zhishu.domain.model.Citation
+import com.example.zhishu.domain.model.CitationStatus
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
@@ -36,6 +39,7 @@ import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.StoryBible
 import com.example.zhishu.domain.repository.ChapterRepository
+import com.example.zhishu.domain.repository.CitationRepository
 import com.example.zhishu.domain.repository.KnowledgeRepository
 import com.example.zhishu.domain.repository.ProgressRepository
 import com.example.zhishu.domain.repository.ProjectRepository
@@ -87,6 +91,22 @@ class DefaultSourceRepository(
 
     override suspend fun findDuplicate(hash: String): SourceDocument? =
         documentDao.findByHash(hash)
+
+    override suspend fun updateMeta(
+        sourceId: String,
+        versionLabel: String?,
+        jurisdiction: String?,
+        effectiveFrom: String?,
+        legalVersion: String?,
+    ) = documentDao.updateMeta(
+        id = sourceId,
+        // 空白一律存 null：数据库里躺着一个空字符串和「没填」是同一件事，
+        // 但判断「填了没填」时空字符串会算成填了
+        versionLabel = versionLabel?.trim()?.takeIf { it.isNotEmpty() },
+        jurisdiction = jurisdiction?.trim()?.takeIf { it.isNotEmpty() },
+        effectiveFrom = effectiveFrom?.trim()?.takeIf { it.isNotEmpty() },
+        legalVersion = legalVersion?.trim()?.takeIf { it.isNotEmpty() },
+    )
 
     override suspend fun delete(sourceId: String) {
         chunkDao.deleteBySource(sourceId)
@@ -290,8 +310,48 @@ class DefaultChapterRepository(
     }
 }
 
-class DefaultStoryBibleRepository(private val dao: StoryBibleDao) : StoryBibleRepository {
-    override suspend fun get(projectId: String): StoryBible? = dao.get(projectId)
+/**
+ * 引用关系（4A）。转发为主，唯一有逻辑的是 [replaceForVersion]：
+ * 先清这一版再写，历史版本的引用一条都不碰。
+ */
+class DefaultCitationRepository(private val dao: CitationDao) : CitationRepository {
+    override fun observeActiveByChapter(chapterId: String): Flow<List<Citation>> =
+        dao.observeActiveByChapter(chapterId)
+
+    override suspend fun getActiveByChapter(chapterId: String): List<Citation> =
+        dao.getActiveByChapter(chapterId)
+
+    override suspend fun countActiveResolved(chapterId: String): Int =
+        dao.countActiveByChapterAndStatus(chapterId, CitationStatus.RESOLVED)
+
+    override suspend fun countActiveUnconfirmed(chapterId: String): Int =
+        dao.countActiveByChapterAndStatus(chapterId, CitationStatus.UNCONFIRMED)
+
+    override suspend fun getActiveByChunk(projectId: String, chunkId: String): List<Citation> =
+        dao.getActiveByChunk(projectId, chunkId)
+
+    override suspend fun getActiveByProject(projectId: String): List<Citation> =
+        dao.getActiveByProject(projectId)
+
+    override suspend fun getByVersion(versionId: String): List<Citation> = dao.getByVersion(versionId)
+
+    override suspend fun getAllVersionsByProject(projectId: String): List<Citation> =
+        dao.getAllVersionsByProject(projectId)
+
+    override suspend fun replaceForVersion(versionId: String, citations: List<Citation>) {
+        dao.deleteByVersion(versionId)
+        if (citations.isNotEmpty()) dao.upsertAll(citations)
+    }
+
+    override suspend fun upsertAll(citations: List<Citation>) = dao.upsertAll(citations)
+    override suspend fun deleteByChapter(chapterId: String) = dao.deleteByChapter(chapterId)
+    override suspend fun deleteByProject(projectId: String) = dao.deleteByProject(projectId)
+
+    override suspend fun unconfirmForSource(sourceId: String) =
+        dao.unconfirmForSource(sourceId, CitationStatus.UNCONFIRMED)
+}
+
+class DefaultStoryBibleRepository(private val dao: StoryBibleDao) : StoryBibleRepository {    override suspend fun get(projectId: String): StoryBible? = dao.get(projectId)
     override fun observe(projectId: String): Flow<StoryBible?> = dao.observe(projectId)
     override suspend fun save(bible: StoryBible) = dao.upsert(bible)
 

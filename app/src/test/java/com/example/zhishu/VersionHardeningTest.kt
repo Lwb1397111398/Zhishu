@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.zhishu.ai.pipeline.PipelineService
 import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.data.local.repo.DefaultChapterRepository
+import com.example.zhishu.data.local.repo.DefaultCitationRepository
 import com.example.zhishu.data.local.repo.DefaultKnowledgeRepository
 import com.example.zhishu.data.local.repo.DefaultProgressRepository
 import com.example.zhishu.data.local.repo.DefaultProjectRepository
@@ -74,6 +75,7 @@ class VersionHardeningTest {
                 db.chapterBlockDao(),
                 db.chapterVersionDao(),
             ),
+            citationRepository = DefaultCitationRepository(db.citationDao()),
             storyBibleRepository = DefaultStoryBibleRepository(db.storyBibleDao()),
             quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
             reviewRepository = DefaultReviewRepository(db.reviewItemDao()),
@@ -488,6 +490,8 @@ class VersionHardeningTest {
             "Repositories.kt",
             "RepositoriesImpl.kt",
             "ChapterBlockDao.kt",
+            // 引用关系的 DAO（4A）：同样只有备份导出会调它的 AllVersions 查询
+            "CitationDao.kt",
         )
         val offenders = sourceRoot().resolve("src/main").walkTopDown()
             .filter { it.isFile && it.extension == "kt" && it.name !in allowed }
@@ -583,7 +587,8 @@ class VersionHardeningTest {
             db.chapterBlockDao(),
             db.chapterVersionDao(),
         ),
-        storyBibleRepository = DefaultStoryBibleRepository(db.storyBibleDao()),
+        citationRepository = DefaultCitationRepository(db.citationDao()),
+            storyBibleRepository = DefaultStoryBibleRepository(db.storyBibleDao()),
         quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
         reviewRepository = DefaultReviewRepository(db.reviewItemDao()),
         spacedReviewEnabled = { enabled },

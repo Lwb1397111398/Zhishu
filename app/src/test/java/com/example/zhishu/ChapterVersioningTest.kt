@@ -6,6 +6,7 @@ import com.example.zhishu.ai.ModelError
 import com.example.zhishu.ai.pipeline.PipelineService
 import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.data.local.repo.DefaultChapterRepository
+import com.example.zhishu.data.local.repo.DefaultCitationRepository
 import com.example.zhishu.data.local.repo.DefaultKnowledgeRepository
 import com.example.zhishu.data.local.repo.DefaultProgressRepository
 import com.example.zhishu.data.local.repo.DefaultProjectRepository
@@ -78,6 +79,7 @@ class ChapterVersioningTest {
                 db.chapterBlockDao(),
                 db.chapterVersionDao(),
             ),
+            citationRepository = DefaultCitationRepository(db.citationDao()),
             storyBibleRepository = DefaultStoryBibleRepository(db.storyBibleDao()),
             quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
             reviewRepository = DefaultReviewRepository(db.reviewItemDao()),
