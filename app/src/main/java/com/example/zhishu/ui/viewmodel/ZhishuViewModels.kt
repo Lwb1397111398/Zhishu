@@ -319,6 +319,21 @@ class ProjectDetailViewModel(
     val rewriting: StateFlow<Set<String>> = _rewriting
 
     /**
+     * 当前正文里出处没对上的引用条数（4C）：未确认 + 来源已删除。
+     *
+     * 只数 active version。历史版本的未确认引用留在库里，但它们指的是
+     * 读者已经看不到的段落，数进来会让「有 12 项要核对」这个数字
+     * 既无法定位也无法消掉。
+     *
+     * 跟着 plans 重算：发布新版本、局部重写、删除资料都会改变它。
+     */
+    val unconfirmedCitationCount: StateFlow<Int> =
+        plans.map {
+            container.citationRepository.getActiveByProject(projectId)
+                .count { citation -> !citation.status.isResolved }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    /**
      * 问题所在段落的正文，blockId → 文字（4B）。
      *
      * 用户要能看到「问题指的是哪一段」才谈得上判断。只给一句问题说明
@@ -834,6 +849,35 @@ class ReaderViewModel(
     private val _blockSources = MutableStateFlow<Map<String, BlockSourceSummary>>(emptyMap())
     val blockSources: StateFlow<Map<String, BlockSourceSummary>> = _blockSources
 
+    /**
+     * 章节级来源摘要（4C）。统计范围只含当前 active version。
+     *
+     * 和 [blockSources] 同一次装载算出来：两者读的是同一批引用，
+     * 分两次查会出现「摘要说 7 处来源、逐块数只有 5 处」这种自己打自己脸的情况。
+     */
+    private val _chapterTrust = MutableStateFlow(ChapterTrustSummary())
+    val chapterTrust: StateFlow<ChapterTrustSummary> = _chapterTrust
+
+    /**
+     * 跳转过来的 blockId 在当前版本里已经不存在（4C）。
+     *
+     * 搜索结果、资料回跳、知识地图锚点都可能是在上一版正文上算出来的。
+     * 正文换版本后每个块都是新 ID（4B），旧链接必然落空。
+     * 什么都不说会让用户以为「点了没反应」，所以如实说一句：
+     * 那一段属于旧版本，本章已经更新过。
+     *
+     * 和 [bodyUpdatedNotice] 不同，这条不落库、也没有「消费」这一步：
+     * 它说的是**这一次跳转**的结果，生命周期就是这一次进入阅读器。
+     * 换一章或重新跳一次都会拿到新的 ViewModel，提示自然消失；
+     * 记进库反而会让它在一次跟本次跳转无关的阅读里冒出来。
+     */
+    private val _staleTargetNotice = MutableStateFlow(false)
+    val staleTargetNotice: StateFlow<Boolean> = _staleTargetNotice
+
+    fun reportStaleTarget() {
+        _staleTargetNotice.value = true
+    }
+
     private var lastSaved: ReadAnchor? = null
 
     init {
@@ -852,6 +896,7 @@ class ReaderViewModel(
             blocks.collectLatest { currentBlocks ->
                 if (currentBlocks.isEmpty()) {
                     _blockSources.value = emptyMap()
+                    _chapterTrust.value = ChapterTrustSummary()
                     return@collectLatest
                 }
                 val projectId = currentBlocks.first().projectId
@@ -864,12 +909,24 @@ class ReaderViewModel(
                     .associateBy { it.id }
                 // 「这一版是不是 AI 自备知识写的」记在版本上而不是项目设置上（4A）
                 val version = container.chapterRepository.getActiveVersion(chapterId)
+                // 当前版本的核验问题（4B/4C）：块级面板要能说出「这一段有已知问题」
+                val issues = container.issueRepository.getActiveByChapter(chapterId)
                 _blockSources.value = BlockSourceSummary.build(
                     blockIds = currentBlocks.map { it.id },
                     citations = citations,
                     chunks = chunks,
                     documents = documents,
                     modelKnowledge = version?.usedModelKnowledge ?: false,
+                    issues = issues,
+                )
+                _chapterTrust.value = ChapterTrustSummary.build(
+                    citations = citations,
+                    chunks = chunks,
+                    documents = documents,
+                    issues = issues,
+                    usedModelKnowledge = version?.usedModelKnowledge ?: false,
+                    unverifiedClaimCount = container.chapterRepository.getPlan(chapterId)
+                        ?.unverifiedClaims?.size ?: 0,
                 )
             }
         }

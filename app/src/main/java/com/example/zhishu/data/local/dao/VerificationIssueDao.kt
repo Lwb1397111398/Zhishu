@@ -58,6 +58,14 @@ interface VerificationIssueDao {
     )
     fun observeActiveByProject(projectId: String): Flow<List<VerificationIssue>>
 
+    @Query(
+        "SELECT verification_issues.* FROM verification_issues " +
+            "JOIN chapters ON chapters.activeVersionId = verification_issues.versionId " +
+            "WHERE verification_issues.projectId = :projectId " +
+            "ORDER BY chapters.[order], verification_issues.[order]",
+    )
+    suspend fun getActiveByProject(projectId: String): List<VerificationIssue>
+
     // --- 指定版本 / 全部历史版本 ---
 
     /**

@@ -363,7 +363,8 @@ class DefaultCitationRepository(private val dao: CitationDao) : CitationReposito
         dao.countActiveByChapterAndStatus(chapterId, CitationStatus.RESOLVED)
 
     override suspend fun countActiveUnconfirmed(chapterId: String): Int =
-        dao.countActiveByChapterAndStatus(chapterId, CitationStatus.UNCONFIRMED)
+        dao.countActiveByChapterAndStatus(chapterId, CitationStatus.UNCONFIRMED) +
+            dao.countActiveByChapterAndStatus(chapterId, CitationStatus.SOURCE_DELETED)
 
     override suspend fun getActiveByChunk(projectId: String, chunkId: String): List<Citation> =
         dao.getActiveByChunk(projectId, chunkId)
@@ -386,7 +387,7 @@ class DefaultCitationRepository(private val dao: CitationDao) : CitationReposito
     override suspend fun deleteByProject(projectId: String) = dao.deleteByProject(projectId)
 
     override suspend fun unconfirmForSource(sourceId: String) =
-        dao.unconfirmForSource(sourceId, CitationStatus.UNCONFIRMED)
+        dao.unconfirmForSource(sourceId, CitationStatus.SOURCE_DELETED)
 }
 
 /**
@@ -408,6 +409,9 @@ class DefaultVerificationIssueRepository(
 
     override fun observeActiveByProject(projectId: String): Flow<List<VerificationIssue>> =
         dao.observeActiveByProject(projectId)
+
+    override suspend fun getActiveByProject(projectId: String): List<VerificationIssue> =
+        dao.getActiveByProject(projectId)
 
     override suspend fun getByVersion(versionId: String): List<VerificationIssue> =
         dao.getByVersion(versionId)

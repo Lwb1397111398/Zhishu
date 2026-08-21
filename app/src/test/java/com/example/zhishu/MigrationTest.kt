@@ -61,11 +61,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
                     AppDatabase.MIGRATION_10_11,
+                    AppDatabase.MIGRATION_11_12,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(11, db.openHelper.readableDatabase.version)
+            assertEquals(12, db.openHelper.readableDatabase.version)
 
             // 旧数据保留
             assertEquals("民法基础", db.projectDao().getById("p-1")?.title)
@@ -119,11 +120,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
                     AppDatabase.MIGRATION_10_11,
+                    AppDatabase.MIGRATION_11_12,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(11, db.openHelper.readableDatabase.version)
+            assertEquals(12, db.openHelper.readableDatabase.version)
             // 旧项目仍在，新列有默认值
             val project = db.projectDao().getById("p-1")
             assertEquals("民法基础", project?.title)
@@ -156,11 +158,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
                     AppDatabase.MIGRATION_10_11,
+                    AppDatabase.MIGRATION_11_12,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(11, db.openHelper.readableDatabase.version)
+            assertEquals(12, db.openHelper.readableDatabase.version)
             // 旧进度行保留，新列取默认值 0
             val old = db.readingProgressDao().getForProject("p-1")
             assertEquals("ch-1", old?.chapterId)
@@ -204,11 +207,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
                     AppDatabase.MIGRATION_10_11,
+                    AppDatabase.MIGRATION_11_12,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(11, db.openHelper.readableDatabase.version)
+            assertEquals(12, db.openHelper.readableDatabase.version)
 
             // ch-1 有题：标 READY，状态不动
             val withQuiz = db.chapterPlanDao().getById("ch-1")
@@ -257,11 +261,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
                     AppDatabase.MIGRATION_10_11,
+                    AppDatabase.MIGRATION_11_12,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(11, db.openHelper.readableDatabase.version)
+            assertEquals(12, db.openHelper.readableDatabase.version)
 
             // 每个现有章节都有一个初始版本，一章不落
             assertEquals(1, db.chapterVersionDao().countByChapter("ch-1"))
@@ -333,11 +338,12 @@ class MigrationTest {
                 AppDatabase.MIGRATION_8_9,
                     AppDatabase.MIGRATION_9_10,
                     AppDatabase.MIGRATION_10_11,
+                    AppDatabase.MIGRATION_11_12,
             )
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(11, db.openHelper.readableDatabase.version)
+            assertEquals(12, db.openHelper.readableDatabase.version)
 
             // 已发布章节：carryOver 是结尾状态，落在当前版本上；openingHook 留空
             val published = db.chapterPlanDao().getById("ch-1")
@@ -374,11 +380,11 @@ class MigrationTest {
         createV7Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_7_8, AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11)
+            .addMigrations(AppDatabase.MIGRATION_7_8, AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(11, db.openHelper.readableDatabase.version)
+            assertEquals(12, db.openHelper.readableDatabase.version)
 
             // 旧章节全部落在第一卷
             val plans = db.chapterPlanDao().getByProject("p-1")
@@ -419,11 +425,11 @@ class MigrationTest {
         createV8Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11)
+            .addMigrations(AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(11, db.openHelper.readableDatabase.version)
+            assertEquals(12, db.openHelper.readableDatabase.version)
 
             val byId = db.chapterVersionDao().getByChapter("ch-1").associateBy { it.id }
             // 有正文、比当前版本旧 → 被取代的历史正文
@@ -472,11 +478,11 @@ class MigrationTest {
         createV9Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11)
+            .addMigrations(AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(11, db.openHelper.readableDatabase.version)
+            assertEquals(12, db.openHelper.readableDatabase.version)
 
             // 当前版本（ch-1-v3）的引用：一条对上了片段，一条对不上
             val active = db.citationDao().getActiveByChapter("ch-1").sortedBy { it.order }
@@ -534,7 +540,7 @@ class MigrationTest {
         createV9Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11)
+            .addMigrations(AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12)
             .allowMainThreadQueries()
             .build()
         try {
@@ -560,11 +566,11 @@ class MigrationTest {
         createV10Database()
 
         val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_10_11)
+            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12)
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(11, db.openHelper.readableDatabase.version)
+            assertEquals(12, db.openHelper.readableDatabase.version)
 
             // 旧说明原样留着，而且没有被回填成问题记录
             assertEquals(
@@ -617,6 +623,57 @@ class MigrationTest {
 
             // 4A 建立的引用一条不少，正文一块不少，进度一个字没动
             assertEquals(2, db.citationDao().getActiveByChapter("ch-1").size)
+            assertEquals(3, db.chapterBlockDao().countByProject("p-1"))
+            assertEquals("b-1", db.readingProgressDao().getForProject("p-1")?.blockId)
+        } finally {
+            db.close()
+        }
+    }
+
+    /**
+     * v11 → v12：引用增加「来源已删除」状态与被删资料标题（4C）。
+     *
+     * 盯三件事：
+     * 1. 新列建起来、有默认值，旧引用一条不少也一条没被改状态；
+     * 2. **存量 UNCONFIRMED 不回填成 SOURCE_DELETED**。库里那条降级过的引用和
+     *    一条从没对上的引用现在长得一模一样，无从判断；全判成「你自己删了资料」
+     *    会把模型编的出处说成用户的操作，这比说得保守一点糟得多；
+     * 3. 新的删除操作从这一版起分得清，而且标题抄得下来。
+     */
+    @Test
+    fun migrate11To12_addsDeletedSourceStateWithoutRelabelingOldRows() = runBlocking {
+        createV11Database()
+
+        val db = Room.databaseBuilder(context, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_11_12)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            assertEquals(12, db.openHelper.readableDatabase.version)
+
+            // 旧引用一条不少，状态一个没动，新列取默认空串
+            val active = db.citationDao().getActiveByChapter("ch-1").sortedBy { it.order }
+            assertEquals(2, active.size)
+            assertEquals(CitationStatus.RESOLVED, active[0].status)
+            assertEquals("", active[0].lostSourceTitle)
+            // 存量「未能匹配」保持原状，没有被说成「资料已删除」
+            assertEquals(CitationStatus.UNCONFIRMED, active[1].status)
+            assertEquals("", active[1].lostSourceTitle)
+
+            // 从这一版起，删资料能分得清，而且标题在删除前抄了下来
+            db.citationDao().unconfirmForSource("src-1", CitationStatus.SOURCE_DELETED)
+            db.sourceChunkDao().deleteBySource("src-1")
+            db.sourceDocumentDao().deleteById("src-1")
+
+            val afterDelete = db.citationDao().getActiveByChapter("ch-1").sortedBy { it.order }
+            assertEquals(CitationStatus.SOURCE_DELETED, afterDelete[0].status)
+            assertEquals("笔记", afterDelete[0].lostSourceTitle)
+            assertNull(afterDelete[0].chunkId)
+            // 那条从没对上的引用不受影响：它跟这份资料没有关系
+            assertEquals(CitationStatus.UNCONFIRMED, afterDelete[1].status)
+            assertEquals("", afterDelete[1].lostSourceTitle)
+
+            // 正文一块不少，进度一个字没动
             assertEquals(3, db.chapterBlockDao().countByProject("p-1"))
             assertEquals("b-1", db.readingProgressDao().getForProject("p-1")?.blockId)
         } finally {
@@ -886,6 +943,37 @@ class MigrationTest {
      * 顺带塞一条 4B 之前那种核验说明：一整章的问题被拼成一个字符串存在
      * `chapters.verificationNote` 上。迁移之后它必须原样还在。
      */
+    /** 造一个真正的 v11 库：v10 结构 + 执行 10→11，版本号置为 11。 */
+    private fun createV11Database() {
+        val callback = object : SupportSQLiteOpenHelper.Callback(11) {
+            override fun onCreate(db: SupportSQLiteDatabase) {
+                seedV5(db)
+                AppDatabase.MIGRATION_5_6.migrate(db)
+                AppDatabase.MIGRATION_6_7.migrate(db)
+                AppDatabase.MIGRATION_7_8.migrate(db)
+                seedV8MultiVersionChapter(db)
+                AppDatabase.MIGRATION_8_9.migrate(db)
+                db.execSQL(
+                    "UPDATE chapter_blocks SET sourceRefs = '[\"c-1\",\"c-已经删掉的资料\"]' " +
+                        "WHERE id = 'b-v3'",
+                )
+                db.execSQL("UPDATE chapter_blocks SET sourceRefs = '[\"c-1\"]' WHERE id = 'b-v2'")
+                AppDatabase.MIGRATION_9_10.migrate(db)
+                AppDatabase.MIGRATION_10_11.migrate(db)
+            }
+
+            override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+        }
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(dbName)
+                .callback(callback)
+                .build(),
+        )
+        helper.writableDatabase.use { it.version = 11 }
+        helper.close()
+    }
+
     private fun createV10Database() {
         val callback = object : SupportSQLiteOpenHelper.Callback(10) {
             override fun onCreate(db: SupportSQLiteDatabase) {

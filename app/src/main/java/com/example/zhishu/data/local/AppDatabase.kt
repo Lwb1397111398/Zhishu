@@ -70,7 +70,7 @@ import kotlinx.serialization.json.Json
         ModelConfig::class,
         StoryBible::class,
     ],
-    version = 11,
+    version = 12,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -706,6 +706,32 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v11 → v12：引用增加「来源已删除」这一状态与被删资料的标题（4C）。
+         *
+         * 4A 起删掉一份资料不会删掉引用它的引用行，只把状态降级——正文里那段话
+         * 还在，它当初确实有依据。但降级后的行和「模型给的出处一开始就没对上」
+         * 长得一模一样，阅读器只能对两者说同一句「未能匹配到资料」。
+         * 这两件事对读者的意思差得很远：前者是资料不在了，后者是依据从没被确认过。
+         *
+         * `lostSourceTitle` 必须在删除资料的同一个事务里、`sources` 那一行还在的时候
+         * 抄下来（见 CitationDao.unconfirmForSource）。删完再想查标题已经查不到了，
+         * 而「引用的资料已被删除」不说是哪一份，用户既没法判断这一段还站不站得住，
+         * 也不知道该重新导入哪一份。
+         *
+         * 存量的 UNCONFIRMED 行**不回填**成 SOURCE_DELETED：一条已经降级的引用
+         * 和一条从没对上的引用在库里现在没有任何区别，无从判断。全判成「资料已删除」
+         * 会把模型编的出处说成「你自己删了资料」；全留在 UNCONFIRMED 是它们本来的
+         * 显示方式，最多是说得保守一点。新的删除操作从这一版起分得清。
+         */
+        val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE citations ADD COLUMN lostSourceTitle TEXT NOT NULL DEFAULT ''",
+                )
+            }
+        }
+
         /** 迁移里手工拼列表时用的 JSON 编解码，与 [Converters] 保持一致 */
         val LIST_JSON = Json
         val LIST_SERIALIZER = ListSerializer(String.serializer())
@@ -723,6 +749,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_8_9,
                     MIGRATION_9_10,
                     MIGRATION_10_11,
+                    MIGRATION_11_12,
                 )
                 .build()
     }

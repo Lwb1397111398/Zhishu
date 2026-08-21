@@ -99,18 +99,22 @@ interface CitationDao {
     suspend fun deleteByProject(projectId: String)
 
     /**
-     * 资料被删除后，引用它的那些引用降级为「未确认」（4A）。
+     * 资料被删除后，引用它的那些引用降级（4A，状态在 4C 细分）。
      *
      * 删掉这些引用行是错的：正文里那段话还在，它当初确实是有依据写出来的。
      * 直接删除会让那一段看起来「从来没打算给出处」，读者也就不会想到去核对。
-     * 保留 [Citation.rawRef]，把状态改成 UNCONFIRMED，阅读器就能说出
-     * 「这一段引用的资料已经不在了，需要你自己核对」——这句话是真的。
+     *
+     * 状态写成 [CitationStatus.SOURCE_DELETED] 而不是 UNCONFIRMED：这一段的依据
+     * 当初是对上过的，只是资料不在了。同时把资料标题抄进 `lostSourceTitle`——
+     * 必须在 `sources` 那一行还在的时候抄，删完就再也查不到了，
+     * 而「引用的资料已被删除」不说是哪一份，用户没法判断也没法补救。
      */
     @Query(
-        "UPDATE citations SET status = :unconfirmed, chunkId = NULL " +
+        "UPDATE citations SET status = :deleted, chunkId = NULL, " +
+            "lostSourceTitle = COALESCE((SELECT title FROM sources WHERE id = :sourceId), '') " +
             "WHERE chunkId IN (SELECT id FROM source_chunks WHERE sourceId = :sourceId)",
     )
-    suspend fun unconfirmForSource(sourceId: String, unconfirmed: CitationStatus)
+    suspend fun unconfirmForSource(sourceId: String, deleted: CitationStatus)
 
     @Query("SELECT COUNT(*) FROM citations WHERE projectId = :projectId")
     suspend fun countAllVersionsByProject(projectId: String): Int

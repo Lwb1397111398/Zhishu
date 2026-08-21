@@ -22,9 +22,23 @@ enum class CitationStatus {
 
     /** 模型给的标识对不上任何片段。原样留着 [Citation.rawRef]，不伪装成已引用 */
     UNCONFIRMED,
+
+    /**
+     * 当初对上了真实片段，后来那份资料被用户删掉了（4C）。
+     *
+     * 和 [UNCONFIRMED] 分开，因为对读者的意思完全不同：「未能匹配」说的是
+     * 模型给的出处一开始就没对上，这一段的依据从来没被确认过；「来源已删除」
+     * 说的是这一段当初确实有依据，只是那份资料现在不在库里了——原文找不回来，
+     * 但它不是模型编的。混成一句「未确认」会让前者显得没那么严重，
+     * 也会让后者显得比实际更可疑。
+     */
+    SOURCE_DELETED,
     ;
 
     val isResolved: Boolean get() = this == RESOLVED
+
+    /** 需要用户自己核对：除了 RESOLVED 都算 */
+    val needsManualCheck: Boolean get() = this != RESOLVED
 }
 
 /**
@@ -75,6 +89,15 @@ data class Citation(
     @ColumnInfo(defaultValue = "")
     val rawRef: String = "",
     val status: CitationStatus = CitationStatus.RESOLVED,
+    /**
+     * 被删掉的那份资料的标题，删除的当时抄一份留在这里（4C）。
+     *
+     * 只说「引用的资料已被删除」等于什么都没说：用户有十几份资料，
+     * 不知道是哪一份就没法判断这一段还站不站得住，更不知道该重新导入哪份。
+     * 资料行删掉之后标题就查不到了，所以必须在删除的同一个事务里抄下来。
+     */
+    @ColumnInfo(defaultValue = "")
+    val lostSourceTitle: String = "",
     /** 块内顺序，同时参与 [id] 的构造 */
     @ColumnInfo(defaultValue = "0")
     val order: Int = 0,

@@ -388,26 +388,28 @@ class SourceTraceTest {
     // --- 资料被删：引用降级，不删 ---
 
     /**
-     * 删掉资料后引用变成「未确认」，正文一个字不动。
+     * 删掉资料后引用变成「来源已删除」，正文一个字不动，并保留原资料标题。
      *
      * 删掉引用是错的：正文里那段话还在，它当初确实有依据。
-     * 删掉会让那一段看起来从来没打算给出处，读者也就不会想到去核对。
+     * 标成普通「未确认」也不够准确：用户需要知道这是资料后来被删，而不是模型一开始就没对上。
      */
     @Test
-    fun deletingSource_downgradesCitationsInsteadOfRemovingThem() = runBlocking {
+    fun deletingSource_marksCitationsAsDeletedInsteadOfRemovingThem() = runBlocking {
         seedThroughBible()
         val planId = db.chapterPlanDao().getByProject("p-1").minBy { it.order }.id
         pipeline.generateChapter("p-1", planId).getOrThrow()
         val before = db.citationDao().getActiveByChapter(planId).size
         val blocksBefore = db.chapterBlockDao().getActiveBlocks(planId).size
 
-        db.citationDao().unconfirmForSource("src-1", CitationStatus.UNCONFIRMED)
+        // 必须在删除资料行之前调用，DAO 才能抄下原资料标题。
+        db.citationDao().unconfirmForSource("src-1", CitationStatus.SOURCE_DELETED)
         db.sourceChunkDao().deleteBySource("src-1")
         db.sourceDocumentDao().deleteById("src-1")
 
         val after = db.citationDao().getActiveByChapter(planId)
         assertEquals(before, after.size)
-        assertTrue(after.all { it.status == CitationStatus.UNCONFIRMED })
+        assertTrue(after.all { it.status == CitationStatus.SOURCE_DELETED })
+        assertTrue(after.all { it.lostSourceTitle == "民法典释义" })
         // 原始标识留着，用户还能看出当初引的是什么
         assertTrue(after.all { it.rawRef == "c-1" })
         assertEquals(blocksBefore, db.chapterBlockDao().getActiveBlocks(planId).size)

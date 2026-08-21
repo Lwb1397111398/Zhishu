@@ -118,6 +118,9 @@ interface VerificationIssueRepository {
 
     fun observeActiveByProject(projectId: String): Flow<List<VerificationIssue>>
 
+    /** 全项目当前正文的问题，一次读完。未核实内容筛选用（4C） */
+    suspend fun getActiveByProject(projectId: String): List<VerificationIssue>
+
     /** 指定版本的问题。局部重写与重新核验用 */
     suspend fun getByVersion(versionId: String): List<VerificationIssue>
     fun observeByVersion(versionId: String): Flow<List<VerificationIssue>>

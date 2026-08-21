@@ -470,6 +470,13 @@ class TransferManager(private val container: AppContainer) {
         knownChunkIds: Set<String>,
     ): NormalizedCitations {
         val byBlock = imported.groupBy { it.blockId }
+        // (blockId, 引用标识) → 导入进来的那一条。用来把「来源已删除」原样带过去（4C）：
+        // 光看 chunkId 对不上，分不出「资料被删了」和「模型编的出处」，
+        // 而备份里明明记着是哪一种。重算会把前者说成后者，
+        // 相当于把一段本来有依据的正文往更可疑的方向改了一次
+        val importedByRef = imported.associateBy { citation ->
+            citation.blockId to citation.rawRef.ifBlank { citation.chunkId.orEmpty() }
+        }
         val citations = mutableListOf<Citation>()
         val rebuiltBlocks = blocks.map { block ->
             val refs = byBlock[block.id]
@@ -485,6 +492,10 @@ class TransferManager(private val container: AppContainer) {
                 if (!seen.add(ref)) return@forEach
                 val known = ref in knownChunkIds
                 if (known) resolved += ref
+                val original = importedByRef[block.id to ref]
+                // 片段又能对上了（用户重新导入过同一份资料）→ 回到 RESOLVED，
+                // 「已删除」那句话不再成立，被删资料的标题也一起清掉
+                val wasDeleted = !known && original?.status == CitationStatus.SOURCE_DELETED
                 citations += Citation(
                     id = Citation.idFor(block.id, order),
                     projectId = block.projectId,
@@ -494,7 +505,15 @@ class TransferManager(private val container: AppContainer) {
                     blockId = block.id,
                     chunkId = if (known) ref else null,
                     rawRef = ref,
-                    status = if (known) CitationStatus.RESOLVED else CitationStatus.UNCONFIRMED,
+                    status = when {
+                        known -> CitationStatus.RESOLVED
+                        wasDeleted -> CitationStatus.SOURCE_DELETED
+                        // v11 及更早的备份里没有 SOURCE_DELETED 这个值，
+                        // 一律落在 UNCONFIRMED——与 v11→v12 迁移「存量不回填」逐字一致：
+                        // 库里没记是哪一种，就不替用户猜
+                        else -> CitationStatus.UNCONFIRMED
+                    },
+                    lostSourceTitle = if (wasDeleted) original.lostSourceTitle else "",
                     order = order,
                 )
                 order += 1

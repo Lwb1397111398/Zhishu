@@ -117,6 +117,10 @@ fun ProjectDetailScreen(
     onOpenQuiz: (String) -> Unit,
     onOpenSearch: (String) -> Unit,
     onOpenSettings: () -> Unit = {},
+    /** 打开某份资料的原文与引用（4C） */
+    onOpenSource: (String) -> Unit = {},
+    /** 打开全书未核实内容筛选（4C） */
+    onOpenTrustCenter: (String) -> Unit = {},
     /** 从正文跳回知识地图时带上的知识点：直接打开「知识主干」页并展开它 */
     focusNodeId: String? = null,
 ) {
@@ -220,6 +224,8 @@ fun ProjectDetailScreen(
                         hasNodes = nodes.isNotEmpty(),
                         onAddFile = { filePicker.launch(SOURCE_MIME_TYPES) },
                         onGoMap = { tab = 1 },
+                        onOpenSource = onOpenSource,
+                        onOpenTrustCenter = { onOpenTrustCenter(projectId) },
                     )
                     1 -> MapTab(
                         vm = vm,
@@ -270,12 +276,19 @@ private fun SourcesTab(
     hasNodes: Boolean,
     onAddFile: () -> Unit,
     onGoMap: () -> Unit,
+    /** 打开某份资料的原文与引用（4C） */
+    onOpenSource: (String) -> Unit,
+    /** 打开全书未核实内容筛选（4C） */
+    onOpenTrustCenter: () -> Unit,
 ) {
     var showText by remember { mutableStateOf(false) }
     var showUrl by remember { mutableStateOf(false) }
     // 正在编辑来源信息的那份资料（4A）
     var editingSource by remember { mutableStateOf<SourceDocument?>(null) }
     val modelKnowledge = project?.usesModelKnowledge == true
+    val unconfirmed by vm.unconfirmedCitationCount.collectAsState()
+    val issues by vm.issues.collectAsState()
+    val openIssueCount = issues.values.sumOf { list -> list.count { it.resolution.isOpen } }
 
     LazyColumn(
         Modifier
@@ -288,6 +301,18 @@ private fun SourcesTab(
                 modelKnowledge = modelKnowledge,
                 onSelect = { vm.setSourceMode(it) },
             )
+        }
+
+        // 需要核对的内容（4C）。只在真的有的时候出现——
+        // 一个常驻的「0 项需核对」入口只会教用户忽略这一行
+        if (unconfirmed > 0 || openIssueCount > 0) {
+            item {
+                TrustEntryCard(
+                    unconfirmed = unconfirmed,
+                    openIssues = openIssueCount,
+                    onOpen = onOpenTrustCenter,
+                )
+            }
         }
 
         // 一键开讲：把「知识地图 → 讲述路线 → 第一章」收成一个按钮（问题4）
@@ -335,6 +360,7 @@ private fun SourcesTab(
                     SourceCard(
                         source = source,
                         onEditMeta = { editingSource = source },
+                        onOpenMeta = { onOpenSource(source.id) },
                         onDelete = { vm.deleteSource(source.id) },
                     )
                 }
@@ -377,6 +403,40 @@ private fun SourcesTab(
             },
             onDismiss = { showUrl = false },
         )
+    }
+}
+
+/**
+ * 「需要核对的内容」入口（4C）。
+ *
+ * 说数字，不说结论。「有 3 处出处没对上」是事实；「本项目内容不可信」不是，
+ * 而且会让用户放弃一批其实写得没问题的章节。
+ */
+@Composable
+private fun TrustEntryCard(
+    unconfirmed: Int,
+    openIssues: Int,
+    onOpen: () -> Unit,
+) {
+    Card {
+        Column(Modifier.padding(14.dp)) {
+            Text(
+                "需要你核对的内容",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                buildList {
+                    if (unconfirmed > 0) add("$unconfirmed 处引用没能对上资料")
+                    if (openIssues > 0) add("$openIssues 条核验问题待处理")
+                }.joinToString("，") + "。只统计你现在读到的这一版正文。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = onOpen) { Text("逐条查看") }
+        }
     }
 }
 
@@ -505,6 +565,8 @@ private fun OneTapCard(
 private fun SourceCard(
     source: SourceDocument,
     onEditMeta: () -> Unit,
+    /** 打开资料原文：能看到每个片段被哪些当前正文引用（4C） */
+    onOpenMeta: () -> Unit,
     onDelete: () -> Unit,
 ) {
     Card(modifier = Modifier.padding(vertical = 6.dp)) {
@@ -544,10 +606,16 @@ private fun SourceCard(
                     },
                 )
                 Spacer(Modifier.height(4.dp))
-                TextButton(
-                    onClick = onEditMeta,
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
-                ) { Text("填写来源信息", style = MaterialTheme.typography.labelMedium) }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(
+                        onClick = onOpenMeta,
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                    ) { Text("原文与引用", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = onEditMeta,
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                    ) { Text("填写来源信息", style = MaterialTheme.typography.labelMedium) }
+                }
             }
             IconButton(onClick = onDelete) {
                 Icon(Icons.Default.Delete, contentDescription = "删除资料", tint = MaterialTheme.colorScheme.error)

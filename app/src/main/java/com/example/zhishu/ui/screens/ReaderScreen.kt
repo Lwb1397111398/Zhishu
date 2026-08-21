@@ -26,12 +26,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -60,6 +62,7 @@ import androidx.compose.ui.unit.sp
 import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
+import com.example.zhishu.domain.model.IssueResolution
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.ui.common.InfoRow
@@ -67,7 +70,9 @@ import com.example.zhishu.ui.common.UnverifiedClaimsCard
 import com.example.zhishu.ui.common.rememberZhishuViewModel
 import com.example.zhishu.ui.viewmodel.BlockSource
 import com.example.zhishu.ui.viewmodel.BlockSourceSummary
+import com.example.zhishu.ui.viewmodel.ChapterTrustSummary
 import com.example.zhishu.ui.viewmodel.ReaderViewModel
+import com.example.zhishu.ui.viewmodel.SourceTrustState
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -93,6 +98,10 @@ fun ReaderScreen(
     onOpenChapter: (String) -> Unit,
     onOpenQuiz: (String) -> Unit,
     onOpenNodeInMap: (String, String) -> Unit = { _, _ -> },
+    /** 正文 → 资料：打开某份资料并滚到指定片段（4C） */
+    onOpenSource: (String, String?) -> Unit = { _, _ -> },
+    /** 打开全书未核实内容筛选（4C） */
+    onOpenTrustCenter: (String) -> Unit = {},
 ) {
     val app = LocalContext.current.applicationContext as Application
     val vm: ReaderViewModel = rememberZhishuViewModel(key = "reader_$chapterId") {
@@ -109,9 +118,12 @@ fun ReaderScreen(
     val quizCount by vm.quizCount.collectAsState()
     val bodyUpdatedNotice by vm.bodyUpdatedNotice.collectAsState()
     val blockSources by vm.blockSources.collectAsState()
+    val chapterTrust by vm.chapterTrust.collectAsState()
+    val staleTargetNotice by vm.staleTargetNotice.collectAsState()
 
     var selectedNode by remember { mutableStateOf<KnowledgeNode?>(null) }
     var showOutline by remember { mutableStateOf(false) }
+    var showTrust by remember { mutableStateOf(false) }
     var highlightBlockId by remember { mutableStateOf(targetBlockId) }
     var restored by remember(chapterId) { mutableStateOf(false) }
     // 打开哪一块的来源面板（4A）。默认不展开，阅读体验优先
@@ -148,7 +160,12 @@ fun ReaderScreen(
         val index = visibleBlocks.indexOfFirst { it.id == targetId }
         if (index < 0) {
             // 块还没出现在当前可见列表里（等待切换密集模式）；确实找不到才算恢复完成
-            if (blocks.none { it.id == targetId }) restored = true
+            if (blocks.none { it.id == targetId }) {
+                restored = true
+                // 从搜索 / 资料 / 知识地图点进来，而目标段落不属于当前版本：
+                // 本章更新过，那一段已经不存在了。不说的话用户会以为点了没反应（4C）
+                if (targetBlockId != null) vm.reportStaleTarget()
+            }
             return@LaunchedEffect
         }
         listState.scrollToItem(
@@ -201,6 +218,21 @@ fun ReaderScreen(
                     IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "返回") }
                 },
                 actions = {
+                    // 章节级来源摘要（4C）。只在这一章确实有来源或待核对项时出现——
+                    // 一个点开只会说「什么都没有」的按钮不如不给
+                    if (!chapterTrust.isEmpty) {
+                        IconButton(onClick = { showTrust = true }) {
+                            Icon(
+                                Icons.Default.Info,
+                                contentDescription = "本章来源",
+                                tint = if (chapterTrust.needsAttentionCount > 0) {
+                                    MaterialTheme.colorScheme.tertiary
+                                } else {
+                                    LocalContentColor.current
+                                },
+                            )
+                        }
+                    }
                     IconButton(onClick = { showOutline = true }) {
                         Icon(Icons.Default.List, contentDescription = "本章导览")
                     }
@@ -297,6 +329,24 @@ fun ReaderScreen(
                                 )
                             }
                         }
+                        // 点进来的那一段属于旧版本（4C）。同样中性——本章更新过而已，
+                        // 但必须说，否则「跳转没反应」看起来就是个 bug
+                        if (staleTargetNotice) {
+                            Spacer(Modifier.height(12.dp))
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(
+                                    "你点的那一段属于本章的旧版本，正文后来更新过，" +
+                                        "所以只能从章首开始。可以用本章导览或搜索重新定位。",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(10.dp),
+                                )
+                            }
+                        }
                     }
                 }
                 items(visibleBlocks, key = { it.id }) { block ->
@@ -363,21 +413,48 @@ fun ReaderScreen(
     sourceBlockId?.let { blockId ->
         val summary = blockSources[blockId]
         ModalBottomSheet(onDismissRequest = { sourceBlockId = null }) {
-            BlockSourceSheet(summary = summary)
+            BlockSourceSheet(
+                summary = summary,
+                onOpenSource = { sourceId, chunkId ->
+                    sourceBlockId = null
+                    onOpenSource(sourceId, chunkId)
+                },
+            )
+        }
+    }
+
+    // 章节级来源摘要（4C）
+    if (showTrust) {
+        ModalBottomSheet(onDismissRequest = { showTrust = false }) {
+            ChapterTrustSheet(
+                trust = chapterTrust,
+                onOpenTrustCenter = {
+                    val projectId = project?.id
+                    showTrust = false
+                    if (projectId != null) onOpenTrustCenter(projectId)
+                },
+            )
         }
     }
 }
 
 /**
- * 一个正文块的来源明细（4A）。
+ * 一个正文块的来源明细（4A，4C 补上可信度）。
  *
- * 三种情况说三种话，不混在一起：
- * - 可定位的引用：资料名、页码/章节、版本与法域、原文摘录；
+ * 几种情况说几种话，不混在一起：
+ * - 可定位的引用：资料名、页码/章节、版本与法域、原文摘录，可以点开原资料；
  * - 未确认的引用：模型给的标识原样列出，并说明我们没能对上；
+ * - 资料已删除：说出是哪一份，并说明这一段当初确实有依据；
  * - 一条引用都没有：区分「AI 自备知识」和「没标来源」——前者是设计如此，后者是缺口。
+ *
+ * 最后再把这一块的核验问题列出来。「这段的依据在哪」和「这段有没有已知问题」
+ * 是读者同时会问的两件事，分在两个页面里等于没说。
  */
 @Composable
-private fun BlockSourceSheet(summary: BlockSourceSummary?) {
+private fun BlockSourceSheet(
+    summary: BlockSourceSummary?,
+    onOpenSource: (String, String?) -> Unit,
+) {
     Column(
         Modifier
             .fillMaxWidth()
@@ -400,18 +477,81 @@ private fun BlockSourceSheet(summary: BlockSourceSummary?) {
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            BlockIssues(summary)
             return@Column
         }
 
         summary.sources.forEach { source ->
-            SourceEntry(source)
+            SourceEntry(source = source, onOpenSource = onOpenSource)
             Spacer(Modifier.height(12.dp))
         }
+
+        // 有资料模式下也会出现「这一块有引用记录，但一条都没对上」：那部分内容
+        // 同样是模型自己的知识，读者该知道。一条引用都没有的块在上面就已经
+        // 说过话了（「未标注来源」/「AI 自备知识」），不在这里重复一遍
+        if (summary.allSourcesUnresolved) {
+            Text(
+                "这一段没有任何已确认的引用，其中的知识来自模型自己，建议自行核对。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+        }
+
+        BlockIssues(summary)
     }
 }
 
+/** 这一块上的核验问题及处理状态（4C）。已修与「不用改」也显示，但说明它们已有结论 */
 @Composable
-private fun SourceEntry(source: BlockSource) {
+private fun BlockIssues(summary: BlockSourceSummary?) {
+    val issues = summary?.issues.orEmpty()
+    if (issues.isEmpty()) return
+    Spacer(Modifier.height(8.dp))
+    Text("这一段的核验问题", style = MaterialTheme.typography.labelLarge)
+    Spacer(Modifier.height(6.dp))
+    issues.forEach { issue ->
+        Surface(
+            color = if (issue.resolution.isOpen) {
+                MaterialTheme.colorScheme.tertiaryContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceVariant
+            },
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(Modifier.padding(10.dp)) {
+                Text(
+                    "${issue.type.label} · ${issueResolutionLabel(issue.resolution)}",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(issue.message, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+    }
+    // 处理入口在大纲页，不在阅读器里：读者正在读故事，
+    // 「重写这一段」是编辑动作，摆在这里会把阅读变成校对
+    Text(
+        "要修改的话，回到项目的「讲述路线」页，在这一章上点「逐条处理」。",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+private fun issueResolutionLabel(resolution: IssueResolution): String = when (resolution) {
+    IssueResolution.OPEN -> "待处理"
+    IssueResolution.FIXED -> "已修"
+    IssueResolution.ACCEPTED -> "你已判断不用改"
+}
+
+@Composable
+private fun SourceEntry(
+    source: BlockSource,
+    onOpenSource: (String, String?) -> Unit,
+) {
     Surface(
         color = if (source.needsManualCheck) {
             MaterialTheme.colorScheme.tertiaryContainer
@@ -424,23 +564,31 @@ private fun SourceEntry(source: BlockSource) {
         Column(Modifier.padding(12.dp)) {
             if (source.needsManualCheck) {
                 // 说清楚发生了什么，而不是只挂一个「未确认」标签：
-                // 用户需要知道这是「模型给的出处对不上」，不是「系统出错了」
+                // 用户需要知道这是「模型给的出处对不上」还是「资料被删了」，
+                // 两者该做的事不一样，而「系统出错了」哪一种都不是
                 Text(
-                    "未能匹配到资料，需要你自己核对",
+                    source.trust.label,
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onTertiaryContainer,
                 )
                 Spacer(Modifier.height(4.dp))
-                Text(
-                    "模型给出的出处标识：${source.citation.rawRef}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onTertiaryContainer,
-                )
+                if (source.trust == SourceTrustState.SOURCE_DELETED) {
+                    Text(
+                        "原资料：${source.title}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                } else if (source.citation.rawRef.isNotBlank()) {
+                    Text(
+                        "模型给出的出处标识：${source.citation.rawRef}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                }
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "可能是引用的资料已被删除，也可能是模型自己凑了一个标识。" +
-                        "这一段的内容仍然可读，但它的出处没有得到确认。",
+                    source.trust.explanation,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onTertiaryContainer,
                 )
@@ -460,11 +608,28 @@ private fun SourceEntry(source: BlockSource) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            // 旧资料没有页码与章节：说明我们只能定位到片段，不编一个页码出来（4C）
+            if (source.locatorIsImprecise) {
+                Text(
+                    "这份资料是早期导入的，只能定位到片段，没有页码与章节；重新导入一次即可获得完整定位。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
             if (source.versionInfo.isNotBlank()) {
                 Text(
                     source.versionInfo,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            // 有法域或生效时间限制：这句话未必在读者的处境下成立（4C）
+            if (source.scopeLimited) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "这份资料有适用范围限制，请确认它覆盖你所在的地区与时间。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.tertiary,
                 )
             }
             source.document?.let { document ->
@@ -481,7 +646,150 @@ private fun SourceEntry(source: BlockSource) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
             }
+            // 回到原资料，并滚到这一段引用的片段（4C）
+            source.document?.let { document ->
+                Spacer(Modifier.height(4.dp))
+                TextButton(
+                    onClick = { onOpenSource(document.id, source.chunk?.id) },
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                ) { Text("在原资料中查看", style = MaterialTheme.typography.labelMedium) }
+            }
         }
+    }
+}
+
+/**
+ * 章节级来源摘要（4C）。
+ *
+ * 阅读器上只有一行入口，点开才看到这些。默认不展开是刻意的：
+ * 把可信度做成常驻警告条，读者会先学会无视它，然后连真正要紧的那条也一起无视。
+ *
+ * 统计范围只含当前版本——这句话在数据层已经保证（ChapterTrustSummary.build
+ * 拿到的是 Active 系列查询的结果），这里只负责把它说明白。
+ */
+@Composable
+private fun ChapterTrustSheet(
+    trust: ChapterTrustSummary,
+    onOpenTrustCenter: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp)
+            .padding(bottom = 32.dp),
+    ) {
+        Text("本章的来源", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "以下只统计你现在读到的这一版正文。旧版本的引用仍然保留在库里，但不计入这里。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.outline,
+        )
+        Spacer(Modifier.height(12.dp))
+
+        Text(trust.headline, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(12.dp))
+
+        TrustStatRow("用户资料", if (trust.sourceCount > 0) "${trust.sourceCount} 份" else "未使用")
+        TrustStatRow(
+            "可定位引用",
+            if (trust.locatableCount > 0) "${trust.locatableCount} 处（可点开原文）" else "无",
+        )
+        if (trust.unconfirmedCount > 0) {
+            TrustStatRow("未确认来源", "${trust.unconfirmedCount} 处", attention = true)
+        }
+        if (trust.deletedSourceCount > 0) {
+            TrustStatRow("来源已删除", "${trust.deletedSourceCount} 处", attention = true)
+        }
+        TrustStatRow("AI 自备知识", if (trust.usedModelKnowledge) "本章包含" else "未使用")
+        if (trust.openIssueCount > 0) {
+            TrustStatRow(
+                "待核对的核验问题",
+                buildString {
+                    append("${trust.openIssueCount} 条")
+                    if (trust.locatedIssueCount > 0) {
+                        append("（${trust.locatedIssueCount} 条能定位到具体段落）")
+                    }
+                },
+                attention = true,
+            )
+        }
+        if (trust.unverifiedClaimCount > 0) {
+            TrustStatRow("建议自己查证的断言", "${trust.unverifiedClaimCount} 条", attention = true)
+        }
+
+        // 法域、生效时间、版本：时效敏感内容离开这三样就没有对错可言（4C）
+        if (trust.scopes.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            Text("适用范围", style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.height(4.dp))
+            trust.scopes.forEach { scope ->
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(Modifier.padding(10.dp)) {
+                        Text(scope.title, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            scope.summary,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+            }
+            Text(
+                "本章内容以上面这些资料为准，请确认它们覆盖你所在的地区与时间。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (trust.hasImpreciseLocator) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "本章有引用只能定位到片段，没有页码与章节——那是早期导入的资料没有记位置。" +
+                    "重新导入一次同一份资料即可获得完整定位。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        }
+
+        if (trust.needsAttentionCount > 0) {
+            Spacer(Modifier.height(16.dp))
+            OutlinedButton(onClick = onOpenTrustCenter, modifier = Modifier.fillMaxWidth()) {
+                Text("查看全书需要核对的内容")
+            }
+        }
+    }
+}
+
+@Composable
+private fun TrustStatRow(label: String, value: String, attention: Boolean = false) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            value,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = if (attention) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (attention) {
+                MaterialTheme.colorScheme.tertiary
+            } else {
+                MaterialTheme.colorScheme.onSurface
+            },
+        )
     }
 }
 
@@ -772,11 +1080,11 @@ private fun BlockContent(
             }
         }
 
-        // 来源入口（4A）。克制显示：密集模式下有来源就给入口；
-        // 安静模式下只在**存在未确认引用**时出现——那件事读者应该知道，
-        // 而「这一段有 3 处正常来源」不该在故事阅读中反复打断视线
+        // 来源入口（4A，判据在 4C 收紧）。克制显示：密集模式下有来源就给入口；
+        // 安静模式下只在**读者应该知道**的时候出现——出处没对上，或者这一段
+        // 有待处理的核验问题。「这一段有 3 处正常来源」不该在读故事时反复打断视线
         if (sourceSummary != null && sourceSummary.hasAnything &&
-            (dense || sourceSummary.unconfirmedCount > 0)
+            (dense || sourceSummary.deservesAttention)
         ) {
             Spacer(Modifier.height(4.dp))
             TextButton(
@@ -784,9 +1092,14 @@ private fun BlockContent(
                 contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
             ) {
                 Text(
-                    sourceSummary.label,
+                    // 有待处理问题时优先说这件事：它比「几处来源」更需要读者知道
+                    if (sourceSummary.openIssues.isNotEmpty()) {
+                        "${sourceSummary.label} · ${sourceSummary.openIssues.size} 项待核对"
+                    } else {
+                        sourceSummary.label
+                    },
                     style = MaterialTheme.typography.labelMedium,
-                    color = if (sourceSummary.unconfirmedCount > 0) {
+                    color = if (sourceSummary.deservesAttention) {
                         MaterialTheme.colorScheme.tertiary
                     } else {
                         MaterialTheme.colorScheme.onSurfaceVariant

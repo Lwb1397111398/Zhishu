@@ -358,7 +358,7 @@ class TransferTest {
         assertFalse(text.contains("keyRef"))
     }
 
-    /** formatVersion 必须递增，且旧版本仍然读得进来 */
+    /** formatVersion 保持 8：4C 的新增字段通过序列化默认值与旧格式兼容 */
     @Test
     fun manifest_declaresCurrentFormatVersion() = runBlocking {
         DemoSeeder.seed(container)
@@ -679,6 +679,93 @@ class TransferTest {
         assertEquals(CitationStatus.UNCONFIRMED, restored[1].status)
         assertNull(restored[1].chunkId)
         assertEquals("《民法典》第1123条", restored[1].rawRef)
+    }
+
+    /**
+     * 「来源已删除」随备份往返，不被降级成普通「未确认」（4C）。
+     *
+     * 两者在库里的差别只有一个状态值：chunkId 都是空的，都对不上任何片段。
+     * 导入时重算会把「这一段当初有依据、只是资料被删了」说成「模型给的出处
+     * 一开始就没对上」——恢复出来的库比原库更不信任用户自己写的东西，
+     * 而且被删资料的名字一起丢了，用户再也不知道该重新导入哪一份。
+     */
+    @Test
+    fun exportThenImport_keepsDeletedSourceStateAndItsTitle() = runBlocking {
+        DemoSeeder.seed(container)
+        val projectId = firstProjectId()
+        val block = container.chapterRepository.getActiveBlocks("c1").first { it.sourceRefs.isEmpty() }
+        container.citationRepository.upsertAll(
+            listOf(
+                Citation(
+                    id = Citation.idFor(block.id, 0),
+                    projectId = projectId,
+                    chapterId = "c1",
+                    versionId = block.versionId,
+                    blockId = block.id,
+                    chunkId = null,
+                    rawRef = "讲义第三节",
+                    status = CitationStatus.SOURCE_DELETED,
+                    lostSourceTitle = "上学期的讲义",
+                    order = 0,
+                ),
+            ),
+        )
+
+        val file = File(workDir, "deleted-source.zip")
+        val uri = Uri.fromFile(file)
+        assertTrue(transfer.export(app, uri).isSuccess)
+        container.citationRepository.deleteByProject(projectId)
+        assertTrue(transfer.import(app, uri).isSuccess)
+
+        val restored = container.citationRepository.getActiveByChapter("c1")
+            .single { it.blockId == block.id }
+        assertEquals(CitationStatus.SOURCE_DELETED, restored.status)
+        assertEquals("上学期的讲义", restored.lostSourceTitle)
+        assertNull(restored.chunkId)
+        assertEquals("讲义第三节", restored.rawRef)
+    }
+
+    /**
+     * 备份里记着「资料已删除」，但导入时那个片段又在了：回到已确认，标题一起清掉。
+     *
+     * 这正是用户重新导入同一份资料之后的样子。继续说「来源已删除」是在陈述
+     * 一件已经不成立的事，而那句话会让人再导一次同一份资料。
+     */
+    @Test
+    fun import_deletedSourceThatExistsAgain_becomesResolved() = runBlocking {
+        DemoSeeder.seed(container)
+        val projectId = firstProjectId()
+        val chunkId = container.sourceRepository.getChunksByProject(projectId).first().id
+        val block = container.chapterRepository.getActiveBlocks("c1").first { it.sourceRefs.isEmpty() }
+        container.citationRepository.upsertAll(
+            listOf(
+                Citation(
+                    id = Citation.idFor(block.id, 0),
+                    projectId = projectId,
+                    chapterId = "c1",
+                    versionId = block.versionId,
+                    blockId = block.id,
+                    chunkId = null,
+                    // 备份时资料已被删；导入时同名片段还在库里
+                    rawRef = chunkId,
+                    status = CitationStatus.SOURCE_DELETED,
+                    lostSourceTitle = "被删掉又导回来的资料",
+                    order = 0,
+                ),
+            ),
+        )
+
+        val file = File(workDir, "deleted-then-back.zip")
+        val uri = Uri.fromFile(file)
+        assertTrue(transfer.export(app, uri).isSuccess)
+        container.citationRepository.deleteByProject(projectId)
+        assertTrue(transfer.import(app, uri).isSuccess)
+
+        val restored = container.citationRepository.getActiveByChapter("c1")
+            .single { it.blockId == block.id }
+        assertEquals(CitationStatus.RESOLVED, restored.status)
+        assertEquals(chunkId, restored.chunkId)
+        assertEquals("", restored.lostSourceTitle)
     }
 
     /**
