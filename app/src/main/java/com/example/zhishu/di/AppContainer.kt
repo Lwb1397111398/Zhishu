@@ -44,9 +44,11 @@ class AppContainer(context: Context) {
     val projectRepository: ProjectRepository = DefaultProjectRepository(database.projectDao())
     val sourceRepository: SourceRepository = DefaultSourceRepository(database.sourceDocumentDao(), database.sourceChunkDao())
     val knowledgeRepository: KnowledgeRepository = DefaultKnowledgeRepository(
+        db = database,
         dao = database.knowledgeNodeDao(),
         gapDao = database.knowledgeGapDao(),
         conflictDao = database.knowledgeConflictDao(),
+        batchDao = database.knowledgeMapBatchDao(),
     )
     val chapterRepository: ChapterRepository = DefaultChapterRepository(
         planDao = database.chapterPlanDao(),

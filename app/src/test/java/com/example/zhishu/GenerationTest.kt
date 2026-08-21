@@ -69,7 +69,9 @@ class GenerationTest {
             knowledgeRepository = DefaultKnowledgeRepository(
                 dao = db.knowledgeNodeDao(),
                 gapDao = db.knowledgeGapDao(),
+                db = db,
                 conflictDao = db.knowledgeConflictDao(),
+                batchDao = db.knowledgeMapBatchDao(),
             ),
             chapterRepository = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao(), db.chapterVersionDao()),
             citationRepository = DefaultCitationRepository(db.citationDao()),
@@ -120,13 +122,14 @@ class GenerationTest {
     @Test
     fun generateKnowledgeMap_persistsGapsAndConflicts() = runBlocking {
         seedProjectWithChunk()
-        fakeRouter.knowledgeMapJson = """
-            {"nodes":[{"title":"意思表示","definition":"核心要素。","depth":1,"sourceRefs":["c-1"]}],
-             "gaps":["缺少合同解除的资料"],
+        fakeRouter.auditJson = """
+            {"gaps":["缺少合同解除的资料"],
              "conflicts":[{"topic":"撤销权期限","sources":["A","B"],"description":"两份资料期限不一致"}]}
         """.trimIndent()
         assertTrue(pipeline.generateKnowledgeMap("p-1").isSuccess)
-        assertEquals(1, db.knowledgeGapDao().getByProject("p-1").size)
+        // 审计的 gaps + 节点数偏少的软提示都可能存在，断言关键内容命中即可
+        val gaps = db.knowledgeGapDao().getByProject("p-1")
+        assertTrue(gaps.any { it.description.contains("缺少合同解除的资料") })
         assertEquals("撤销权期限", db.knowledgeConflictDao().getByProject("p-1").first().topic)
     }
 
@@ -134,7 +137,7 @@ class GenerationTest {
     @Test
     fun generateKnowledgeMap_emptyNodes_failsValidation() = runBlocking {
         seedProjectWithChunk()
-        fakeRouter.knowledgeMapJson = """{"nodes":[],"gaps":[],"conflicts":[]}"""
+        fakeRouter.skeletonJson = """{"chains":[],"gaps":[],"conflicts":[]}"""
         val result = pipeline.generateKnowledgeMap("p-1")
         assertTrue(result.exceptionOrNull() is ModelError.Invalid)
         assertTrue(db.knowledgeNodeDao().getByProject("p-1").isEmpty())
@@ -394,6 +397,9 @@ class GenerationTest {
         // 返回值里带一个稳定的阶段标记，FakeRouter 据此分辨阶段，
         // 不再依赖会随产品文案变化的 system 串。
         private val map = mapOf(
+            "knowledge_map_skeleton" to "[[MAP_SKELETON]]",
+            "knowledge_map_chain" to "[[MAP_CHAIN]] 节点标识清单：{nodeKeyTitles}",
+            "knowledge_map_audit" to "[[MAP_AUDIT]]",
             "knowledge_map" to "[[MAP]]",
             "knowledge_map_model" to "[[MAP]]",
             "story_bible" to "[[BIBLE]]",
@@ -407,8 +413,10 @@ class GenerationTest {
     }
 
     private class FakeRouter : ModelRouter {
-        var knowledgeMapJson: String =
-            """{"nodes":[{"title":"意思表示","definition":"民事法律行为的核心要素。","depth":1,"sourceRefs":["c-1"]},{"title":"民事法律行为","definition":"以意思表示为核心的行为。","parentTitle":"意思表示","depth":2,"sourceRefs":["c-1"]}],"gaps":[],"conflicts":[]}"""
+        // 批次化：骨架输出（一条链、两个节点），单链展开 JSON 由 generate 里按 prompt 动态构造
+        var skeletonJson: String =
+            """{"chains":[{"theme":"民法演进","opening":"从合同纠纷开始","nodeTitles":["意思表示","民事法律行为"]}],"gaps":[],"conflicts":[]}"""
+        var auditJson: String = """{"gaps":[],"conflicts":[]}"""
         var storyBibleJson: String =
             """{"world":"滨海市","characters":[{"name":"林默","role":"主角","description":"年轻律师"}],"conflict":"遗产继承纠纷","style":"悬疑","chapters":[{"order":1,"title":"第一章 遗嘱风波","plotGoal":"引出遗嘱问题","learningGoals":["意思表示"],"nodeTitles":["意思表示"],"wordTarget":1000}]}"""
         var chapterJson: String =
@@ -433,8 +441,15 @@ class GenerationTest {
             decoder: JsonDecoder<T>,
         ): Result<T> {
             val text = when {
+                request.user.contains("[[MAP_SKELETON]]") -> {
+                    knowledgeMapRole = role; skeletonJson
+                }
+                // 单链展开：从 prompt 的「节点标识清单」解析 nodeKey 与标题，回传带 nodeKey 的节点。
+                // 第一个节点是根（depth 1），其余挂到第一个节点下（depth 2），与旧测试的父子断言兼容。
+                request.user.contains("[[MAP_CHAIN]]") -> chainNodesJson(request)
+                request.user.contains("[[MAP_AUDIT]]") -> auditJson
                 request.user.contains("[[MAP]]") -> {
-                    knowledgeMapRole = role; knowledgeMapJson
+                    knowledgeMapRole = role; knowledgeMapJson()
                 }
                 request.user.contains("[[BIBLE]]") -> storyBibleJson
                 request.user.contains("[[CHAPTER]]") -> {
@@ -453,6 +468,37 @@ class GenerationTest {
             } catch (e: Exception) {
                 Result.failure(ModelError.Decode(e.message ?: "decode failed"))
             }
+        }
+
+        /** 旧式一次性地图 JSON（兼容只设旧字段的用例） */
+        private fun knowledgeMapJson(): String {
+            val nodes = skeletonJson.let { raw ->
+                runCatching {
+                    com.example.zhishu.ai.outputs.OutputValidators.validateSkeleton(
+                        com.example.zhishu.ai.jsonDecoder(
+                            com.example.zhishu.ai.outputs.KnowledgeMapSkeletonOutput.serializer(),
+                        ).decode(raw),
+                    ).getOrThrow()
+                }.getOrNull()?.chains?.flatMap { it.nodeTitles }.orEmpty()
+            }
+            val nodeJson = nodes.mapIndexed { index, title ->
+                """{"title":"$title","definition":"$title 的定义。","parentTitle":${if (index == 0) "null" else "\"${nodes[0]}\""},"depth":${if (index == 0) 1 else 2},"sourceRefs":["c-1"]}"""
+            }.joinToString(",")
+            return """{"nodes":[$nodeJson],"gaps":[],"conflicts":[]}"""
+        }
+
+        /** 从单链 prompt 提取 (nodeKey, title) 对，格式为「nk-xxx：标题」每行一条 */
+        private fun chainNodesJson(request: ModelRequest): String {
+            val entries = Regex("""(nk-[^\s：]+)：([^\n]+)""")
+                .findAll(request.user)
+                .map { it.groupValues[1] to it.groupValues[2].trim() }
+                .toList()
+            val nodeJson = entries.mapIndexed { index, (key, title) ->
+                """{"nodeKey":"$key","title":"$title","definition":"$title 的核心定义。",""" +
+                    """"arisesFrom":"从起点而来","leadsTo":"引出下一步","depth":${if (index == 0) 1 else 2},""" +
+                    """"parentTitle":${if (index == 0) "null" else "\"${entries[0].second}\""},"sourceRefs":["c-1"]}"""
+            }.joinToString(",")
+            return """{"nodes":[$nodeJson]}"""
         }
     }
 }

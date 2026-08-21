@@ -14,6 +14,7 @@ import com.example.zhishu.data.local.dao.ChapterVersionDao
 import com.example.zhishu.data.local.dao.CitationDao
 import com.example.zhishu.data.local.dao.KnowledgeConflictDao
 import com.example.zhishu.data.local.dao.KnowledgeGapDao
+import com.example.zhishu.data.local.dao.KnowledgeMapBatchDao
 import com.example.zhishu.data.local.dao.KnowledgeNodeDao
 import com.example.zhishu.data.local.dao.ModelConfigDao
 import com.example.zhishu.data.local.dao.ProjectDao
@@ -32,6 +33,7 @@ import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.Citation
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
+import com.example.zhishu.domain.model.KnowledgeMapBatch
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.Project
@@ -55,6 +57,7 @@ import kotlinx.serialization.json.Json
         SourceChunk::class,
         SourceChunkFts::class,
         KnowledgeNode::class,
+        KnowledgeMapBatch::class,
         KnowledgeGap::class,
         KnowledgeConflict::class,
         ChapterPlan::class,
@@ -70,7 +73,7 @@ import kotlinx.serialization.json.Json
         ModelConfig::class,
         StoryBible::class,
     ],
-    version = 12,
+    version = 14,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -79,6 +82,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun sourceDocumentDao(): SourceDocumentDao
     abstract fun sourceChunkDao(): SourceChunkDao
     abstract fun knowledgeNodeDao(): KnowledgeNodeDao
+    abstract fun knowledgeMapBatchDao(): KnowledgeMapBatchDao
     abstract fun knowledgeGapDao(): KnowledgeGapDao
     abstract fun knowledgeConflictDao(): KnowledgeConflictDao
     abstract fun chapterPlanDao(): ChapterPlanDao
@@ -732,6 +736,86 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v12 → v13：知识地图分批生成（骨架 → 逐链展开 → 全局审计）。
+         *
+         * 一次性让模型输出 14-44 个节点加 3-8 条演进链，单次 2 万 token 输出、
+         * 最坏几分钟不出结果，改成分批后需要两样新的持久化状态：
+         *
+         * 1. **节点的稳定标识与生成状态**。knowledge_nodes 增加：
+         *    - `nodeKey`：骨架落库时由程序分配，单链展开时模型原样回传——
+         *      标题只做显示，不能当身份（模型改一个空格/标点就匹配失败）；
+         *    - `generateStatus`：PLACEHOLDER / GENERATING / COMPLETED / FAILED。
+         *      旧数据一律默认 COMPLETED——它们是一次性生成出来的完整节点，
+         *      不能因为缺状态被误判成「待展开」。
+         * 2. **批次状态表**。knowledge_map_batches 记录当前批次的骨架、逐链、
+         *    审计完成情况，供断点续跑与重新生成隔离。
+         *    这是过程状态，不随备份导出。
+         */
+        val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE knowledge_nodes ADD COLUMN nodeKey TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE knowledge_nodes ADD COLUMN generateStatus TEXT NOT NULL DEFAULT 'COMPLETED'")
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `knowledge_map_batches` (" +
+                        "`id` TEXT NOT NULL, `projectId` TEXT NOT NULL, " +
+                        "`skeletonDone` INTEGER NOT NULL DEFAULT 0, " +
+                        "`chainsJson` TEXT NOT NULL DEFAULT '[]', " +
+                        "`chainStatuses` TEXT NOT NULL DEFAULT '[]', " +
+                        "`previewGaps` TEXT NOT NULL DEFAULT '[]', " +
+                        "`previewConflicts` TEXT NOT NULL DEFAULT '[]', " +
+                        "`auditDone` INTEGER NOT NULL DEFAULT 0, " +
+                        "`auditFailed` INTEGER NOT NULL DEFAULT 0, " +
+                        "`completed` INTEGER NOT NULL DEFAULT 0, " +
+                        "`failed` INTEGER NOT NULL DEFAULT 0, " +
+                        "`createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`id`))",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_knowledge_map_batches_projectId` " +
+                        "ON `knowledge_map_batches` (`projectId`)",
+                )
+                // 单链回填按 nodeKey 匹配，走索引而不是扫全表
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_knowledge_nodes_projectId_nodeKey` " +
+                        "ON `knowledge_nodes` (`projectId`, `nodeKey`)",
+                )
+            }
+        }
+
+        /**
+         * v13 → v14：重新生成不预先删地图，批次原子切换（收尾）。
+         *
+         * v13 的重新生成会在骨架阶段前 clearForProject——新批次一旦失败，
+         * 用户连旧地图都看不到了。现在给节点加批次归属：
+         *
+         * 1. knowledge_nodes 增加 `batchId`：重新生成时新批次节点先落库但
+         *    不生效（查询过滤掉），整批成功后事务切换 active 批次，
+         *    旧批次节点随之删除。空串 = 迁移前旧数据，视为当前有效地图。
+         * 2. knowledge_map_batches 增加 `active`：标记当前生效批次。
+         * 3. 回填：有已完成批次的项目，把其节点归属到该批次并置 active；
+         *    没有完成过批次的项目，节点保持空串（仍视为有效地图）。
+         */
+        val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE knowledge_nodes ADD COLUMN batchId TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE knowledge_map_batches ADD COLUMN active INTEGER NOT NULL DEFAULT 0")
+                // 最新的已完成批次置为生效
+                db.execSQL(
+                    "UPDATE knowledge_map_batches SET active = 1 WHERE id = (" +
+                        "SELECT id FROM knowledge_map_batches WHERE completed = 1 AND failed = 0 " +
+                        "ORDER BY createdAt DESC LIMIT 1)",
+                )
+                // 该批次项目下的节点归属到它（无完成批次的项目节点保持空串）
+                db.execSQL(
+                    "UPDATE knowledge_nodes SET batchId = COALESCE((" +
+                        "SELECT id FROM knowledge_map_batches " +
+                        "WHERE completed = 1 AND failed = 0 AND knowledge_map_batches.projectId = knowledge_nodes.projectId " +
+                        "ORDER BY createdAt DESC LIMIT 1), '')",
+                )
+            }
+        }
+
         /** 迁移里手工拼列表时用的 JSON 编解码，与 [Converters] 保持一致 */
         val LIST_JSON = Json
         val LIST_SERIALIZER = ListSerializer(String.serializer())
@@ -750,6 +834,8 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_9_10,
                     MIGRATION_10_11,
                     MIGRATION_11_12,
+                    MIGRATION_12_13,
+                    MIGRATION_13_14,
                 )
                 .build()
     }

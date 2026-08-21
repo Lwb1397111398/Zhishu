@@ -9,6 +9,7 @@ import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.Citation
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
+import com.example.zhishu.domain.model.KnowledgeMapBatch
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ModelRole
@@ -146,6 +147,8 @@ interface VerificationIssueRepository {
 interface KnowledgeRepository {
     fun observeByProject(projectId: String): Flow<List<KnowledgeNode>>
     suspend fun getByProject(projectId: String): List<KnowledgeNode>
+    /** 全量查询（含未生效的新批次节点），仅供生成流水线内部使用（v14） */
+    suspend fun getByProjectAll(projectId: String): List<KnowledgeNode>
     suspend fun upsertAll(nodes: List<KnowledgeNode>)
     suspend fun upsert(node: KnowledgeNode)
     suspend fun updateMastery(id: String, mastery: Float)
@@ -162,6 +165,23 @@ interface KnowledgeRepository {
         gaps: List<KnowledgeGap>,
         conflicts: List<KnowledgeConflict>,
     )
+
+    // --- 批次化生成状态（骨架 → 逐链 → 审计）---
+    /** 取该项目最新的生成批次；没有批次 = 从未开始或已完成清理 */
+    suspend fun getLatestBatch(projectId: String): KnowledgeMapBatch?
+    suspend fun saveBatch(batch: KnowledgeMapBatch)
+    /** 重新生成前清掉旧批次，避免旧状态被误认成当前批次（重新生成隔离） */
+    suspend fun clearBatch(projectId: String)
+
+    /**
+     * 原子切换 active 批次（v14）：把 [newBatchId] 置为生效、其他批次全部失效并清理，
+     * 同时删除不属于新批次的全部节点（含迁移前空批次旧数据）。
+     * 旧地图在新批次完整落库并切换前一直可见，失败/取消不触发切换。
+     */
+    suspend fun switchActiveBatch(projectId: String, newBatchId: String)
+
+    /** 批次化生成：只更新节点的生成状态（占位/失败），不覆盖用户字段 */
+    suspend fun updateGenerateStatus(id: String, status: String)
 }
 
 interface ChapterRepository {

@@ -15,11 +15,34 @@ interface KnowledgeNodeDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(node: KnowledgeNode)
 
-    @Query("SELECT * FROM knowledge_nodes WHERE projectId = :projectId ORDER BY depth, [order]")
+    /**
+     * 只返回当前生效地图的节点：空串（迁移前旧数据）或属于 active 批次的节点。
+     * 重新生成时新批次节点先落库但不可见，整批成功后原子切换才可见（v14）。
+     */
+    @Query(
+        "SELECT * FROM knowledge_nodes WHERE projectId = :projectId " +
+            "AND (batchId = '' OR batchId = (SELECT id FROM knowledge_map_batches " +
+            "WHERE projectId = :projectId AND active = 1)) ORDER BY depth, [order]",
+    )
     fun observeByProject(projectId: String): Flow<List<KnowledgeNode>>
 
-    @Query("SELECT * FROM knowledge_nodes WHERE projectId = :projectId ORDER BY depth, [order]")
+    @Query(
+        "SELECT * FROM knowledge_nodes WHERE projectId = :projectId " +
+            "AND (batchId = '' OR batchId = (SELECT id FROM knowledge_map_batches " +
+            "WHERE projectId = :projectId AND active = 1)) ORDER BY depth, [order]",
+    )
     suspend fun getByProject(projectId: String): List<KnowledgeNode>
+
+    /** 切换后清理：删除不属于当前批次的所有节点（含迁移前空批次旧数据），供批次切换事务调用 */
+    @Query("DELETE FROM knowledge_nodes WHERE projectId = :projectId AND batchId != :keepBatchId")
+    suspend fun deleteByBatchNotEqual(projectId: String, keepBatchId: String)
+
+    /**
+     * 全量查询（含未生效的新批次节点）。仅供生成流水线内部使用——
+     * 重新生成时新批次节点还没切换 active，过滤版查不到它们。
+     */
+    @Query("SELECT * FROM knowledge_nodes WHERE projectId = :projectId ORDER BY depth, [order]")
+    suspend fun getByProjectAll(projectId: String): List<KnowledgeNode>
 
     @Query("SELECT * FROM knowledge_nodes WHERE id = :id")
     suspend fun getById(id: String): KnowledgeNode?
@@ -38,9 +61,46 @@ interface KnowledgeNodeDao {
     @Query("DELETE FROM knowledge_nodes WHERE projectId = :projectId")
     suspend fun clearByProject(projectId: String)
 
-    @Query("SELECT * FROM knowledge_nodes WHERE projectId = :projectId AND title = :query LIMIT 20")
+    @Query(
+        "SELECT * FROM knowledge_nodes WHERE projectId = :projectId AND title = :query " +
+            "AND (batchId = '' OR batchId = (SELECT id FROM knowledge_map_batches " +
+            "WHERE projectId = :projectId AND active = 1)) LIMIT 20",
+    )
     suspend fun searchExactTitle(projectId: String, query: String): List<KnowledgeNode>
 
-    @Query("SELECT * FROM knowledge_nodes WHERE projectId = :projectId AND (title LIKE '%' || :query || '%' OR definition LIKE '%' || :query || '%') LIMIT 50")
+    @Query(
+        "SELECT * FROM knowledge_nodes WHERE projectId = :projectId " +
+            "AND (title LIKE '%' || :query || '%' OR definition LIKE '%' || :query || '%') " +
+            "AND (batchId = '' OR batchId = (SELECT id FROM knowledge_map_batches " +
+            "WHERE projectId = :projectId AND active = 1)) LIMIT 50",
+    )
     suspend fun searchFuzzy(projectId: String, query: String): List<KnowledgeNode>
+
+    /** 按稳定标识取节点（批次化生成：单链回填按 nodeKey 匹配，不按标题） */
+    @Query("SELECT * FROM knowledge_nodes WHERE projectId = :projectId AND nodeKey = :nodeKey LIMIT 1")
+    suspend fun getByNodeKey(projectId: String, nodeKey: String): KnowledgeNode?
+
+    /** 字段级状态更新：展开失败/重试时只动生成状态，不覆盖已有内容（批次化生成） */
+    @Query("UPDATE knowledge_nodes SET generateStatus = :status WHERE id = :id")
+    suspend fun updateGenerateStatus(id: String, status: String)
+
+    /**
+     * 单链展开回填（批次化生成）。
+     * 只写内容与层级字段，不碰 mastery / confirmed / chapterIds（用户与发布流程的字段）。
+     */
+    @Query("UPDATE knowledge_nodes SET generateStatus = :status, parentId = :parentId, depth = :depth, definition = :definition, arisesFrom = :arisesFrom, leadsTo = :leadsTo, prerequisites = :prerequisites, related = :related, confusions = :confusions, examples = :examples, sourceRefs = :sourceRefs WHERE id = :id")
+    suspend fun fillFromChain(
+        id: String,
+        status: String,
+        parentId: String?,
+        depth: Int,
+        definition: String,
+        arisesFrom: String,
+        leadsTo: String,
+        prerequisites: List<String>,
+        related: List<String>,
+        confusions: List<String>,
+        examples: List<String>,
+        sourceRefs: List<String>,
+    )
 }

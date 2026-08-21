@@ -15,6 +15,60 @@ import com.example.zhishu.domain.model.QuizType
  */
 object OutputValidators {
 
+    /**
+     * 骨架校验（批次化生成）。
+     *
+     * 只做「能开跑」的硬校验：至少一条链、每条链至少两个节点标题、节点标题
+     * 跨链去重后非空。节点数量低于学习深度预期只算软问题——由调用方写进 gaps
+     * 提示用户补充，而不是整批失败（骨架重试便宜，但给模型「列少点也行」的
+     * 退路总比反复失败强）。
+     */
+    fun validateSkeleton(output: KnowledgeMapSkeletonOutput): Result<KnowledgeMapSkeletonOutput> {
+        val chains = output.chains
+            .map { chain ->
+                chain.copy(nodeTitles = chain.nodeTitles.map { it.trim() }.filter { it.isNotBlank() })
+            }
+            .filter { it.nodeTitles.size >= 2 }
+        if (chains.isEmpty()) {
+            return Result.failure(ModelError.Invalid("知识地图骨架没有任何有效演进链"))
+        }
+        val allTitles = chains.flatMap { it.nodeTitles }.map { it.trim() }.distinct()
+        if (allTitles.isEmpty()) {
+            return Result.failure(ModelError.Invalid("知识地图骨架没有列出任何知识点"))
+        }
+        return Result.success(output.copy(chains = chains))
+    }
+
+    /**
+     * 单链展开校验（批次化生成）。
+     *
+     * [expectedKeys] 是骨架阶段程序分配的 nodeKey 集合——模型必须原样回传
+     * 标识才能匹配到占位节点；[knownTitles] 是骨架阶段的标题集合——模型给出的
+     * 标题不在骨架里的（超纲节点）按「模型改了标题」丢弃，写进 gaps 提示，
+     * 而不是让整条链失败。没带 nodeKey、或带了不认识标识的节点一律丢弃。
+     */
+    fun validateChainNodes(
+        output: ChainNodesOutput,
+        expectedKeys: Set<String>,
+        knownTitles: Set<String>,
+    ): Result<Pair<List<NodeDto>, List<String>>> {
+        val valid = output.nodes.filter { it.nodeKey.isNotBlank() && it.nodeKey in expectedKeys }
+        val unmatched = output.nodes.map { it.title.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .filter { title -> title !in knownTitles }
+        return Result.success(valid to unmatched)
+    }
+
+    /** 全局审计校验（批次化生成）：gaps 非空但 conflicts 结构异常时按脏数据清洗 */
+    fun validateAudit(output: KnowledgeMapAuditOutput): Result<KnowledgeMapAuditOutput> {
+        val gaps = output.gaps.map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        val conflicts = output.conflicts
+            .filter { it.topic.isNotBlank() }
+            .distinctBy { it.topic.trim() }
+        return Result.success(output.copy(gaps = gaps, conflicts = conflicts))
+    }
+
     fun validateKnowledgeMap(output: KnowledgeMapOutput): Result<KnowledgeMapOutput> {
         val nodes = output.nodes.filter { it.title.isNotBlank() }
         if (nodes.isEmpty()) {

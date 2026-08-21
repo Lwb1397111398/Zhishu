@@ -266,7 +266,10 @@ class OpenAiModelProvider(
         fun defaultClient(): HttpClient = HttpClient(OkHttp) {
             install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
             install(HttpTimeout) {
-                requestTimeoutMillis = 120_000
+                // 总超时 180 秒：单次 AI 生成本来就可能跑 1-3 分钟（长 JSON 输出），
+                // 收紧到 60 秒会主动杀死正常请求。socketTimeout 是「连续 120 秒无数据」的
+                // 空闲超时——服务端一直在吐就不算超时，彻底挂死才会触发。
+                requestTimeoutMillis = 180_000
                 connectTimeoutMillis = 20_000
                 socketTimeoutMillis = 120_000
             }

@@ -25,6 +25,8 @@ data class GenerationUiState(
     val error: String? = null,
     /** 正在等待网络/退避重试 */
     val waitingRetry: Boolean = false,
+    /** 已经自动重试过的次数（退避等待期间显示给用户，说明任务没死） */
+    val retryCount: Int = 0,
     /** 已完成的工作单元数（问题2） */
     val completed: Int = 0,
     /** 本次任务的工作单元总数。为 0 表示总量未知，UI 退回不确定进度条（问题2） */
@@ -55,7 +57,11 @@ data class GenerationUiState(
             hasError -> error.orEmpty()
             running -> stageText.ifBlank { "正在生成…" }
             // 退避重试期间必须说清是在等，不能伪装成还在调模型
-            waitingRetry -> "服务繁忙或网络不可用，正在等待重试…"
+            waitingRetry -> if (retryCount > 0) {
+                "服务繁忙或网络不可用，正在等待第 $retryCount 次重试…"
+            } else {
+                "服务繁忙或网络不可用，正在等待重试…"
+            }
             enqueued -> "已排队，等待开始…"
             cancelled -> "已取消生成。已经写好的章节不受影响。"
             else -> ""
@@ -96,6 +102,7 @@ internal fun List<WorkInfo>.toGenerationState(): GenerationUiState {
             enqueued = true,
             // runAttemptCount > 0 说明已经跑过并退避重试中，和「刚排队」要区分开
             waitingRetry = pending.runAttemptCount > 0,
+            retryCount = pending.runAttemptCount,
         )
     }
     val failed = current.lastOrNull { it.state == WorkInfo.State.FAILED }

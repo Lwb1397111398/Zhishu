@@ -55,8 +55,14 @@ class GenerationWorker(
             report(stage.label, unitsBefore, project.title)
             when (stage) {
                 GenerationStage.KNOWLEDGE_MAP -> {
-                    container.pipeline.generateKnowledgeMap(projectId).getOrThrow()
-                    report(stage.label, unitsBefore + 1, project.title)
+                    // 批次化生成：骨架 → 逐链 → 审计，逐阶段上报进度
+                    var done = 0
+                    container.pipeline.generateKnowledgeMap(projectId) { progress ->
+                        val text = progress.label.ifBlank { stage.label }
+                        report(text, unitsBefore + progress.completed, project.title)
+                        done = progress.completed
+                    }.getOrThrow()
+                    report(stage.label, unitsBefore + done, project.title)
                 }
 
                 GenerationStage.STORY_BIBLE -> {

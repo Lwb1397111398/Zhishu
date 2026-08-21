@@ -32,7 +32,10 @@ internal class VolumeRouter : ModelRouter {
         decoder: JsonDecoder<T>,
     ): Result<T> {
         val text = when {
-            request.user.contains("[[MAP]]") -> MAP_JSON
+            request.user.contains("[[MAP_SKELETON]]") -> SKELETON_JSON
+            request.user.contains("[[MAP_CHAIN]]") -> chainNodesJson(request.user)
+            request.user.contains("[[MAP_AUDIT]]") -> AUDIT_JSON
+            request.user.contains("[[MAP]]") -> SKELETON_JSON
             request.user.contains("[[BIBLE]]") -> bibleJson()
             request.user.contains("[[VOLUME]]") -> {
                 lastNextVolumePrompt = request.user
@@ -107,12 +110,31 @@ internal class VolumeRouter : ModelRouter {
                 """{"title":"法定继承","definition":"无遗嘱时按法定顺序继承。","depth":2,"sourceRefs":["c-1"]}""" +
                 """],"gaps":[],"conflicts":[]}"""
 
+        /** 批次化骨架：一条链、四个节点，与原 MAP_JSON 的节点集一致 */
+        const val SKELETON_JSON =
+            """{"chains":[{"theme":"继承制度演进","opening":"从财产传承开始","nodeTitles":["继承","遗产范围","遗嘱继承","法定继承"]}],"gaps":[],"conflicts":[]}"""
+        const val AUDIT_JSON = """{"gaps":[],"conflicts":[]}"""
+    }
+
+    /** 从单链 prompt 提取 (nodeKey, title) 对并回传带 nodeKey 的节点（与原 MAP_JSON 的节点集一致） */
+    private fun chainNodesJson(prompt: String): String {
+        val entries = Regex("""(nk-[^\s：]+)：([^\n]+)""")
+            .findAll(prompt)
+            .map { it.groupValues[1] to it.groupValues[2].trim() }
+            .toList()
+        val nodeJson = entries.map { (key, title) ->
+            """{"nodeKey":"$key","title":"$title","definition":"$title 的定义。","depth":1,"sourceRefs":["c-1"]}"""
+        }.joinToString(",")
+        return """{"nodes":[$nodeJson]}"""
     }
 }
 
 /** 分卷测试的阶段标记 prompt，额外区分续卷阶段 */
 internal class VolumePromptProvider : PromptProvider {
     private val map = mapOf(
+        "knowledge_map_skeleton" to "[[MAP_SKELETON]]",
+        "knowledge_map_chain" to "[[MAP_CHAIN]] 节点标识清单：{nodeKeyTitles}",
+        "knowledge_map_audit" to "[[MAP_AUDIT]]",
         "knowledge_map" to "[[MAP]]",
         "knowledge_map_model" to "[[MAP]]",
         "story_bible" to "[[BIBLE]]",

@@ -69,7 +69,9 @@ class VersionHardeningTest {
             knowledgeRepository = DefaultKnowledgeRepository(
                 dao = db.knowledgeNodeDao(),
                 gapDao = db.knowledgeGapDao(),
+                db = db,
                 conflictDao = db.knowledgeConflictDao(),
+                batchDao = db.knowledgeMapBatchDao(),
             ),
             chapterRepository = DefaultChapterRepository(
                 db.chapterPlanDao(),
@@ -586,7 +588,9 @@ class VersionHardeningTest {
         knowledgeRepository = DefaultKnowledgeRepository(
             dao = db.knowledgeNodeDao(),
             gapDao = db.knowledgeGapDao(),
+            db = db,
             conflictDao = db.knowledgeConflictDao(),
+            batchDao = db.knowledgeMapBatchDao(),
         ),
         chapterRepository = DefaultChapterRepository(
             db.chapterPlanDao(),

@@ -50,6 +50,8 @@ android {
 
     testOptions {
         unitTests.isIncludeAndroidResources = true
+        // 本机物理内存紧张时，全量单测请用命令行限并行：
+        // ./gradlew.bat testDebugUnitTest --max-workers=1
         unitTests.all { it.maxHeapSize = "1024m" }
     }
 

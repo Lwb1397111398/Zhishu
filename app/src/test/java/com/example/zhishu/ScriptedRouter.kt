@@ -51,6 +51,24 @@ internal class ScriptedRouter : ModelRouter {
             """{"type":"EXPLANATION","text":"意思表示是民事法律行为的核心要素。","knowledgeNodeTitles":["意思表示"],"sourceRefs":["c-1"]}]}"""
     var verifyJson: String = """{"issues":[]}"""
 
+    /** 批次化知识地图：骨架 / 单链 / 审计 */
+    var skeletonJson: String = SKELETON_JSON
+    var auditJson: String = AUDIT_JSON
+
+    /** 从单链 prompt 提取 (nodeKey, title) 对并回传带 nodeKey 的节点 */
+    private fun chainNodesJson(prompt: String): String {
+        val entries = Regex("""(nk-[^\s：]+)：([^\n]+)""")
+            .findAll(prompt)
+            .map { it.groupValues[1] to it.groupValues[2].trim() }
+            .toList()
+        val nodeJson = entries.mapIndexed { index, (key, title) ->
+            """{"nodeKey":"$key","title":"$title","definition":"$title 的核心定义。",""" +
+                """"arisesFrom":"从起点而来","leadsTo":"引出下一步","depth":${if (index == 0) 1 else 2},""" +
+                """"parentTitle":${if (index == 0) "null" else "\"${entries[0].second}\""},"sourceRefs":["c-1"]}"""
+        }.joinToString(",")
+        return """{"nodes":[$nodeJson]}"""
+    }
+
     /**
      * 按顺序返回的核验结果（4B）。
      *
@@ -80,7 +98,9 @@ internal class ScriptedRouter : ModelRouter {
         decoder: JsonDecoder<T>,
     ): Result<T> {
         val phase = when {
-            request.user.contains("[[MAP]]") -> Phase.MAP
+            request.user.contains("[[MAP_SKELETON]]") ||
+                request.user.contains("[[MAP_CHAIN]]") ||
+                request.user.contains("[[MAP_AUDIT]]") -> Phase.MAP
             request.user.contains("[[BIBLE]]") -> Phase.BIBLE
             request.user.contains("[[CHAPTER]]") -> Phase.CHAPTER
             request.user.contains("[[VERIFY]]") -> Phase.VERIFY
@@ -94,13 +114,16 @@ internal class ScriptedRouter : ModelRouter {
         if (phase == cancelAt) throw CancellationException("用户取消")
         if (phase == failAt) return Result.failure(failWith)
 
-        val text = when (phase) {
-            Phase.MAP -> MAP_JSON
-            Phase.BIBLE -> BIBLE_JSON
-            Phase.CHAPTER -> chapterJson
-            Phase.VERIFY -> verifyQueue.removeFirstOrNull() ?: verifyJson
-            Phase.QUIZ -> quizJson
-            Phase.REWRITE -> rewriteQueue.removeFirstOrNull() ?: rewriteJson
+        val text = when {
+            request.user.contains("[[MAP_SKELETON]]") -> skeletonJson
+            request.user.contains("[[MAP_CHAIN]]") -> chainNodesJson(request.user)
+            request.user.contains("[[MAP_AUDIT]]") -> auditJson
+            Phase.BIBLE == phase -> BIBLE_JSON
+            Phase.CHAPTER == phase -> chapterJson
+            Phase.VERIFY == phase -> verifyQueue.removeFirstOrNull() ?: verifyJson
+            Phase.QUIZ == phase -> quizJson
+            Phase.REWRITE == phase -> rewriteQueue.removeFirstOrNull() ?: rewriteJson
+            else -> error("没有匹配的测试数据: ${request.user.take(40)}")
         }
         return try {
             Result.success(decoder.decode(text))
@@ -110,8 +133,10 @@ internal class ScriptedRouter : ModelRouter {
     }
 
     private companion object {
-        const val MAP_JSON =
-            """{"nodes":[{"title":"意思表示","definition":"民事法律行为的核心要素。","depth":1,"sourceRefs":["c-1"]}],"gaps":[],"conflicts":[]}"""
+        /** 批次化骨架：一条链、两个节点（演进链最小结构），与旧 MAP_JSON 语义一致 */
+        const val SKELETON_JSON =
+            """{"chains":[{"theme":"民法演进","opening":"从合同纠纷开始","nodeTitles":["意思表示","民事法律行为"]}],"gaps":[],"conflicts":[]}"""
+        const val AUDIT_JSON = """{"gaps":[],"conflicts":[]}"""
         const val BIBLE_JSON =
             """{"world":"滨海市","characters":[{"name":"林默","role":"主角","description":"律师"}],""" +
                 """"conflict":"遗产纠纷","style":"悬疑","chapters":[""" +
@@ -143,8 +168,11 @@ internal class TaggedPromptProvider(
     private val verifyTemplate: String = "[[VERIFY]] 正文=<{blocks}>",
 ) : PromptProvider {
     private val map = mapOf(
-        "knowledge_map" to "[[MAP]]",
-        "knowledge_map_model" to "[[MAP]]",
+        "knowledge_map_skeleton" to "[[MAP_SKELETON]]",
+        "knowledge_map_chain" to "[[MAP_CHAIN]] 节点标识清单：{nodeKeyTitles}",
+        "knowledge_map_audit" to "[[MAP_AUDIT]]",
+        "knowledge_map" to "[[MAP_SKELETON]]",
+        "knowledge_map_model" to "[[MAP_SKELETON]]",
         "story_bible" to "[[BIBLE]]",
         "chapter" to chapterTemplate,
         "verify" to verifyTemplate,

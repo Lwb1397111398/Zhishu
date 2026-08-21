@@ -1,5 +1,7 @@
 package com.example.zhishu.data.local.repo
 
+import androidx.room.withTransaction
+import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.data.local.dao.AnswerRecordDao
 import com.example.zhishu.data.local.dao.ChapterBlockDao
 import com.example.zhishu.data.local.dao.ChapterPlanDao
@@ -7,6 +9,7 @@ import com.example.zhishu.data.local.dao.ChapterVersionDao
 import com.example.zhishu.data.local.dao.CitationDao
 import com.example.zhishu.data.local.dao.KnowledgeConflictDao
 import com.example.zhishu.data.local.dao.KnowledgeGapDao
+import com.example.zhishu.data.local.dao.KnowledgeMapBatchDao
 import com.example.zhishu.data.local.dao.KnowledgeNodeDao
 import com.example.zhishu.data.local.dao.ModelConfigDao
 import com.example.zhishu.data.local.dao.ProjectDao
@@ -28,6 +31,7 @@ import com.example.zhishu.domain.model.CitationStatus
 import com.example.zhishu.domain.model.IssueResolution
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
+import com.example.zhishu.domain.model.KnowledgeMapBatch
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ModelRole
@@ -129,15 +133,20 @@ class DefaultSourceRepository(
 }
 
 class DefaultKnowledgeRepository(
+    private val db: AppDatabase,
     private val dao: KnowledgeNodeDao,
     private val gapDao: KnowledgeGapDao,
     private val conflictDao: KnowledgeConflictDao,
+    private val batchDao: KnowledgeMapBatchDao,
 ) : KnowledgeRepository {
     override fun observeByProject(projectId: String): Flow<List<KnowledgeNode>> =
         dao.observeByProject(projectId)
 
     override suspend fun getByProject(projectId: String): List<KnowledgeNode> =
         dao.getByProject(projectId)
+
+    override suspend fun getByProjectAll(projectId: String): List<KnowledgeNode> =
+        dao.getByProjectAll(projectId)
 
     override suspend fun upsertAll(nodes: List<KnowledgeNode>) = dao.upsertAll(nodes)
     override suspend fun upsert(node: KnowledgeNode) = dao.upsert(node)
@@ -168,6 +177,25 @@ class DefaultKnowledgeRepository(
         if (gaps.isNotEmpty()) gapDao.upsertAll(gaps)
         if (conflicts.isNotEmpty()) conflictDao.upsertAll(conflicts)
     }
+
+    override suspend fun getLatestBatch(projectId: String): KnowledgeMapBatch? =
+        batchDao.getLatest(projectId)
+
+    override suspend fun saveBatch(batch: KnowledgeMapBatch) = batchDao.upsert(batch)
+
+    override suspend fun clearBatch(projectId: String) = batchDao.clearByProject(projectId)
+
+    override suspend fun switchActiveBatch(projectId: String, newBatchId: String) {
+        db.withTransaction {
+            batchDao.deactivateAll(projectId)
+            batchDao.activate(projectId, newBatchId)
+            batchDao.deleteExcept(projectId, newBatchId)
+            dao.deleteByBatchNotEqual(projectId, newBatchId)
+        }
+    }
+
+    override suspend fun updateGenerateStatus(id: String, status: String) =
+        dao.updateGenerateStatus(id, status)
 }
 
 class DefaultChapterRepository(

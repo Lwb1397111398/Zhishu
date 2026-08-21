@@ -69,6 +69,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -81,6 +82,7 @@ import com.example.zhishu.domain.model.GENRE_AUTO
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
+import com.example.zhishu.domain.model.NodeGenerateStatus
 import com.example.zhishu.domain.model.ParseStatus
 import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.SourceDocument
@@ -906,7 +908,17 @@ private fun TreeNodeRow(
         )
         Spacer(Modifier.width(8.dp))
         Column(Modifier.weight(1f)) {
-            Text(node.title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(node.title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                node.generateStatusLabel()?.let { (labelText, labelColor) ->
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        labelText,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = labelColor,
+                    )
+                }
+            }
             LinearProgressIndicator(
                 progress = { node.mastery },
                 modifier = Modifier
@@ -933,6 +945,19 @@ private fun TreeNodeRow(
                 onClick = onClick,
             )
         }
+    }
+}
+
+/** 批次化生成的节点状态标签：占位/展开中/失败才显示，已完成不打扰 */
+@Composable
+private fun KnowledgeNode.generateStatusLabel(): Pair<String, Color>? {
+    val status = NodeGenerateStatus.entries.firstOrNull { it.name == generateStatus }
+        ?: return null
+    return when (status) {
+        NodeGenerateStatus.PLACEHOLDER -> "待展开" to MaterialTheme.colorScheme.outline
+        NodeGenerateStatus.GENERATING -> "展开中" to MaterialTheme.colorScheme.primary
+        NodeGenerateStatus.FAILED -> "生成失败" to MaterialTheme.colorScheme.error
+        NodeGenerateStatus.COMPLETED -> null
     }
 }
 

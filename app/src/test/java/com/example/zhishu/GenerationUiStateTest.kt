@@ -90,7 +90,8 @@ class GenerationUiStateTest {
         ).toGenerationState()
 
         assertTrue(state.waitingRetry)
-        assertTrue(state.message.contains("等待重试"))
+        assertTrue(state.message.contains("重试"))
+        assertTrue(state.message.contains("2")) // 显示第几次重试（要求 6）
         assertFalse(state.determinate)
     }
 

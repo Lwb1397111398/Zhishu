@@ -13,6 +13,36 @@ data class KnowledgeMapOutput(
     val conflicts: List<ConflictDto> = emptyList(),
 )
 
+/**
+ * 知识地图分批生成（批次化）：骨架阶段的输出。
+ *
+ * 只让模型列出演进链结构与节点标题清单，不写节点内容——单次输出降到
+ * 2-4 千 token，30 秒内可完成。节点内容由逐链展开阶段分批补齐。
+ */
+@Serializable
+data class KnowledgeMapSkeletonOutput(
+    /** 3-8 条演进链。所有链的 nodeTitles 并集 = 全部知识点，不重不漏 */
+    val chains: List<ChainDto> = emptyList(),
+    /** 骨架阶段的缺口预览（最终审计会整体替换） */
+    val gaps: List<String> = emptyList(),
+    /** 骨架阶段的冲突预览（最终审计会整体替换） */
+    val conflicts: List<ConflictDto> = emptyList(),
+)
+
+/** 知识地图分批生成（批次化）：单条演进链展开的输出 */
+@Serializable
+data class ChainNodesOutput(
+    /** 本链涉及的节点完整内容。nodeKey 必须与骨架阶段程序分配的标识一致 */
+    val nodes: List<NodeDto> = emptyList(),
+)
+
+/** 知识地图分批生成（批次化）：全局审计的输出（骨架 → 逐链 → 审计） */
+@Serializable
+data class KnowledgeMapAuditOutput(
+    val gaps: List<String> = emptyList(),
+    val conflicts: List<ConflictDto> = emptyList(),
+)
+
 /** 一条「前一个制度长出后一个」的演进链 */
 @Serializable
 data class ChainDto(
@@ -36,6 +66,11 @@ data class NodeDto(
     val sourceRefs: List<String> = emptyList(),
     val parentTitle: String? = null,
     val depth: Int = 1,
+    /**
+     * 稳定标识（批次化生成）。骨架阶段由程序分配并下发给模型，
+     * 单链展开时模型必须原样回传；按它匹配节点，不按标题。
+     */
+    val nodeKey: String = "",
 )
 
 @Serializable

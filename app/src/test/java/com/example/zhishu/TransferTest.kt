@@ -14,6 +14,7 @@ import com.example.zhishu.domain.model.IssueResolution
 import com.example.zhishu.domain.model.IssueType
 import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ModelRole
+import com.example.zhishu.domain.model.NodeGenerateStatus
 import com.example.zhishu.domain.model.VerificationIssue
 import com.example.zhishu.ui.viewmodel.DemoSeeder
 import java.io.ByteArrayOutputStream
@@ -76,6 +77,10 @@ class TransferTest {
 
         assertTrue(transfer.import(app, uri).isSuccess)
         assertEquals(4, container.knowledgeRepository.getByProject(projectId).size)
+        // v13/v14 新增字段（nodeKey / generateStatus / batchId）随备份往返保留，不因恢复而丢失
+        val restoredNodes = container.knowledgeRepository.getByProject(projectId)
+        assertTrue(restoredNodes.all { it.generateStatus == NodeGenerateStatus.COMPLETED.name })
+        assertTrue(restoredNodes.all { it.batchId == "" })
         val plans = container.chapterRepository.getPlans(projectId)
         assertEquals(3, plans.size)
         assertTrue(plans.all { it.status == ChapterStatus.PUBLISHED })

@@ -38,3 +38,6 @@ ver.txt
 test-classpath.txt
 *-args.txt
 *args*.txt
+
+# 本地工作记忆（不进仓库）
+.workbuddy/
