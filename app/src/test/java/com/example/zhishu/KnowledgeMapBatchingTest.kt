@@ -3,6 +3,7 @@ package com.example.zhishu
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.zhishu.ai.JsonDecoder
+import com.example.zhishu.ai.ModelCallStats
 import com.example.zhishu.ai.ModelError
 import com.example.zhishu.ai.ModelRequest
 import com.example.zhishu.ai.ModelRouter
@@ -367,6 +368,8 @@ class KnowledgeMapBatchingTest {
             role: com.example.zhishu.domain.model.ModelRole,
             request: ModelRequest,
             decoder: JsonDecoder<T>,
+            onStats: (ModelCallStats) -> Unit,
+            onAttempt: (com.example.zhishu.ai.CallAttempt) -> Unit,
         ): Result<T> {
             val text = when {
                 request.user.contains("[[MAP_SKELETON]]") -> {

@@ -100,6 +100,68 @@ data class CharacterDto(
     val description: String,
 )
 
+/**
+ * 章节类型（第二轮 P1-2）。
+ *
+ * 决定本章的最低写作要求——不要求每一章机械走完八拍因果链，
+ * 而是按类型只保证该类型必须满足的那几拍：
+ * - INTRODUCE：新授。必须显式制造 knowledgeGap，且给出 resultingChange
+ * - APPLY：应用。必须列出 appliedNodeTitles，且给出行动的结果
+ * - CONTRAST：辨析。必须摆出易混点（priorIntuition/obstacle），并给出区分结果
+ * - REVIEW：回顾迁移。只能引用已学节点，不能把新概念伪装成首次介绍
+ * - ASSESS：通过案例验证掌握。必须给案例与判断结果
+ */
+@Serializable
+enum class ChapterType {
+    INTRODUCE,
+    APPLY,
+    CONTRAST,
+    REVIEW,
+    ASSESS,
+}
+
+/**
+ * 章节因果契约（第二轮 P1-2）：路线规划时为每一章定下的因果结构。
+ *
+ * 路线模型输出契约，正文模型遵循它写作，核验模型拿着它逐项检查——
+ * 这是把「故事因果」从 prompt 软约束变成可校验产物的第一步。
+ * 所有字段可空/可缺省：旧模型输出（无契约字段）解析后得到空契约，
+ * 兼容老流程；只有新 Prompt 版本且校验开启时才要求契约完整。
+ */
+@Serializable
+data class ChapterContractDto(
+    /** 本章开头人物要面对的具体问题或目标 */
+    val entryQuestion: String = "",
+    /** 读者/人物对这个问题原本就有的直觉、旧方法或初步方案 */
+    val priorIntuition: String = "",
+    /** 旧方法遇到的阻碍或矛盾 */
+    val obstacle: String = "",
+    /** 读者因此明确感到需要一个新的解释 */
+    val knowledgeGap: String = "",
+    /** 本章**新引入**的知识点标题（首次讲解） */
+    val introducedNodeTitles: List<String> = emptyList(),
+    /** 本章**应用**的知识点标题（用来判断/行动/排除，可含已学节点） */
+    val appliedNodeTitles: List<String> = emptyList(),
+    /** 本章必须走到的叙事节点（拍子），不要求每拍都有独立段落 */
+    val requiredBeats: List<String> = emptyList(),
+    /** 知识被用起来之后带来的可观察变化 */
+    val resultingChange: String = "",
+    /** 本章结尾留下、交给下一章的问题 */
+    val bridgeToNext: String = "",
+) {
+    /** 契约是否完全缺失（旧模型输出或模型没填）。缺失 ≠ 伪造通过。 */
+    val isEmpty: Boolean
+        get() = entryQuestion.isBlank() &&
+            priorIntuition.isBlank() &&
+            obstacle.isBlank() &&
+            knowledgeGap.isBlank() &&
+            introducedNodeTitles.isEmpty() &&
+            appliedNodeTitles.isEmpty() &&
+            requiredBeats.isEmpty() &&
+            resultingChange.isBlank() &&
+            bridgeToNext.isBlank()
+}
+
 @Serializable
 data class ChapterPlanDto(
     val order: Int,
@@ -112,6 +174,17 @@ data class ChapterPlanDto(
     val wordTarget: Int = 1200,
     val openingHook: String = "",
     val closingHook: String = "",
+    /** 章节类型。空串 = 未指定（旧模型输出），校验开启时才要求给出 */
+    val chapterType: String = "",
+    /** 本章的因果契约（第二轮 P1-2）。旧模型输出时为默认空契约 */
+    val contract: ChapterContractDto = ChapterContractDto(),
+    /**
+     * 本章依赖的前置知识点标题（第二轮 P1-4，路线模型输出）。
+     *
+     * 只用于提示与软校验：程序只对能精确匹配到节点标题/ID 的关系做硬校验，
+     * 自由文本一律不建立程序关系，匹配不到的记 UNRESOLVED_PREREQUISITE。
+     */
+    val prerequisiteNodeTitles: List<String> = emptyList(),
 )
 
 /**
@@ -178,7 +251,60 @@ data class VerificationOutput(
     val issues: List<VerificationIssueDto> = emptyList(),
     /** 无资料模式下需要学习者自行核对权威出处的断言（问题3） */
     val unverifiedClaims: List<String> = emptyList(),
+    /**
+     * 结构化契约检查（批次 B 后续：contractChecks）。
+     *
+     * 对契约声明的 applied/introduced 节点逐项给出正文证据判定，使双轨比对
+     * 「契约声明 vs 正文证据」从 issues 推断升级为真证据。旧模型不输出本字段
+     * （解析默认空数组，完全不破坏兼容）；双轨判定在 checks 缺失时退回 issues 推断。
+     */
+    val checks: List<ContractCheck> = emptyList(),
 )
+
+/**
+ * 一个知识点的契约检查结果（批次 B 后续）。
+ *
+ * [evidence] 为宽松字符串（模型可能输出大小写/措辞变体，解析层不做枚举强校验，
+ * 避免旧模型或变体输出把整个核验结果炸掉）；判定时映射到 [Evidence]，
+ * 未知值一律归 [Evidence.UNKNOWN]——**不得默认为 PRESENT**。
+ *
+ * 判定口径（防误报）：
+ * - PRESENT：正文有明确应用/引入证据，且 [evidenceBlockIds] 可定位到段落；
+ * - PARTIAL：正文有涉及但没真正用起来（只提了名字、没走完应用）；
+ * - ABSENT：正文没有对应内容；
+ * - UNKNOWN：核验无法判断（正文未生成/上下文不足）。
+ */
+@Serializable
+data class ContractCheck(
+    /** 被检查的知识点标题（来自契约 appliedNodeTitles / introducedNodeTitles） */
+    val nodeTitle: String,
+    /** 契约声称的用法：APPLIED / INTRODUCED / RESULT */
+    val claim: String = "APPLIED",
+    /** 宽松字符串，判定层映射到 [Evidence]；未知值归 UNKNOWN */
+    val evidence: String = "UNKNOWN",
+    /** 证据所在段落（blockId 原样复制，可定位到正文） */
+    val evidenceBlockIds: List<String> = emptyList(),
+    /** 一句说明；无证据（PARTIAL/ABSENT）时解释为什么判定 */
+    val comment: String = "",
+)
+
+@Serializable
+enum class Evidence {
+    PRESENT,
+    PARTIAL,
+    ABSENT,
+    UNKNOWN;
+
+    companion object {
+        /** 宽松映射：未知/空值一律 UNKNOWN（防误报，绝不当 PRESENT） */
+        fun parse(raw: String?): Evidence = when (raw?.trim()?.uppercase()) {
+            "PRESENT" -> PRESENT
+            "PARTIAL" -> PARTIAL
+            "ABSENT" -> ABSENT
+            else -> UNKNOWN
+        }
+    }
+}
 
 @Serializable
 data class VerificationIssueDto(

@@ -409,6 +409,29 @@ class TransferTest {
         assertEquals(1, container.storyBibleRepository.get(projectId)?.currentVolumeIndex)
     }
 
+    /** 章节类型与因果契约必须随备份往返（第二轮 P1-2，新字段向后兼容） */
+    @Test
+    fun exportThenImport_roundTripsChapterTypeAndContract() = runBlocking {
+        DemoSeeder.seed(container)
+        val c1 = container.chapterRepository.getPlan("c1")!!
+        container.chapterRepository.upsertPlan(
+            c1.copy(
+                chapterType = "INTRODUCE",
+                contractJson = """{"entryQuestion":"如何判断遗嘱效力","knowledgeGap":"需要一个标准",""" +
+                    """"introducedNodeTitles":["继承"],"requiredBeats":["开场","引入","收束"],"resultingChange":"有了判断"}""",
+            ),
+        )
+
+        val file = File(workDir, "contract.zip")
+        assertTrue(transfer.export(app, Uri.fromFile(file)).isSuccess)
+        assertTrue(transfer.import(app, Uri.fromFile(file)).isSuccess)
+
+        val restored = container.chapterRepository.getPlan("c1")
+        assertEquals("INTRODUCE", restored?.chapterType)
+        assertTrue(restored?.contractJson.orEmpty().contains("knowledgeGap"))
+        assertTrue(restored?.contractJson.orEmpty().contains("introducedNodeTitles"))
+    }
+
     /**
      * v5 备份（formatVersion 5）导入时，被取代的旧正文改成 ARCHIVED（3D）。
      *

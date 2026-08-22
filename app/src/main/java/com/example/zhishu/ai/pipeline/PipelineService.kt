@@ -8,9 +8,11 @@ import com.example.zhishu.ai.jsonDecoder
 import com.example.zhishu.ai.outputs.BlockRewriteOutput
 import com.example.zhishu.ai.outputs.ChainDto
 import com.example.zhishu.ai.outputs.ChainNodesOutput
+import com.example.zhishu.ai.outputs.ChapterContractDto
 import com.example.zhishu.ai.outputs.ChapterOutput
 import com.example.zhishu.ai.outputs.ChapterPlanDto
 import com.example.zhishu.ai.outputs.ConflictDto
+import com.example.zhishu.ai.outputs.ContractCodec
 import com.example.zhishu.ai.outputs.KnowledgeMapAuditOutput
 import com.example.zhishu.ai.outputs.KnowledgeMapOutput
 import com.example.zhishu.ai.outputs.KnowledgeMapSkeletonOutput
@@ -18,6 +20,8 @@ import com.example.zhishu.ai.outputs.NextVolumeOutput
 import com.example.zhishu.ai.outputs.NodeDto
 import com.example.zhishu.ai.outputs.OutputValidators
 import com.example.zhishu.ai.outputs.QuizSetOutput
+import com.example.zhishu.ai.outputs.RouteAudit
+import com.example.zhishu.ai.outputs.RouteAuditIssue
 import com.example.zhishu.ai.outputs.StoryBibleOutput
 import com.example.zhishu.ai.outputs.VerificationOutput
 import com.example.zhishu.domain.model.ChapterBlock
@@ -58,6 +62,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 class PipelineService(
@@ -81,6 +87,28 @@ class PipelineService(
     private val spacedReviewEnabled: () -> Boolean = { false },
     private val idFactory: () -> String = { UUID.randomUUID().toString() },
     private val clock: () -> Long = { System.currentTimeMillis() },
+    /**
+     * 路线规划是否强制章节因果契约（批次 B B.0-3）。
+     *
+     * 新版 Prompt 输出契约 → true（生产默认）；旧版 Prompt 不输出契约 → false，
+     * 由样本运行器传入，走兼容解析（chapterType=未指定、contract=未生成），
+     * 事实/推导/引用核验照常，不因契约缺失失败、不补写虚假契约。
+     */
+    private val requireChapterContracts: () -> Boolean = { true },
+    /**
+     * 正文是否强制讲解段落关联既有知识点（批次 B 样本）。生产默认 true；
+     * 样本运行器传 false 以容忍部分模型（如 doubao-seed）正文块不填
+     * knowledgeNodeTitles——该质量问题作为样本发现记录，不改变生产默认。
+     */
+    private val requireBlockNodeLinks: () -> Boolean = { true },
+    /**
+     * 路线软审计结果出口（第二轮 P1-5）。
+     *
+     * 硬校验失败会让路线生成直接失败；这里是「能继续但有风险」的提示。
+     * 批次 A 先通过此回调把审计问题交出去（测试断言、后续版本接 UI/落库），
+     * 不落库、不影响生成结果。
+     */
+    private val routeAuditSink: (List<RouteAuditIssue>) -> Unit = {},
 ) {
 
     /**
@@ -472,8 +500,34 @@ class PipelineService(
         ).getOrElse { return Result.failure(it) }
 
         val titleToId = nodes.associate { it.title to it.id }
-        val output = OutputValidators.validateStoryBible(raw, titleToId.keys)
-            .getOrElse { return Result.failure(it) }
+        // 新 Prompt 版本要求每章带因果契约与章节类型（第二轮 P1-2）：
+        // 老模型输出（无契约字段）解析成默认空契约，这里会明确失败而不是伪造通过
+        //
+        // 批次 B++ n=3：路线被强校验拦截的最大失败模式是「REVIEW 章把新节点填进
+        // introducedNodeTitles」。先校验；命中该模式时做一次**针对性修复重试**（只清空
+        // REVIEW 的 introduced 并检查此前引入），修复失败仍如实拦截，不静默降级。
+        val output = ReviewIntroducedFix.repairIfApplicable(
+            router = router,
+            output = raw,
+            decoder = jsonDecoder(StoryBibleOutput.serializer()),
+            validate = { candidate ->
+                OutputValidators.validateStoryBible(
+                    candidate, titleToId.keys, requireContracts = requireChapterContracts(),
+                )
+            },
+            fixFailure = { err -> Result.failure(err) },
+        ).getOrElse { return Result.failure(it) }
+
+        // 路线软审计：前置顺序 / 重复引入 / 范围覆盖 / 负荷 / 类型单一化 / 链连续性（第二轮 P1-5）
+        // 演进链（chains）在批次 A 不落库，链连续性检查暂以空链运行，其余审计项完整生效
+        routeAuditSink(
+            RouteAudit.audit(
+                chapters = output.chapters,
+                nodeTitlesByPrereqs = nodes.associate { it.title to it.prerequisites },
+                allNodeTitles = titleToId.keys,
+                dailyMinutes = project.dailyMinutes,
+            ),
+        )
 
         val plans = output.chapters.mapIndexed { index, chapter ->
             ChapterPlan(
@@ -494,6 +548,9 @@ class PipelineService(
                 volumeIndex = FIRST_VOLUME,
                 volumeTitle = "第一卷",
                 volumeGoal = output.conflict,
+                // 章节类型与因果契约落库（第二轮 P1-2）：正文与核验阶段要用
+                chapterType = chapter.chapterType,
+                contractJson = ContractCodec.encode(chapter.contract),
             )
             // 卷内章数硬上限：模型多给了也只收前 VOLUME_MAX_CHAPTERS 章，
             // 剩下的知识点留给续卷，而不是一次摊平
@@ -638,7 +695,18 @@ class PipelineService(
             knownNodeTitles = titleToId.keys,
             pendingNodeTitles = pendingTitles,
             maxChapters = VOLUME_MAX_CHAPTERS,
+            requireContracts = requireChapterContracts(),
         ).getOrElse { return Result.failure(it) }
+
+        // 续卷同样过一遍路线软审计（第二轮 P1-5）
+        routeAuditSink(
+            RouteAudit.audit(
+                chapters = output.chapters,
+                nodeTitlesByPrereqs = allNodes.associate { it.title to it.prerequisites },
+                allNodeTitles = titleToId.keys,
+                dailyMinutes = project.dailyMinutes,
+            ),
+        )
 
         // order 从现有最大值往后排，绝不与已有章节冲突
         val nextOrder = plans.maxOf { it.order } + 1
@@ -659,6 +727,9 @@ class PipelineService(
                 volumeIndex = newVolume,
                 volumeTitle = chapter.volumeTitleOr(output.volumeTitle, newVolume),
                 volumeGoal = output.volumeGoal,
+                // 续卷章节同样带类型与契约（第二轮 P1-2）
+                chapterType = chapter.chapterType,
+                contractJson = ContractCodec.encode(chapter.contract),
             )
         }
         // 只 upsert 新章节。不 clear 任何东西——这是「往后接」，不是「重新规划」
@@ -678,6 +749,17 @@ class PipelineService(
 
     private fun ChapterPlanDto.volumeTitleOr(fallback: String, volumeIndex: Int): String =
         fallback.ifBlank { "第${volumeIndex + 1}卷" }
+
+    /**
+     * 因果契约的落库/读库编解码（批次 A.1）。
+     *
+     * 落库用 [ContractCodec.encode]（空契约 → 空串）；读库用 [ContractCodec.decode]——
+     * 它区分四种状态：Valid / None（老数据无契约）/ MissingAfterType（声明类型但契约缺失）/
+     * Corrupt（数据损坏）。损坏绝不回退成看似正常的空契约，正文 prompt 与核验计划摘要
+     * 都会显示「契约不可用」，而不是静默按无契约处理。
+     */
+    private fun chapterContractState(plan: ChapterPlan): ContractCodec.State =
+        ContractCodec.decode(plan.contractJson, plan.chapterType)
 
     /**
      * 还没被任何章节安排到、也没有讲过的知识点（3D 起按 nodeId 判断）。
@@ -822,6 +904,9 @@ class PipelineService(
             .replace("{wordTarget}", plan.wordTarget.toString())
             .replace("{runningBudget}", ContextBudget.RUNNING_STATE_LIMIT.toString())
             .replace("{unverifiedSection}", unverifiedSection(modelKnowledge))
+            // 章节类型与因果契约（第二轮 P1-2）：正文必须按契约走拍子
+            .replace("{chapterType}", plan.chapterType.ifBlank { "未指定（按通用顺序写作）" })
+            .replace("{contract}", ContractCodec.describe(chapterContractState(plan)))
 
         val rawOutput = router.generate(
             role = ModelRole.STORY,
@@ -846,6 +931,7 @@ class PipelineService(
             validChunkIds = validChunkIds,
             // 无资料模式没有片段可引，改由核验的待核实清单承担追溯责任（问题3）
             requireSourceRefs = !modelKnowledge,
+            requireNodeLinks = requireBlockNodeLinks(),
         ).getOrElse {
             failAttempt(planId, attempt, it.message ?: "章节内容不合要求", ChapterStatus.FAILED)
             return Result.failure(it)
@@ -1461,6 +1547,18 @@ class PipelineService(
         val body = blocks.joinToString("\n\n") {
             "[blockId: ${it.id}] [type: ${it.blockType.name}]\n${it.text.take(BLOCK_EXCERPT)}"
         }
+        // 计划摘要（第二轮 P1-3）：核验拿着本章「打算讲什么」逐项对正文。
+        // 包含章节类型与因果契约（v15 起落库），核验据此检查契约是否走完、按类型豁免回顾/解释章节
+        val planSummary = buildString {
+            append("本章类型：").appendLine(plan.chapterType.ifBlank { "未指定" })
+            append("本章要走的推演：").appendLine(derivation)
+            if (plan.plotGoal.isNotBlank()) append("本章目标：").appendLine(plan.plotGoal)
+            if (plan.learningGoals.isNotEmpty()) {
+                append("应当想通的问题：").appendLine(plan.learningGoals.joinToString("；"))
+            }
+            if (plan.openingHook.isNotBlank()) append("开头处境：").appendLine(plan.openingHook)
+            append("本章因果契约：").appendLine(ContractCodec.describe(chapterContractState(plan)))
+        }.trim()
 
         // 无资料模式核验的是「推演是否走通 + 有没有编造出处」，而不是「与资料是否一致」（问题3）
         val prompt = if (modelKnowledge) {
@@ -1468,6 +1566,7 @@ class PipelineService(
                 .replace("{topic}", project?.topic.orEmpty())
                 .replace("{derivationChain}", derivation)
                 .replace("{learningGoals}", plan.learningGoals.joinToString("；"))
+                .replace("{chapterPlan}", planSummary)
                 .replace("{nodes}", formatNodesWithDerivation(nodes))
                 .replace("{blocks}", body)
         } else {
@@ -1478,11 +1577,12 @@ class PipelineService(
             prompts.load(PROMPT_VERIFY)
                 .replace("{derivationChain}", derivation)
                 .replace("{learningGoals}", plan.learningGoals.joinToString("；"))
+                .replace("{chapterPlan}", planSummary)
                 .replace("{chunks}", formatChunks(chunks))
                 .replace("{blocks}", body)
         }
 
-        return router.generate(
+        val result = router.generate(
             role = ModelRole.VERIFY,
             request = ModelRequest(
                 role = ModelRole.VERIFY,
@@ -1493,6 +1593,13 @@ class PipelineService(
             ),
             decoder = jsonDecoder(VerificationOutput.serializer()),
         )
+        // contractChecks 轻校验（批次 B 后续）：nodeTitle 为空的条目丢弃；
+        // 不因 checks 结构问题让整个核验失败（旧模型无 checks 完全兼容）
+        if (result.isSuccess) {
+            val output = result.getOrThrow()
+            return Result.success(output.copy(checks = output.checks.filter { it.nodeTitle.isNotBlank() }))
+        }
+        return result
     }
 
     /** 出题使用核验模型，与设置页说明一致（N3） */
@@ -1805,7 +1912,7 @@ class PipelineService(
         sourceMetaCache = sourceRepository.getByProject(projectId).associateBy { it.id }
     }
 
-    /** 节点连带来处与去处一起给模型，推演才接得上（问题2） */
+    /** 节点连带来处、去处与前置一起给模型，推演才接得上（问题2 / 第二轮 P1-4） */
     private fun formatNodesWithDerivation(nodes: List<KnowledgeNode>): String =
         nodes.joinToString("\n") { node ->
             buildString {
@@ -1815,6 +1922,9 @@ class PipelineService(
                 }
                 if (node.leadsTo.isNotBlank()) {
                     append("\n    去处：").append(node.leadsTo.take(NODE_EXCERPT))
+                }
+                if (node.prerequisites.isNotEmpty()) {
+                    append("\n    前置：").append(node.prerequisites.take(4).joinToString("；"))
                 }
                 if (node.confusions.isNotEmpty()) {
                     append("\n    易混：").append(node.confusions.take(3).joinToString("；"))

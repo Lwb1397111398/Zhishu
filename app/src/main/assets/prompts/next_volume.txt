@@ -21,9 +21,13 @@
 ## 规则
 
 1. **接着讲，不要重开。** 新卷第一章的开场必须接得上「上一章结束时的处境」。
-2. **优先覆盖还没讲到的知识点。** 已经讲过的知识点只能作为承接引用，不能再作为本章要走通的目标；
-   如果确实需要重新展开某个讲过的知识点（例如它是新内容的直接前提），必须在 `plotGoal` 里写明复现理由。
-3. **一章一条演进链。** 每章都要有 `derivationChain`：从哪个已经成立的东西出发 → 撞上什么解决不了的问题 → 长出什么新东西。
+2. **优先覆盖还没讲到的知识点。** 已经讲过的知识点只能作为承接引用或进入 `appliedNodeTitles`，
+   不能作为 `introducedNodeTitles` 重新介绍；如果确实需要重新展开某个讲过的知识点
+   （例如它是新内容的直接前提），必须在 `plotGoal` 里写明复现理由。
+3. **一章围绕一条主要推演路径，允许跨链、拆链、合并与回顾。** 每章都要有 `derivationChain`：
+   从哪个已经成立的东西出发 → 撞上什么解决不了的问题 → 长出什么新东西。每个 `chapterType`
+   必须满足该类型的最低要求（INTRODUCE 要有 knowledgeGap 与 resultingChange；APPLY/CONTRAST/ASSESS
+   要有 appliedNodeTitles 与结果；REVIEW 只能引用已学节点，不能伪装首次介绍）。
 4. **章数就是上面给的范围**，不要多给。剩下的知识点留给再下一卷。
 5. **相邻两章咬合。** 后一章的 `openingHook` 必须是前一章 `closingHook` 的落脚点。
 6. 如果「还没讲到的知识点」是空的，说明主线已经讲完了。这时不要硬凑新主线，
@@ -44,7 +48,20 @@
       "derivationChain": "从X出发 → 撞上Y → 长出Z",
       "plotGoal": "这一章要走完的路",
       "learningGoals": ["读完应当想通的问题"],
-      "nodeTitles": ["本章要真的讲透的知识点标题"],
+      "nodeTitles": ["本章涉及的知识点标题"],
+      "chapterType": "INTRODUCE | APPLY | CONTRAST | REVIEW | ASSESS",
+      "contract": {
+        "entryQuestion": "开头面对的具体问题",
+        "priorIntuition": "原本的直觉/旧方法",
+        "obstacle": "遇到的阻碍或矛盾",
+        "knowledgeGap": "感到需要的新解释",
+        "introducedNodeTitles": ["新引入的节点"],
+        "appliedNodeTitles": ["应用的节点"],
+        "requiredBeats": ["必须走到的拍子"],
+        "resultingChange": "知识带来的可观察变化",
+        "bridgeToNext": "交给下一章的问题"
+      },
+      "prerequisiteNodeTitles": ["本章依赖的前置节点标题"],
       "wordTarget": {wordHint},
       "openingHook": "本章从什么具体处境开头",
       "closingHook": "本章结尾留下的那个问题"

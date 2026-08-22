@@ -1,6 +1,7 @@
 package com.example.zhishu
 
 import com.example.zhishu.ai.JsonDecoder
+import com.example.zhishu.ai.ModelCallStats
 import com.example.zhishu.ai.ModelError
 import com.example.zhishu.ai.ModelRequest
 import com.example.zhishu.ai.ModelRouter
@@ -96,6 +97,8 @@ internal class ScriptedRouter : ModelRouter {
         role: ModelRole,
         request: ModelRequest,
         decoder: JsonDecoder<T>,
+        onStats: (ModelCallStats) -> Unit,
+        onAttempt: (com.example.zhishu.ai.CallAttempt) -> Unit,
     ): Result<T> {
         val phase = when {
             request.user.contains("[[MAP_SKELETON]]") ||
@@ -141,9 +144,11 @@ internal class ScriptedRouter : ModelRouter {
             """{"world":"滨海市","characters":[{"name":"林默","role":"主角","description":"律师"}],""" +
                 """"conflict":"遗产纠纷","style":"悬疑","chapters":[""" +
                 """{"order":1,"title":"第一章","plotGoal":"引出遗嘱","learningGoals":["意思表示"],""" +
-                """"nodeTitles":["意思表示"],"wordTarget":1000,"openingHook":"从一封律师函开始"},""" +
+                """"nodeTitles":["意思表示"],"wordTarget":1000,"openingHook":"从一封律师函开始","chapterType":"INTRODUCE",""" +
+                """"contract":{"entryQuestion":"收到遗嘱纠纷的律师函","priorIntuition":"拿到遗嘱就有理","obstacle":"遗嘱真伪存疑","knowledgeGap":"需要判断效力的标准","introducedNodeTitles":["意思表示"],"appliedNodeTitles":[],"requiredBeats":["收到函","引入意思表示","判断效力"],"resultingChange":"重新审视遗嘱效力","bridgeToNext":"遗嘱是否有效"}},""" +
                 """{"order":2,"title":"第二章","plotGoal":"庭审","learningGoals":["意思表示"],""" +
-                """"nodeTitles":["意思表示"],"wordTarget":1000,"openingHook":"庭审当天的清晨"}]}"""
+                """"nodeTitles":["意思表示"],"wordTarget":1000,"openingHook":"庭审当天的清晨","chapterType":"APPLY",""" +
+                """"contract":{"entryQuestion":"法庭上如何判断意思表示","priorIntuition":"按字面理解","obstacle":"表述与内心意思不符","knowledgeGap":"需要判断真实意思的规则","introducedNodeTitles":[],"appliedNodeTitles":["意思表示"],"requiredBeats":["庭审","应用意思表示","作出判决"],"resultingChange":"法庭按真实意思改判","bridgeToNext":"判决的后果"}}]}"""
     }
 }
 

@@ -1,0 +1,14 @@
+{
+ "os": {
+  "A": "new",
+  "B": "legacy"
+ },
+ "sky": {
+  "A": "new",
+  "B": "legacy"
+ },
+ "inheritance": {
+  "A": "new",
+  "B": "legacy"
+ }
+}

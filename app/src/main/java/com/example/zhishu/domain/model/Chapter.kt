@@ -145,6 +145,21 @@ data class ChapterPlan(
      * 为 null 表示这一章还没有任何通过核验的正文。
      */
     val activeVersionId: String? = null,
+    /**
+     * 本章类型（第二轮 P1-2）：INTRODUCE / APPLY / CONTRAST / REVIEW / ASSESS。
+     * 空串 = 未指定（旧数据/旧 Prompt 生成的章节），阅读器据此显示「未生成因果契约」。
+     */
+    @ColumnInfo(defaultValue = "")
+    val chapterType: String = "",
+    /**
+     * 本章因果契约的 JSON（第二轮 P1-2）。
+     *
+     * 路线规划时生成、正文模型按它写、核验模型拿它逐项检查，所以必须落库才能跨
+     * Worker 传递。空串 = 未生成契约（旧数据），读取方明确显示「未生成因果契约」，
+     * 不得伪造一份。内容为 [com.example.zhishu.ai.outputs.ChapterContractDto] 的序列化。
+     */
+    @ColumnInfo(defaultValue = "")
+    val contractJson: String = "",
 ) {
     /** 正文是否已可阅读。测验状态一概不参与判断。 */
     val isReadable: Boolean get() = status.isReadable

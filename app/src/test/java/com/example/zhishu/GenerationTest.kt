@@ -3,6 +3,7 @@ package com.example.zhishu
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.zhishu.ai.JsonDecoder
+import com.example.zhishu.ai.ModelCallStats
 import com.example.zhishu.ai.ModelError
 import com.example.zhishu.ai.ModelRequest
 import com.example.zhishu.ai.ModelRouter
@@ -418,7 +419,7 @@ class GenerationTest {
             """{"chains":[{"theme":"民法演进","opening":"从合同纠纷开始","nodeTitles":["意思表示","民事法律行为"]}],"gaps":[],"conflicts":[]}"""
         var auditJson: String = """{"gaps":[],"conflicts":[]}"""
         var storyBibleJson: String =
-            """{"world":"滨海市","characters":[{"name":"林默","role":"主角","description":"年轻律师"}],"conflict":"遗产继承纠纷","style":"悬疑","chapters":[{"order":1,"title":"第一章 遗嘱风波","plotGoal":"引出遗嘱问题","learningGoals":["意思表示"],"nodeTitles":["意思表示"],"wordTarget":1000}]}"""
+            """{"world":"滨海市","characters":[{"name":"林默","role":"主角","description":"年轻律师"}],"conflict":"遗产继承纠纷","style":"悬疑","chapters":[{"order":1,"title":"第一章 遗嘱风波","plotGoal":"引出遗嘱问题","learningGoals":["意思表示"],"nodeTitles":["意思表示"],"wordTarget":1000,"chapterType":"INTRODUCE","contract":{"entryQuestion":"老人立下遗嘱后子女各执一词","priorIntuition":"谁拿到遗嘱谁说了算","obstacle":"遗嘱真伪存疑","knowledgeGap":"需要判断遗嘱效力的标准","introducedNodeTitles":["意思表示"],"appliedNodeTitles":[],"requiredBeats":["收到律师函","发现遗嘱","引入意思表示","判断效力"],"resultingChange":"子女开始按意思表示规则重新审视遗嘱","bridgeToNext":"遗嘱是否有效"}}]}"""
         var chapterJson: String =
             """{"title":"第一章 遗嘱风波","summary":"老人立下遗嘱后引发纠纷","blocks":[{"type":"STORY","text":"老人立下遗嘱，子女们各怀心思。","knowledgeNodeTitles":["意思表示"],"sourceRefs":["c-1"]},{"type":"EXPLANATION","text":"意思表示是民事法律行为的核心要素。","knowledgeNodeTitles":["意思表示"],"sourceRefs":["c-1"]}]}"""
         var verifyJson: String = """{"issues":[]}"""
@@ -439,6 +440,8 @@ class GenerationTest {
             role: ModelRole,
             request: ModelRequest,
             decoder: JsonDecoder<T>,
+            onStats: (ModelCallStats) -> Unit,
+            onAttempt: (com.example.zhishu.ai.CallAttempt) -> Unit,
         ): Result<T> {
             val text = when {
                 request.user.contains("[[MAP_SKELETON]]") -> {

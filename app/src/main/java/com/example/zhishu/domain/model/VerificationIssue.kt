@@ -46,6 +46,12 @@ enum class IssueType {
     /** 本章该想通的问题没真的被回答，只提了个名字 */
     MISSING,
 
+    /** 概念被讲解但没有被用于判断/行动/排除（契约要求应用时才报，第二轮 P1-3） */
+    NO_APPLICATION,
+
+    /** 人物行动/判断了但没有可观察的结果或后续（行动悬空，第二轮 P1-3） */
+    MISSING_RESULT,
+
     /** 认不出来的类型。原样保留 rawType，不丢 */
     OTHER,
     ;
@@ -60,6 +66,8 @@ enum class IssueType {
             OVERREACH -> "说得过于绝对"
             BROKEN_DERIVATION -> "推演跳步"
             MISSING -> "没讲透"
+            NO_APPLICATION -> "没应用起来"
+            MISSING_RESULT -> "行动没有结果"
             OTHER -> "其他问题"
         }
 
@@ -89,6 +97,12 @@ enum class IssueType {
                 normalized.contains("derivation") || normalized.contains("logic") ||
                     raw.contains("跳步") || raw.contains("推演") || raw.contains("逻辑") ->
                     BROKEN_DERIVATION
+                // 「missing_result」必须先于「missing」匹配，否则会被吞成 MISSING
+                normalized.contains("missingresult") || raw.contains("没有结果") || raw.contains("悬空") ->
+                    MISSING_RESULT
+                normalized.contains("noapplication") || raw.contains("没有应用") ||
+                    raw.contains("没用起来") || raw.contains("没应用") ->
+                    NO_APPLICATION
                 normalized.contains("missing") || raw.contains("没讲") || raw.contains("未回答") ->
                     MISSING
                 else -> OTHER

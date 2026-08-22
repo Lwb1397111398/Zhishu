@@ -28,6 +28,17 @@ private data class ChatCompletionRequest(
     @SerialName("max_tokens") val maxTokens: Int,
     val temperature: Float,
     @SerialName("response_format") val responseFormat: ResponseFormatDto? = null,
+    /**
+     * 推理模型的思考开关（火山 Ark / DeepSeek 等 OpenAI 兼容服务商支持）：
+     * `thinking: {"type":"disabled"}` 把推理模型当普通对话模型用——
+     * 批次 B 样本评估的是契约/路线/核验，不需要长思考；生产默认 null（服务商默认行为）。
+     */
+    val thinking: ThinkingDto? = null,
+)
+
+@Serializable
+private data class ThinkingDto(
+    @SerialName("type") val type: String,
 )
 
 @Serializable
@@ -45,6 +56,15 @@ private data class ResponseFormatDto(
 @Serializable
 private data class ChatCompletionResponse(
     val choices: List<ChoiceDto> = emptyList(),
+    /** token 用量。兼容服务商不返回该字段的情况（第二轮 P1-1） */
+    val usage: UsageDto? = null,
+)
+
+@Serializable
+private data class UsageDto(
+    @SerialName("prompt_tokens") val promptTokens: Long = 0,
+    @SerialName("completion_tokens") val completionTokens: Long = 0,
+    @SerialName("total_tokens") val totalTokens: Long = 0,
 )
 
 @Serializable
@@ -79,10 +99,28 @@ private data class ErrorDetailDto(
 class OpenAiModelProvider(
     private val config: ModelConfig,
     private val apiKey: String,
-    private val client: HttpClient = defaultClient(),
+    clientOverride: HttpClient? = null,
     /** 仅测试用：允许 http 明文地址。生产路径固定为 true，强制 HTTPS（B13） */
     private val requireHttps: Boolean = true,
+    /**
+     * 可配置超时（批次 B 样本用）。生产默认 180s/120s；
+     * 推理模型（doubao-seed/deepseek-r1 等）思考阶段可能长时间无数据，
+     * 会击穿 socket 空闲超时——样本运行器传更长超时，不改变生产默认值。
+     */
+    private val socketTimeoutMillis: Long = 120_000,
+    private val requestTimeoutMillis: Long = 180_000,
+    /**
+     * 关闭推理模型的思考（Ark thinking:disabled）。样本运行器用：
+     * 把 doubao-seed 等推理模型当普通对话模型，避免长思考导致超时与高成本。
+     * 生产默认 false（服务商默认行为）。
+     */
+    private val thinkingDisabled: Boolean = false,
 ) : ModelProvider {
+    init {
+        require(socketTimeoutMillis > 0 && requestTimeoutMillis > 0) { "超时必须是正数" }
+    }
+
+    private val client: HttpClient = clientOverride ?: defaultClient(socketTimeoutMillis, requestTimeoutMillis)
 
     override suspend fun listModels(): Result<List<String>> {
         return try {
@@ -93,7 +131,9 @@ class OpenAiModelProvider(
             }
             if (!response.status.isSuccess()) {
                 // 走同一套错误解释，测试连接时也能看到可行动的中文提示而不是干巴巴的状态码
-                return Result.failure(classify(response.status.value, errorMessage(response), response))
+                return Result.failure(
+                    classify(response.status.value, errorMessage(response.bodyAsText(), response.status.value), response),
+                )
             }
             val models = lenientJson
                 .decodeFromString<ModelsResponse>(response.bodyAsText())
@@ -105,7 +145,11 @@ class OpenAiModelProvider(
         }
     }
 
-    override suspend fun complete(request: ModelRequest): Result<String> {
+    override suspend fun complete(
+        request: ModelRequest,
+        onUsage: (UsageInfo) -> Unit,
+        onRawResponse: (String) -> Unit,
+    ): Result<String> {
         return try {
             val base = requireSecureUrl(config.baseUrl)
             val body = ChatCompletionRequest(
@@ -115,13 +159,16 @@ class OpenAiModelProvider(
                 maxTokens = request.effectiveMaxTokens(config.maxTokens),
                 temperature = request.effectiveTemperature(config.temperature),
                 responseFormat = if (request.jsonMode && config.supportsJson) ResponseFormatDto() else null,
+                thinking = if (thinkingDisabled) ThinkingDto(type = "disabled") else null,
             )
+            val startedAt = System.currentTimeMillis()
             val response = client.post(chatBaseUrl(base)) {
                 header(HttpHeaders.Authorization, "Bearer $apiKey")
                 contentType(ContentType.Application.Json)
                 setBody(body)
             }
-            handleResponse(response)
+            val latencyMillis = System.currentTimeMillis() - startedAt
+            handleResponse(response, latencyMillis, onUsage, onRawResponse)
         } catch (e: ModelError) {
             Result.failure(e)
         } catch (e: Exception) {
@@ -129,19 +176,37 @@ class OpenAiModelProvider(
         }
     }
 
-    private suspend fun handleResponse(response: HttpResponse): Result<String> {
+    private suspend fun handleResponse(
+        response: HttpResponse,
+        latencyMillis: Long,
+        onUsage: (UsageInfo) -> Unit,
+        onRawResponse: (String) -> Unit,
+    ): Result<String> {
+        val text = response.bodyAsText()
+        // 原始响应体先交给调用方（样本运行器保存原始响应；不写入普通日志）
+        onRawResponse(text)
         if (!response.status.isSuccess()) {
-            val raw = errorMessage(response)
+            val raw = errorMessage(text, response.status.value)
             return Result.failure(classify(response.status.value, raw, response))
         }
-        val text = response.bodyAsText()
-        val choice = try {
-            lenientJson
-                .decodeFromString<ChatCompletionResponse>(text)
-                .choices.firstOrNull()
+        val parsed = try {
+            lenientJson.decodeFromString<ChatCompletionResponse>(text)
         } catch (e: Exception) {
             null
         }
+        // 服务商返回了 usage 才上报；解析失败或缺失一律不上报（不伪造用量）
+        parsed?.usage?.let { usage ->
+            onUsage(
+                UsageInfo(
+                    promptTokens = usage.promptTokens,
+                    completionTokens = usage.completionTokens,
+                    totalTokens = usage.totalTokens,
+                    model = config.modelName,
+                    latencyMillis = latencyMillis,
+                ),
+            )
+        }
+        val choice = parsed?.choices?.firstOrNull()
         val content = choice?.message?.content
         if (!content.isNullOrBlank()) return Result.success(content.trim())
 
@@ -167,12 +232,8 @@ class OpenAiModelProvider(
         }
     }
 
-    private suspend fun errorMessage(response: HttpResponse): String {
-        val body = try {
-            response.bodyAsText()
-        } catch (e: Exception) {
-            return "HTTP ${response.status.value}"
-        }
+    private fun errorMessage(body: String, status: Int): String {
+        if (body.isBlank()) return "HTTP $status"
         // 优先取标准 OpenAI 错误结构；取不到就保留原始返回体，
         // 否则像 WPS 这类服务商的自定义错误会被压成一句无信息的「HTTP 403」。
         val parsed = try {
@@ -182,7 +243,7 @@ class OpenAiModelProvider(
         }
         return parsed?.takeIf { it.isNotBlank() }
             ?: body.trim().takeIf { it.isNotBlank() }?.take(ERROR_BODY_LIMIT)
-            ?: "HTTP ${response.status.value}"
+            ?: "HTTP $status"
     }
 
     /**
@@ -263,15 +324,17 @@ class OpenAiModelProvider(
         /** 原始错误体最多保留这么长，避免整页 HTML 灌进提示里 */
         private const val ERROR_BODY_LIMIT = 300
 
-        fun defaultClient(): HttpClient = HttpClient(OkHttp) {
+        fun defaultClient(socketTimeout: Long = 120_000, requestTimeout: Long = 180_000): HttpClient =
+            HttpClient(OkHttp) {
             install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
             install(HttpTimeout) {
                 // 总超时 180 秒：单次 AI 生成本来就可能跑 1-3 分钟（长 JSON 输出），
                 // 收紧到 60 秒会主动杀死正常请求。socketTimeout 是「连续 120 秒无数据」的
                 // 空闲超时——服务端一直在吐就不算超时，彻底挂死才会触发。
-                requestTimeoutMillis = 180_000
+                // 推理模型思考阶段可能长时间无数据，样本运行器可传更长超时。
+                requestTimeoutMillis = requestTimeout
                 connectTimeoutMillis = 20_000
-                socketTimeoutMillis = 120_000
+                socketTimeoutMillis = socketTimeout
             }
         }
     }

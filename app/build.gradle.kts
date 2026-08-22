@@ -53,6 +53,14 @@ android {
         // 本机物理内存紧张时，全量单测请用命令行限并行：
         // ./gradlew.bat testDebugUnitTest --max-workers=1
         unitTests.all { it.maxHeapSize = "1024m" }
+        // 批次 B（B.0-7）：真实模型运行器 SampleRunner 不混入常规测试统计。
+        // 只排除 SampleRunner 类（离线分析测试 SampleSecondaryAnalysisTest 仍参与常规回归）；
+        // 真实调用走专门 task :app:runQualitySamples。
+        unitTests.all { test ->
+            if (test.name == "testDebugUnitTest") {
+                test.exclude("**/samples/SampleRunner*")
+            }
+        }
     }
 
     sourceSets {
@@ -60,6 +68,29 @@ android {
             assets.srcDirs("$projectDir/schemas")
         }
     }
+}
+
+/**
+ * 批次 B：真实模型质量样本（B.0-7）。
+ *
+ * 用法：先设环境变量，再显式运行本 task——
+ *   ZHISHU_SAMPLE_BASE_URL=... ZHISHU_SAMPLE_MODEL=... ZHISHU_SAMPLE_API_KEY=...
+ *   ./gradlew.bat :app:runQualitySamples --max-workers=1
+ *
+ * 只有显式调用本 task 才可能产生真实模型费用；常规 testDebugUnitTest 排除 samples 包，
+ * 且 SampleRunner 内部还有 ZHISHU_RUN_SAMPLES=true 双保险（有 Key 无开关也不运行）。
+ */
+val runQualitySamples by tasks.registering(Test::class) {
+    description = "批次 B：真实模型质量样本（需 ZHISHU_SAMPLE_* 环境变量 + ZHISHU_RUN_SAMPLES=true）"
+    group = "verification"
+    // 复用 testDebugUnitTest 的类路径与输出（AGP 下直接引用 android sourceSets 在 kts 顶层不可靠）
+    testClassesDirs = tasks.named("testDebugUnitTest", Test::class).get().testClassesDirs
+    classpath = tasks.named("testDebugUnitTest", Test::class).get().classpath
+    maxHeapSize = "1024m"
+    filter { includeTestsMatching("com.example.zhishu.samples.*") }
+    systemProperty("ZHISHU_RUN_SAMPLES", "true")
+    // 与常规测试隔离：不并行、不增量缓存（每次样本都要真实调用）
+    outputs.upToDateWhen { false }
 }
 
 dependencies {

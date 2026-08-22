@@ -73,7 +73,7 @@ import kotlinx.serialization.json.Json
         ModelConfig::class,
         StoryBible::class,
     ],
-    version = 14,
+    version = 15,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -816,6 +816,22 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v14 → v15（第二轮 P1-2）：`chapters` 增加 `chapterType` 与 `contractJson`。
+         *
+         * 章节因果契约是路线规划 → 正文生成 → 核验的跨 Worker 传递物，必须落库：
+         * 正文模型按契约写、核验模型拿契约逐项检查。两列都是 TEXT 默认空串——
+         * 旧数据（无契约）读取方明确显示「未生成因果契约」，不伪造。
+         * 空串默认值保证：老备份导入时新列落默认值；新备份导出时默认值字段省略，
+         * 上一版应用也能读（ignoreUnknownKeys）。formatVersion 不升位。
+         */
+        val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE chapters ADD COLUMN chapterType TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE chapters ADD COLUMN contractJson TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
         /** 迁移里手工拼列表时用的 JSON 编解码，与 [Converters] 保持一致 */
         val LIST_JSON = Json
         val LIST_SERIALIZER = ListSerializer(String.serializer())
@@ -836,6 +852,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_11_12,
                     MIGRATION_12_13,
                     MIGRATION_13_14,
+                    MIGRATION_14_15,
                 )
                 .build()
     }

@@ -1,6 +1,7 @@
 package com.example.zhishu
 
 import com.example.zhishu.ai.JsonDecoder
+import com.example.zhishu.ai.ModelCallStats
 import com.example.zhishu.ai.ModelError
 import com.example.zhishu.ai.ModelRequest
 import com.example.zhishu.ai.ModelRouter
@@ -30,6 +31,8 @@ internal class VolumeRouter : ModelRouter {
         role: ModelRole,
         request: ModelRequest,
         decoder: JsonDecoder<T>,
+        onStats: (ModelCallStats) -> Unit,
+        onAttempt: (com.example.zhishu.ai.CallAttempt) -> Unit,
     ): Result<T> {
         val text = when {
             request.user.contains("[[MAP_SKELETON]]") -> SKELETON_JSON
@@ -60,7 +63,8 @@ internal class VolumeRouter : ModelRouter {
             val node = if (order == 1) "继承" else "遗产范围"
             """{"order":$order,"title":"第${order}章","plotGoal":"讲$node","learningGoals":["$node"],""" +
                 """"nodeTitles":["$node"],"wordTarget":1200,"openingHook":"第${order}章的开场",""" +
-                """"closingHook":"第${order}章的口子"}"""
+                """"closingHook":"第${order}章的口子","chapterType":"INTRODUCE",""" +
+                """"contract":{"entryQuestion":"开场问题","priorIntuition":"原有直觉","obstacle":"遇到的阻碍","knowledgeGap":"需要一个新解释","introducedNodeTitles":["$node"],"appliedNodeTitles":[],"requiredBeats":["开场","引入$node","收束"],"resultingChange":"对${node}有了判断","bridgeToNext":"下一个问题"}}"""
         }
         return """{"world":"滨海市","characters":[{"name":"林默","role":"主角","description":"律师"}],""" +
             """"conflict":"遗产纠纷","style":"悬疑","chapters":[$chapters]}"""
@@ -70,7 +74,8 @@ internal class VolumeRouter : ModelRouter {
         val chapters = nextVolumeNodeTitles.mapIndexed { index, title ->
             """{"order":${index + 1},"title":"新卷第${index + 1}章","plotGoal":"讲$title",""" +
                 """"learningGoals":["$title"],"nodeTitles":["$title"],"wordTarget":1200,""" +
-                """"openingHook":"新卷第${index + 1}章的开场","closingHook":"新卷第${index + 1}章的口子"}"""
+                """"openingHook":"新卷第${index + 1}章的开场","closingHook":"新卷第${index + 1}章的口子","chapterType":"INTRODUCE",""" +
+                """"contract":{"entryQuestion":"开场问题","priorIntuition":"原有直觉","obstacle":"遇到的阻碍","knowledgeGap":"需要一个新解释","introducedNodeTitles":["$title"],"appliedNodeTitles":[],"requiredBeats":["开场","引入$title","收束"],"resultingChange":"对${title}有了判断","bridgeToNext":"下一个问题"}}"""
         }.joinToString(",")
         return """{"volumeTitle":"第二卷","volumeGoal":"讲清遗嘱与法定继承的关系","chapters":[$chapters]}"""
     }

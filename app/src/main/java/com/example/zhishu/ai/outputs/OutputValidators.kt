@@ -88,22 +88,135 @@ object OutputValidators {
         return Result.success(output.copy(nodes = nodes, chains = chains))
     }
 
+    /**
+     * 讲述路线校验（第二轮 P1-2 / P1-5 / 批次 A.1）。
+     *
+     * 硬校验：
+     * 1. 有有效章节
+     * 2. 章节引用的知识点**必须存在**（引用不存在的节点 = 凭空讲知识，直接失败）
+     * 3. `chapterType` 非空时必须是五种合法值之一——未知字符串不能静默当作正常章节
+     *    （这条与是否要求契约无关：老数据没有类型=空串放行，非空非法值一律失败）
+     * 4. [requireContracts] 开启时（新 Prompt 版本）：每章必须有因果契约、
+     *    契约引用的节点必须存在、且满足该类型的最低要求（批次 A.1 逐项收紧）
+     *
+     * 不在这里做「一链一章」检查——那是一条应删除的耦合（第二轮 §一.1）：
+     * 地图链解释知识如何推导，章节链是本章实际采用的讲述路径，两者可以不相等。
+     * 拆链、合并、回顾都是合理的教学设计，由 [RouteAudit] 做软审计。
+     */
     fun validateStoryBible(
         output: StoryBibleOutput,
         knownNodeTitles: Set<String>,
+        requireContracts: Boolean = false,
     ): Result<StoryBibleOutput> {
         val chapters = output.chapters.filter { it.title.isNotBlank() }
         if (chapters.isEmpty()) {
             return Result.failure(ModelError.Invalid("讲述路线没有有效章节"))
         }
-        // 至少要有一章能映射到已有知识点，否则整条路线与知识地图脱节
-        val mapped = chapters.count { chapter ->
-            chapter.nodeTitles.any { it.trim() in knownNodeTitles }
+        // 节点存在性：章节引用的知识点必须在地图上（硬校验）
+        val unknown = chapters
+            .flatMap { it.nodeTitles }
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it !in knownNodeTitles }
+            .distinct()
+        if (unknown.isNotEmpty()) {
+            return Result.failure(
+                ModelError.Invalid("章节引用了不存在的知识点：${unknown.take(5).joinToString("、")}"),
+            )
         }
-        if (mapped == 0) {
-            return Result.failure(ModelError.Invalid("章节规划没有任何一章关联到已有知识点"))
+        // 未知章节类型：非空非法值无论是否要求契约都失败（批次 A.1 #1）
+        chapters.forEach { chapter ->
+            val typeName = chapter.chapterType.trim()
+            if (typeName.isNotEmpty() && ChapterType.entries.none { it.name == typeName }) {
+                return Result.failure(
+                    ModelError.Invalid(
+                        "章节「${chapter.title}」声明了未知章节类型「$typeName」（第 ${chapter.order} 章）。" +
+                            "合法值为 INTRODUCE / APPLY / CONTRAST / REVIEW / ASSESS。",
+                    ),
+                )
+            }
+        }
+        if (requireContracts) {
+            chapters.forEach { chapter ->
+                contractViolation(chapter, knownNodeTitles)?.let { return Result.failure(ModelError.Invalid(it)) }
+            }
         }
         return Result.success(output.copy(chapters = chapters))
+    }
+
+    /**
+     * 按章节类型检查因果契约的最低要求（第二轮 P1-2 / 批次 A.1）。
+     *
+     * 批次 A.1 逐项收紧（编号对应执行指令）：
+     * #2 契约引用的节点必须存在；
+     * #3 INTRODUCE 至少一个有效新引入节点；
+     * #4 APPLY 的应用节点不能全部都是首次引入节点（「应用已有概念」的前提不成立）；
+     * #5 CONTRAST 至少两个可区分的概念；
+     * #6 REVIEW 不能把节点列入 introduced，空契约不算已完成回顾；
+     * #7 ASSESS 必须声明被检验节点并有案例步骤。
+     *
+     * 注意边界：APPLY 的「正文真的应用了知识」由核验阶段判断（no_application），
+     * 这里只校验模型的**声明**，不越权替核验下结论。
+     */
+    private fun contractViolation(chapter: ChapterPlanDto, knownNodeTitles: Set<String>): String? {
+        if (chapter.contract.isEmpty) {
+            return "章节「${chapter.title}」缺少因果契约（第 ${chapter.order} 章）。" +
+                "新版本路线必须为每一章生成契约，否则无法保证因果结构。"
+        }
+        val type = ChapterType.entries.firstOrNull { it.name == chapter.chapterType.trim() }
+        if (type == null) {
+            return "章节「${chapter.title}」没有声明章节类型（第 ${chapter.order} 章）。" +
+                "必须为 INTRODUCE / APPLY / CONTRAST / REVIEW / ASSESS 之一。"
+        }
+        val c = chapter.contract
+        // 契约引用的节点必须存在（批次 A.1 #2）
+        val contractTitles = (c.introducedNodeTitles + c.appliedNodeTitles)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+        val unknownInContract = contractTitles.filter { it !in knownNodeTitles }.distinct()
+        if (unknownInContract.isNotEmpty()) {
+            return "章节「${chapter.title}」的契约引用了不存在的知识点：" +
+                "${unknownInContract.take(5).joinToString("、")}（第 ${chapter.order} 章）"
+        }
+        // 有效节点（存在于地图上的去重标题）
+        val effectiveNodes = contractTitles.filter { it in knownNodeTitles }.distinct()
+        val introduced = c.introducedNodeTitles.map { it.trim() }.filter { it in knownNodeTitles }.toSet()
+        val applied = c.appliedNodeTitles.map { it.trim() }.filter { it in knownNodeTitles }.toSet()
+        return when (type) {
+            ChapterType.INTRODUCE -> when {
+                c.knowledgeGap.isBlank() -> "INTRODUCE 章节「${chapter.title}」缺少 knowledgeGap（读者必须感到缺一块解释）"
+                c.resultingChange.isBlank() -> "INTRODUCE 章节「${chapter.title}」缺少 resultingChange（新概念必须带来可观察变化）"
+                introduced.isEmpty() -> "INTRODUCE 章节「${chapter.title}」没有有效的 introducedNodeTitles（至少一个存在的新引入节点）"
+                else -> null
+            }
+            ChapterType.APPLY -> when {
+                applied.isEmpty() -> "APPLY 章节「${chapter.title}」没有列出有效的 appliedNodeTitles（必须应用已有概念）"
+                c.resultingChange.isBlank() -> "APPLY 章节「${chapter.title}」缺少 resultingChange（应用必须带来可观察结果）"
+                // 应用节点全部都是本章首次引入 → 「应用已有概念」不成立（批次 A.1 #4）
+                applied.isNotEmpty() && applied.all { it in introduced } ->
+                    "APPLY 章节「${chapter.title}」的应用节点全是本章首次引入的节点——" +
+                        "「应用已有概念」的前提不成立，至少需要一个先前章节引入过的节点"
+                else -> null
+            }
+            ChapterType.CONTRAST -> when {
+                c.obstacle.isBlank() -> "CONTRAST 章节「${chapter.title}」缺少 obstacle（必须摆出容易混的点）"
+                c.resultingChange.isBlank() -> "CONTRAST 章节「${chapter.title}」缺少 resultingChange（必须给出区分后的结果）"
+                // 至少两个需要区分的概念（批次 A.1 #5）
+                effectiveNodes.size < 2 -> "CONTRAST 章节「${chapter.title}」的可区分概念不足两个（当前 ${effectiveNodes.size} 个）——" +
+                    "辨析必须有至少两个对象"
+                else -> null
+            }
+            ChapterType.REVIEW -> when {
+                c.introducedNodeTitles.isNotEmpty() -> "REVIEW 章节「${chapter.title}」把新知识点标成了 introducedNodeTitles——回顾章节不能伪装成首次介绍"
+                applied.isEmpty() -> "REVIEW 章节「${chapter.title}」没有列出有效的 appliedNodeTitles（回顾必须引用已学节点）"
+                else -> null
+            }
+            ChapterType.ASSESS -> when {
+                applied.isEmpty() -> "ASSESS 章节「${chapter.title}」没有列出有效的 appliedNodeTitles（必须声明被检验的节点）"
+                c.requiredBeats.isEmpty() -> "ASSESS 章节「${chapter.title}」没有 requiredBeats（案例推演至少需要一个判断目标/步骤）"
+                c.resultingChange.isBlank() -> "ASSESS 章节「${chapter.title}」缺少 resultingChange（案例必须给出判断结果）"
+                else -> null
+            }
+        }
     }
 
     /**
@@ -118,6 +231,7 @@ object OutputValidators {
         knownNodeTitles: Set<String>,
         pendingNodeTitles: Set<String>,
         maxChapters: Int,
+        requireContracts: Boolean = false,
     ): Result<NextVolumeOutput> {
         val chapters = output.chapters.filter { it.title.isNotBlank() }.take(maxChapters)
         if (chapters.isEmpty()) {
@@ -134,6 +248,33 @@ object OutputValidators {
                 ModelError.Invalid("续卷规划全是已经讲过的知识点，没有推进主线"),
             )
         }
+        // 节点存在性（与首次规划同一套硬校验）
+        val unknown = chapters
+            .flatMap { it.nodeTitles }
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it !in knownNodeTitles }
+            .distinct()
+        if (unknown.isNotEmpty()) {
+            return Result.failure(
+                ModelError.Invalid("续卷章节引用了不存在的知识点：${unknown.take(5).joinToString("、")}"),
+            )
+        }
+        // 未知章节类型：非空非法值无论是否要求契约都失败（批次 A.1 #1）
+        chapters.forEach { chapter ->
+            val typeName = chapter.chapterType.trim()
+            if (typeName.isNotEmpty() && ChapterType.entries.none { it.name == typeName }) {
+                return Result.failure(
+                    ModelError.Invalid(
+                        "续卷章节「${chapter.title}」声明了未知章节类型「$typeName」。",
+                    ),
+                )
+            }
+        }
+        if (requireContracts) {
+            chapters.forEach { chapter ->
+                contractViolation(chapter, knownNodeTitles)?.let { return Result.failure(ModelError.Invalid(it)) }
+            }
+        }
         return Result.success(output.copy(chapters = chapters))
     }
 
@@ -142,6 +283,13 @@ object OutputValidators {
         knownNodeTitles: Set<String>,
         validChunkIds: Set<String>,
         requireSourceRefs: Boolean = true,
+        /**
+         * 是否强制知识讲解段落关联既有知识点（生产 true）。
+         * 批次 B 样本发现部分模型（如 doubao-seed）正文块不填 knowledgeNodeTitles，
+         * 全空会拦截整章——样本运行器传 false 让链路跑通以评估其余环节，
+         * 该质量问题作为样本发现记录，不改变生产默认。
+         */
+        requireNodeLinks: Boolean = true,
     ): Result<ChapterOutput> {
         val blocks = output.blocks.filter { it.text.isNotBlank() }
         if (blocks.isEmpty()) {
@@ -156,7 +304,7 @@ object OutputValidators {
         val unmapped = knowledgeBlocks.filter { block ->
             block.knowledgeNodeTitles.none { it.trim() in knownNodeTitles }
         }
-        if (knowledgeBlocks.isNotEmpty() && unmapped.size == knowledgeBlocks.size) {
+        if (requireNodeLinks && knowledgeBlocks.isNotEmpty() && unmapped.size == knowledgeBlocks.size) {
             return Result.failure(ModelError.Invalid("章节的知识讲解段落没有关联到任何既有知识点"))
         }
         // 引用不在这里过滤（4A）。

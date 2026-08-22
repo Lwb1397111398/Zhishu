@@ -1,0 +1,18 @@
+{
+ "reveal": {
+  "os": {
+   "A": "new",
+   "B": "legacy"
+  },
+  "sky": {
+   "A": "new",
+   "B": "legacy"
+  },
+  "inheritance": {
+   "A": "new",
+   "B": "legacy"
+  }
+ },
+ "newAvg": 42.833333333333336,
+ "legacyAvg": 35.0
+}

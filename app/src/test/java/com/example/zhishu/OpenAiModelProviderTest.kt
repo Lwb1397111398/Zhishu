@@ -3,6 +3,7 @@ package com.example.zhishu
 import com.example.zhishu.ai.ModelError
 import com.example.zhishu.ai.ModelRequest
 import com.example.zhishu.ai.OpenAiModelProvider
+import com.example.zhishu.ai.UsageInfo
 import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ModelRole
 import kotlinx.coroutines.runBlocking
@@ -250,5 +251,44 @@ class OpenAiModelProviderTest {
         val recorded = server.takeRequest().body.readUtf8()
         assertTrue(recorded.contains("\"max_tokens\":500"))
         assertTrue(recorded.contains("\"temperature\":0.0"))
+    }
+
+    // ---- 第二轮 P1-1：usage 接收 ----
+
+    /** 服务商返回 usage 时必须解析并上报（业务成本统计的第一步） */
+    @Test
+    fun complete_withUsage_reportsParsedUsage() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"choices":[{"message":{"content":"{\"ok\":true}"}}],""" +
+                    """"usage":{"prompt_tokens":120,"completion_tokens":45,"total_tokens":165}}""",
+            ),
+        )
+        var captured: UsageInfo? = null
+        val result = provider().complete(request(), onUsage = { usage -> captured = usage })
+        assertTrue(result.isSuccess)
+        assertTrue("usage 必须被回调", captured != null)
+        assertEquals(120L, captured!!.promptTokens)
+        assertEquals(45L, captured!!.completionTokens)
+        assertEquals(165L, captured!!.totalTokens)
+        assertEquals("test-model", captured!!.model)
+        assertTrue("必须测量到耗时", captured!!.latencyMillis >= 0)
+    }
+
+    /** 服务商不返回 usage 时不能失败，也不能伪造用量 */
+    @Test
+    fun complete_withoutUsage_doesNotFailAndDoesNotFabricate() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody("""{"choices":[{"message":{"content":"ok"}}]}"""),
+        )
+        var calls = 0
+        var captured: UsageInfo? = null
+        val result = provider().complete(request(), onUsage = { usage ->
+            calls++
+            captured = usage
+        })
+        assertTrue(result.isSuccess)
+        assertEquals("没有 usage 时不得回调", 0, calls)
+        assertEquals(null, captured)
     }
 }

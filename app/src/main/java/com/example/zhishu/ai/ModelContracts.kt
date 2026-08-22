@@ -1,6 +1,8 @@
 package com.example.zhishu.ai
 
 import com.example.zhishu.domain.model.ModelRole
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 
 data class ChatMessage(
     val role: String,
@@ -29,10 +31,130 @@ data class ModelRequest(
     fun effectiveTemperature(configured: Float): Float = temperature ?: configured
 }
 
+/**
+ * 一次模型调用的 token 用量与元数据（第二轮 P1-1）。
+ *
+ * 服务商返回 `usage` 时才有真实值；不返回（或解析失败）时全为 0，
+ * 调用方据此区分「没有用量数据」与「用量确实是 0」。
+ */
+@Serializable
+data class UsageInfo(
+    @SerialName("prompt_tokens") val promptTokens: Long = 0,
+    @SerialName("completion_tokens") val completionTokens: Long = 0,
+    @SerialName("total_tokens") val totalTokens: Long = 0,
+    /** 实际响应本次调用的模型名（有 usage 的服务商才拿得到） */
+    val model: String = "",
+    /** 本次 HTTP 调用耗时（毫秒），由客户端测量 */
+    val latencyMillis: Long = 0,
+) {
+    companion object {
+        val NONE = UsageInfo()
+    }
+}
+
+/**
+ * 一次「业务生成」按类别累计的模型调用统计（第二轮 P1-1）。
+ *
+ * 统计口径必须分层，否则无法解释成本来源：
+ * - [business]：第一次业务调用
+ * - [retry]：可重试错误（网络/限流/5xx）退避后重试的调用
+ * - [repair]：JSON 修复调用（不算在业务调用里，也不归入重试）
+ *
+ * [total] 是三者之和。取消或异常路径不会调用 [add]，因此不会伪造用量。
+ */
+class ModelCallStats {
+
+    enum class Kind { BUSINESS, RETRY, REPAIR }
+
+    var business: UsageInfo = UsageInfo.NONE
+        private set
+    var retry: UsageInfo = UsageInfo.NONE
+        private set
+    var repair: UsageInfo = UsageInfo.NONE
+        private set
+
+    val total: UsageInfo
+        get() = UsageInfo(
+            promptTokens = business.promptTokens + retry.promptTokens + repair.promptTokens,
+            completionTokens = business.completionTokens + retry.completionTokens + repair.completionTokens,
+            totalTokens = business.totalTokens + retry.totalTokens + repair.totalTokens,
+            model = business.model.ifBlank { retry.model }.ifBlank { repair.model },
+            latencyMillis = business.latencyMillis + retry.latencyMillis + repair.latencyMillis,
+        )
+
+    fun add(kind: Kind, usage: UsageInfo) {
+        if (usage.totalTokens <= 0) return
+        when (kind) {
+            Kind.BUSINESS -> business = merge(business, usage)
+            Kind.RETRY -> retry = merge(retry, usage)
+            Kind.REPAIR -> repair = merge(repair, usage)
+        }
+    }
+
+    private fun merge(a: UsageInfo, b: UsageInfo): UsageInfo = UsageInfo(
+        promptTokens = a.promptTokens + b.promptTokens,
+        completionTokens = a.completionTokens + b.completionTokens,
+        totalTokens = a.totalTokens + b.totalTokens,
+        model = a.model.ifBlank { b.model },
+        latencyMillis = a.latencyMillis + b.latencyMillis,
+    )
+}
+
 interface ModelProvider {
     suspend fun listModels(): Result<List<String>>
-    suspend fun complete(request: ModelRequest): Result<String>
+
+    /**
+     * 完成一次模型调用（一次 HTTP 尝试）。
+     *
+     * [onUsage] 在成功响应且服务商返回用量信息时回调（缺失时不回调）；
+     * [onRawResponse] 在拿到 HTTP 响应体后回调**原始响应全文**（批次 B 样本需要保存原始响应，
+     * 用来核对 usage/finish_reason 与重放）。响应体可能含资料原文，调用方自行决定是否落盘。
+     */
+    suspend fun complete(
+        request: ModelRequest,
+        onUsage: (UsageInfo) -> Unit = {},
+        onRawResponse: (String) -> Unit = {},
+    ): Result<String>
 }
+
+/**
+ * 一次 HTTP 尝试（批次 B B.0-5）。
+ *
+ * 与 [ModelCallStats] 的差别：stats 是**按类别汇总**的业务成本口径；
+ * 这里是一条记录 = 一次实际发出的请求（含失败的尝试），用于样本审计。
+ * 口径（执行指令）：
+ * - 首次请求失败且无 usage → [UsageStatus.MISSING]，不当作 0；
+ * - 重试成功后首次失败记录不消失（每条 attempt 独立成行）；
+ * - JSON 修复用 [AttemptKind.JSON_REPAIR] 并通过 [businessCallId] 关联原业务调用；
+ * - HTTP 失败可能已产生服务商费用，无法确认时 [UsageStatus.MISSING] + 保留 errorCategory；
+ * - 汇总时 usage 缺失次数单独统计，不能用零填充。
+ */
+data class CallAttempt(
+    /** 一次业务生成（一次 ModelRouter.generate）的标识，JSON 修复用它关联原调用 */
+    val businessCallId: String,
+    /** 本条记录是这次业务生成的第几次 HTTP 尝试（1 起） */
+    val attempt: Int,
+    /** BUSINESS=首次业务调用；RETRY=可重试错误后的重试；JSON_REPAIR=修复调用 */
+    val kind: AttemptKind,
+    /** 服务商实际报告的用量；缺失时全 0 且 [usageStatus] = MISSING */
+    val usage: UsageInfo = UsageInfo.NONE,
+    /** REPORTED=服务商报告了 usage；MISSING=请求发出但服务商未报告；NOT_APPLICABLE=请求未发出 */
+    val usageStatus: UsageStatus,
+    /** 本条 HTTP 尝试开始时间（epoch 毫秒） */
+    val startedAt: Long,
+    val latencyMillis: Long,
+    val outcome: AttemptOutcome,
+    /** ModelError 类名（Auth/RateLimited/Server/Network/Decode/...），成功为 null */
+    val errorCategory: String? = null,
+    /** 原始响应体（含 usage/finish_reason）。样本运行器写入 artifacts，不写进普通日志 */
+    val rawResponse: String? = null,
+)
+
+enum class AttemptKind { BUSINESS, RETRY, JSON_REPAIR }
+
+enum class UsageStatus { REPORTED, MISSING, NOT_APPLICABLE }
+
+enum class AttemptOutcome { SUCCESS, FAILED }
 
 interface JsonDecoder<T> {
     fun decode(text: String): T
@@ -43,6 +165,10 @@ interface ModelRouter {
         role: ModelRole,
         request: ModelRequest,
         decoder: JsonDecoder<T>,
+        /** 本次业务生成结束后回调按类别累计的调用统计（第二轮 P1-1），不传则不统计 */
+        onStats: (ModelCallStats) -> Unit = {},
+        /** 每次 HTTP 尝试回调一条记录（批次 B B.0-5），不传则不记录 */
+        onAttempt: (CallAttempt) -> Unit = {},
     ): Result<T>
 }
 

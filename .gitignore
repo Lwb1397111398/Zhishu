@@ -41,3 +41,5 @@ test-classpath.txt
 
 # 本地工作记忆（不进仓库）
 .workbuddy/
+samples/runs/
+_archive_20260822/

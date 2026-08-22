@@ -22,9 +22,11 @@ class ConfiguredModelRouter(
         role: ModelRole,
         request: ModelRequest,
         decoder: JsonDecoder<T>,
+        onStats: (ModelCallStats) -> Unit,
+        onAttempt: (CallAttempt) -> Unit,
     ): Result<T> {
         val provider = resolveProvider(role).getOrElse { return Result.failure(it) }
-        return DefaultModelRouter(provider).generate(role, request, decoder)
+        return DefaultModelRouter(provider).generate(role, request, decoder, onStats, onAttempt)
     }
 
     /** 设置页连通性测试用：拉取模型列表（B18） */
