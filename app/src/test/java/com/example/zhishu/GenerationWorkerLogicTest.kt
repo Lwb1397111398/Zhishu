@@ -19,25 +19,39 @@ import org.junit.Test
 /** Worker 的阶段筛选与异常分类（B3/B4/B5） */
 class GenerationWorkerLogicTest {
 
-    private fun plan(id: String, order: Int, status: ChapterStatus) = ChapterPlan(
-        id = id,
-        projectId = "p-1",
-        order = order,
-        title = "第 $order 章",
-        status = status,
-    )
+    private fun plan(id: String, order: Int, status: ChapterStatus, activeVersionId: String? = null) =
+        ChapterPlan(
+            id = id,
+            projectId = "p-1",
+            order = order,
+            title = "第 $order 章",
+            status = status,
+            activeVersionId = activeVersionId,
+        )
 
     @Test
-    fun selectChapters_skipsPublishedAndNeedsReviewByDefault() {
+    fun selectChapters_skipsPublishedAndReviewedWithBodyByDefault() {
         val plans = listOf(
             plan("c3", 3, ChapterStatus.QUEUED),
             plan("c1", 1, ChapterStatus.PUBLISHED),
-            plan("c2", 2, ChapterStatus.NEEDS_REVIEW),
+            // 带问题发布的待复核（有可读正文）：默认不动，等用户复核
+            plan("c2", 2, ChapterStatus.NEEDS_REVIEW, activeVersionId = "v-2"),
             plan("c4", 4, ChapterStatus.QUIZ_FAILED),
             plan("c5", 5, ChapterStatus.FAILED),
         )
         val selected = selectChaptersToGenerate(plans, includeNeedsReview = false)
         assertEquals(listOf("c3", "c5"), selected.map { it.id })
+    }
+
+    /** 待复核但没有任何可读正文（版本已作废的空壳）＝ 没写完，照常进批量 */
+    @Test
+    fun selectChapters_includesNeedsReviewWithoutReadableBody() {
+        val plans = listOf(
+            plan("c1", 1, ChapterStatus.NEEDS_REVIEW, activeVersionId = null),
+            plan("c2", 2, ChapterStatus.NEEDS_REVIEW, activeVersionId = "v-2"),
+        )
+        val selected = selectChaptersToGenerate(plans, includeNeedsReview = false)
+        assertEquals(listOf("c1"), selected.map { it.id })
     }
 
     /**

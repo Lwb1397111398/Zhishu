@@ -166,39 +166,45 @@ class ChapterVersioningTest {
         assertEquals("", plan?.verificationNote)
     }
 
-    /** 要求 3：新版本核验失败，activeVersionId 不变，章节不被改成 NEEDS_REVIEW */
+    /** 带问题发布的重生成：新版本成为 active（可读可复核），旧版本归档而不是作废 */
     @Test
-    fun verificationFailure_keepsActiveVersionAndReadableChapter() = runBlocking {
+    fun regenerationWithIssues_publishesNewVersionAndMarksNeedsReview() = runBlocking {
         val planId = firstPublishedChapter()
         val oldVersionId = activeVersionId(planId)
-        val oldText = activeText(planId)
 
         router.verifyJson =
             """{"issues":[{"type":"contradiction","blockId":"id-9","message":"与资料矛盾","sourceRefs":["c-1"],"suggestedFix":"改"}]}"""
         router.chapterJson = router.chapterJson.replace("老人立下遗嘱，子女各怀心思。", "有问题的新开头。")
-        assertTrue(pipeline.generateChapter("p-1", planId).isFailure)
+        // 问题不再判整章失败：新正文发布，章节标待复核等用户处理
+        assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
 
         val plan = db.chapterPlanDao().getById(planId)
-        assertEquals(oldVersionId, plan?.activeVersionId)
-        assertEquals(ChapterStatus.PUBLISHED, plan?.status)
-        assertEquals(oldText, activeText(planId))
-        val abandoned = db.chapterVersionDao().getByChapter(planId).single { it.id != oldVersionId }
-        assertEquals(ChapterVersionStatus.ABANDONED, abandoned.status)
-        assertTrue(abandoned.verificationNote.contains("与资料矛盾"))
+        assertNotEquals(oldVersionId, plan?.activeVersionId)
+        assertEquals(ChapterStatus.NEEDS_REVIEW, plan?.status)
+        val newVersion = db.chapterVersionDao().getById(plan?.activeVersionId.orEmpty())!!
+        assertEquals(ChapterVersionStatus.PUBLISHED, newVersion.status)
+        assertTrue(newVersion.verificationNote.contains("与资料矛盾"))
+        // 旧版本归档（它成功过、读者读过它），不是作废
+        assertEquals(
+            ChapterVersionStatus.ARCHIVED,
+            db.chapterVersionDao().getById(oldVersionId)?.status,
+        )
     }
 
-    /** 没有旧版本可读时，核验失败仍然要拦住发布并标 NEEDS_REVIEW（解耦没放过真正的正文问题） */
+    /** 核验发现问题且没有旧正文可保：正文照常发布（可读），章节标待复核 */
     @Test
-    fun verificationFailure_withoutOldVersion_marksNeedsReview() = runBlocking {
+    fun verificationIssues_firstGeneration_publishesBodyAndMarksNeedsReview() = runBlocking {
         val planId = seedThroughBible()
         router.verifyJson =
             """{"issues":[{"type":"contradiction","blockId":"id-9","message":"与资料矛盾","sourceRefs":["c-1"],"suggestedFix":"改"}]}"""
-        assertTrue(pipeline.generateChapter("p-1", planId).isFailure)
+        assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
 
         val plan = db.chapterPlanDao().getById(planId)
         assertEquals(ChapterStatus.NEEDS_REVIEW, plan?.status)
-        assertFalse(plan?.isReadable == true)
-        assertNull(plan?.activeVersionId)
+        // 与旧流程的本质区别：版本不再作废——「待复核」复核的是读得到的正文
+        val active = db.chapterVersionDao().getActive(planId)
+        assertEquals(ChapterVersionStatus.PUBLISHED, active?.status)
+        assertEquals(active?.id, plan?.activeVersionId)
     }
 
     /** 要求 5 + 8 + 10：核验通过后原子切换；旧版本 blocks 保留；两版 blockId 不同 */

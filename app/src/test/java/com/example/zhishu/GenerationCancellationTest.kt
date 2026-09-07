@@ -253,19 +253,22 @@ class GenerationCancellationTest {
         assertTrue(db.chapterVersionDao().getActive(planId)?.endingState.orEmpty().isNotBlank())
     }
 
-    /** 正文核验不过时仍然是 NEEDS_REVIEW，解耦没有把真正的正文问题也放过 */
+    /** 核验发现问题：正文照常发布（可读）、章节标待复核；出题照走，批量链条不断 */
     @Test
-    fun verificationIssues_stillBlockPublish() = runBlocking {
+    fun verificationIssues_publishBodyAndMarkNeedsReview() = runBlocking {
         val planId = seedThroughBible()
         router.verifyJson =
             """{"issues":[{"type":"contradiction","blockId":"b-1","message":"与资料矛盾","sourceRefs":["c-1"],"suggestedFix":"改"}]}"""
 
-        assertTrue(pipeline.generateChapter("p-1", planId).isFailure)
+        // 问题不再是整章失败：生成返回成功，链条继续
+        assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
         val plan = db.chapterPlanDao().getById(planId)
         assertEquals(ChapterStatus.NEEDS_REVIEW, plan?.status)
-        assertFalse(plan?.isReadable == true)
-        // 没走到出题
-        assertFalse(ScriptedRouter.Phase.QUIZ in router.calls)
+        // 正文真的发布了：activeVersion 存在（块挂在它上面，读者打开就能读）
+        val active = db.chapterVersionDao().getActive(planId)
+        assertTrue(active != null)
+        // 出题照走：题出在已发布的正文上
+        assertTrue(ScriptedRouter.Phase.QUIZ in router.calls)
     }
 
     /** 建到「有知识地图 + 有章节规划」为止，返回第一章的 ID */

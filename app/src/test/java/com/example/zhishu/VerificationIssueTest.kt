@@ -14,6 +14,7 @@ import com.example.zhishu.data.local.repo.DefaultReviewRepository
 import com.example.zhishu.data.local.repo.DefaultSourceRepository
 import com.example.zhishu.data.local.repo.DefaultStoryBibleRepository
 import com.example.zhishu.data.local.repo.DefaultVerificationIssueRepository
+import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.CitationStatus
 import com.example.zhishu.domain.model.IssueResolution
@@ -120,10 +121,12 @@ class VerificationIssueTest {
                 issue("fabrication", blocks[1], "编了一个不存在的条文号"),
             )
         }
-        assertTrue(pipeline.generateChapter("p-1", planId).isFailure)
+        // 问题不再是整章失败：正文发布（可读），自动修复（定位到 2 个真实块）重写一轮
+        // 后重新核验仍报问题 → 草稿作废，章节标待复核
+        assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
 
-        // 六条一条不少（原来第 6 条会被 take(5) 吃掉）
-        val version = db.chapterVersionDao().getByChapter(planId).single()
+        // 六条一条不少（原来第 6 条会被 take(5) 吃掉），都挂在发布出去的版本上
+        val version = db.chapterVersionDao().getActive(planId)!!
         val issues = db.verificationIssueDao().getByVersion(version.id)
         assertEquals(6, issues.size)
 
@@ -157,7 +160,8 @@ class VerificationIssueTest {
         router.verifyJson = issuesJson(
             issue("contradiction", "根本不存在的块", "说错了"),
         )
-        assertTrue(pipeline.generateChapter("p-1", planId).isFailure)
+        // 定位不到块 → 章级问题，自动修复无从下手；正文照常发布，章节待复核
+        assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
 
         val version = db.chapterVersionDao().getByChapter(planId).single()
         val issue = db.verificationIssueDao().getByVersion(version.id).single()
@@ -183,7 +187,9 @@ class VerificationIssueTest {
                 issue("broken_derivation", null, "全章推演在中段断了一次"),
             )
         }
-        assertTrue(pipeline.generateChapter("p-1", planId).isFailure)
+        // 定位到 1 个真实块 → 自动修复跑一轮；重新核验仍报同样的问题 → 草稿作废，
+        // 章节标待复核。正文发布（可读），说明写在章节行的核验说明里
+        assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
 
         val note = db.chapterPlanDao().getById(planId)?.verificationNote.orEmpty()
         // 概览：几条、涉及几段、能不能只改那几段
@@ -205,14 +211,61 @@ class VerificationIssueTest {
                 *Array(7) { index -> issue("contradiction", blocks[0], "问题$index") },
             )
         }
-        assertTrue(pipeline.generateChapter("p-1", planId).isFailure)
+        // 七条都在同一个真实块上 → 自动修复跑一轮、修不动 → 发布 + 待复核
+        assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
 
         val note = db.chapterPlanDao().getById(planId)?.verificationNote.orEmpty()
         assertTrue(note.contains("7 个问题"))
         assertTrue(note.contains("还有 4 条"))
-        // 七条全在表里，一条不丢——这才是 4B 的重点
-        val version = db.chapterVersionDao().getByChapter(planId).single()
+        // 七条全在表里，一条不丢——这才是 4B 的重点（都挂在发布的版本上）
+        val version = db.chapterVersionDao().getActive(planId)!!
         assertEquals(7, db.verificationIssueDao().getByVersion(version.id).size)
+    }
+
+    /**
+     * 自动修复的**成功**路径：问题定位到真实块 → 发布后自动重写这几块 →
+     * 重新核验干净 → 修复版原子发布，旧问题标已修，章节回到「已发布」。
+     *
+     * 这条是「核验发现问题 ≠ 整章失败」的正面样本：用户什么都不用做，
+     * 第二次核验干净的那一版就是最终正文。
+     */
+    @Test
+    fun autoRepair_rewritesAffectedBlocks_andPublishesWhenClean() = runBlocking {
+        val planId = seedThroughBible()
+        var verifyCall = 0
+        router.onPhase = { phase ->
+            if (phase == ScriptedRouter.Phase.VERIFY) {
+                val versionId = db.chapterVersionDao().getByChapter(planId).last().id
+                val blockIds = db.chapterBlockDao().getByVersion(versionId).map { it.id }
+                verifyCall += 1
+                router.verifyJson = if (verifyCall == 1) {
+                    // 第一次核验：两个真实块各有一条问题 → 触发自动修复
+                    issuesJson(
+                        issue("contradiction", blockIds[0], "继承顺序说错了"),
+                        issue("citation_error", blockIds[1], "这段引的片段不支持这句话"),
+                    )
+                } else {
+                    // 修复后的重新核验：干净
+                    """{"issues":[]}"""
+                }
+            }
+        }
+        assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
+
+        val plan = db.chapterPlanDao().getById(planId)
+        // 修复版发布，章节状态回到已发布——不需要用户介入
+        assertEquals(ChapterStatus.PUBLISHED, plan?.status)
+        val versions = db.chapterVersionDao().getByChapter(planId)
+        assertEquals(2, versions.size)
+        val published = versions.single { it.status == ChapterVersionStatus.PUBLISHED }
+        assertEquals(published.id, plan?.activeVersionId)
+        // 旧版本（带问题的那一版）归档而不是作废，它的问题全部标已修
+        val superseded = versions.single { it.status == ChapterVersionStatus.ARCHIVED }
+        val oldIssues = db.verificationIssueDao().getByVersion(superseded.id)
+        assertEquals(2, oldIssues.size)
+        assertTrue(oldIssues.all { it.resolution == IssueResolution.FIXED })
+        // 修复版上没有问题记录
+        assertTrue(db.verificationIssueDao().getByVersion(published.id).isEmpty())
     }
 
     // --- 局部重写 ---

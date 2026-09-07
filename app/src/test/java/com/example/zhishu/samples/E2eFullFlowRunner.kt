@@ -240,18 +240,20 @@ class E2eFullFlowRunner {
                     println("[E2E] 步骤 3/4 第 ${i + 1} 章正文生成中（${plan.title}）…")
                     val chResult = pipeline.generateChapter(projectId, plan.id) { p -> println("[E2E]   · ${p.name}") }
                     val chMillis = System.currentTimeMillis() - t0
-                    // 含被废弃版本：核验发现问题后版本会被 abandon，正文仍在库里
+                    // 含被废弃版本：自动修复失败的草稿会被 abandon，正文仍在库里
                     val blocks = db.chapterBlockDao().getAllVersionsByChapter(plan.id)
                     val wordCount = blocks.filter { it.blockType.name == "PROSE" }.sumOf { it.text.length }
-                    // 「章节存在 N 个待处理问题」= 正文已生成、核验已执行、问题已落库，
-                    // 章节被标记为待人工复核——这是设计内的降级路径，不算流程失败
+                    // 核验发现问题 = 正文已发布（可读）、问题已落库，章节标待复核——
+                    // 设计内的降级路径，不算流程失败；修没修干净由最终章节状态表达
                     val chError = chResult.exceptionOrNull()?.message.orEmpty()
-                    val needsReview = chError.contains("待处理问题")
-                    val chOk = chResult.isSuccess || needsReview
+                    val needsReview =
+                        db.chapterPlanDao().getById(plan.id)?.status ==
+                            com.example.zhishu.domain.model.ChapterStatus.NEEDS_REVIEW
+                    val chOk = chResult.isSuccess
                     val chDetail = when {
-                        chResult.isSuccess -> "块 ${blocks.size} 个，正文约 $wordCount 字"
-                        needsReview -> "正文约 $wordCount 字（块 ${blocks.size} 个），核验标记: $chError"
-                        else -> "失败: ${chError.take(300)}"
+                        !chOk -> "失败: ${chError.take(300)}"
+                        needsReview -> "正文约 $wordCount 字（块 ${blocks.size} 个），核验待复核"
+                        else -> "块 ${blocks.size} 个，正文约 $wordCount 字"
                     }
                     println("[E2E] 步骤 3/4 第 ${i + 1} 章 ${if (chOk) "✅" else "❌"} $chDetail (${chMillis / 1000}s)")
                     steps += StepResult("第${i + 1}章正文", chOk, chDetail, chMillis)

@@ -8,6 +8,7 @@ import com.example.zhishu.ai.ModelError
 import com.example.zhishu.ai.ModelRequest
 import com.example.zhishu.ai.ModelRouter
 import com.example.zhishu.ai.PromptProvider
+import com.example.zhishu.ai.pipeline.IssueRecorder
 import com.example.zhishu.ai.pipeline.PipelineService
 import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.data.local.repo.DefaultChapterRepository
@@ -20,6 +21,7 @@ import com.example.zhishu.data.local.repo.DefaultReviewRepository
 import com.example.zhishu.data.local.repo.DefaultSourceRepository
 import com.example.zhishu.data.local.repo.DefaultStoryBibleRepository
 import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.IssueType
 import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.domain.model.ParseStatus
 import com.example.zhishu.domain.model.Project
@@ -28,12 +30,14 @@ import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.SourceKind
+import com.example.zhishu.domain.model.VerificationIssue
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -390,7 +394,7 @@ class GenerationTest {
     }
 
     @Test
-    fun generateChapter_withIssues_marksNeedsReview() = runBlocking {
+    fun generateChapter_withIssues_publishesBodyAndMarksNeedsReview() = runBlocking {
         seedProjectWithChunk()
         fakeRouter.verifyJson =
             """{"issues":[{"type":"contradiction","blockId":"b-1","message":"与资料矛盾","sourceRefs":["c-1"],"suggestedFix":"修改"}]}"""
@@ -398,15 +402,55 @@ class GenerationTest {
         pipeline.generateStoryBible("p-1")
         val plan = db.chapterPlanDao().getByProject("p-1").first()
         val result = pipeline.generateChapter("p-1", plan.id)
-        assertTrue(result.isFailure)
+        // 核验发现问题不再判整章失败：正文照常发布（可读），问题留给复核。
+        // blockId 对不上任何真实块 → 章级问题，自动修复无从下手，直接标待复核
+        assertTrue(result.isSuccess)
         val loaded = db.chapterPlanDao().getById(plan.id)
         assertEquals(ChapterStatus.NEEDS_REVIEW, loaded?.status)
+        // 正文真的在库里、已发布成 active 版本——「待复核」复核的是读得到的文字
+        val active = db.chapterVersionDao().getActive(plan.id)
+        assertTrue(active != null)
+        assertTrue(db.chapterBlockDao().getAllVersionsByChapter(plan.id).isNotEmpty())
         // 4B 起说明里给的是问题条数与可读的类型名，而不是模型的原始 type 串。
         // 「contradiction」是给代码看的，用户看的是「与资料矛盾」
         val note = loaded?.verificationNote.orEmpty()
         assertTrue(note.contains("1 个问题"))
         assertTrue(note.contains("与资料矛盾"))
         assertFalse(note.contains("contradiction"))
+    }
+
+    /** 自动修复：问题定位到真实块时，发布后立刻按既有逐段重写管线修一轮（4B 延伸） */
+    @Test
+    fun generateChapter_autoRepairTargets_followGuardrails() {
+        fun recordedOf(vararg blockIds: String?) = IssueRecorder.Recorded(
+            blockIds.mapIndexed { index, blockId ->
+                VerificationIssue(
+                    id = "i-$index",
+                    projectId = "p-1",
+                    chapterId = "c-1",
+                    versionId = "v-1",
+                    blockId = blockId,
+                    type = IssueType.CONTRADICTION,
+                    rawType = "contradiction",
+                    message = "m",
+                    sourceRefs = emptyList(),
+                    suggestedFix = "",
+                    order = index,
+                    createdAt = 0L,
+                )
+            },
+        )
+
+        // 定位得到、块数在护栏内 → 修
+        assertEquals(listOf("b-1"), pipeline.autoRepairTargets(recordedOf("b-1")))
+        // 全是章级问题（blockId 空）→ 不修，直接待复核
+        assertNull(pipeline.autoRepairTargets(recordedOf(null, null)))
+        // 块数超过护栏 → 不修
+        val many = (1..7).map { "b-$it" }.toTypedArray()
+        assertNull(pipeline.autoRepairTargets(recordedOf(*many)))
+        // 恰好在护栏边界 → 修
+        val edge = (1..6).map { "b-$it" }.toTypedArray()
+        assertEquals(6, pipeline.autoRepairTargets(recordedOf(*edge))?.size)
     }
 
     /** 章节生成期间项目状态进入 GENERATING（B17） */

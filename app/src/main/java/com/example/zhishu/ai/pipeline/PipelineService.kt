@@ -1969,13 +1969,14 @@ class PipelineService(
             now = clock(),
         )
         issueRepository.replaceForVersion(version.id, recorded.issues)
-        if (recorded.issues.isNotEmpty()) {
-            failAttempt(planId, attempt, issueSummary(recorded), ChapterStatus.NEEDS_REVIEW)
-            return Result.failure(IllegalStateException("章节存在 ${recorded.issues.size} 个待处理问题"))
-        }
 
-        // 正文过了核验 —— 到这里这一章就算写成了，先发布再说（第二阶段）。
+        // 正文写成了就发布（第二阶段 + 4B 的延伸）。
         //
+        // 核验发现问题**不再判整章失败**：原来这里有 10 个问题就把整章扔掉——
+        // 版本作废、Worker 返回失败、批量链条当场中断，一万多 token 的产出全部蒸发，
+        // 而问题处理机制（定位到段、逐段重写）因为正文没了根本无从谈起。
+        // 与「出题失败不影响正文」同一个道理：故事是主流程，先把能读的正文发出去，
+        // 问题交给下面的自动修复和阅读器里的逐条复核。
         // 原来的顺序是「核验通过 → 出题 → 出题成功才发布」，出题一失败，
         // 正文明明写好、核验也过了，章节却停在 QUIZ_FAILED 打不开。
         // 故事是主流程，测验是可选辅助，两件事不该绑在一个状态上。
@@ -2009,26 +2010,76 @@ class PipelineService(
                 // 记住这一版是在什么知识模式下写出来的（4A）。用户以后补了资料，
                 // 也不能让这一版看起来像是有出处的——它当时一条引用都引不到
                 usedModelKnowledge = modelKnowledge,
-                verificationNote = if (unverified.isEmpty()) {
-                    ""
-                } else {
-                    "有 ${unverified.size} 处内容建议你核对权威出处"
+                verificationNote = when {
+                    recorded.issues.isEmpty() -> if (unverified.isEmpty()) {
+                        ""
+                    } else {
+                        "有 ${unverified.size} 处内容建议你核对权威出处"
+                    }
+                    // 带问题发布：说明直接写核验发现了什么，章节卡与阅读器都能看到
+                    else -> issueSummary(recorded)
                 },
             ),
             now = clock(),
         )
         attempt.published = true
+
+        // —— 核验问题的自动修复（一轮，带成本护栏）——
+        //
+        // 只修**定位得到段落**的问题（rewriteOneBlock 的能力边界）；涉及的块数超过
+        // AUTO_REPAIR_MAX_BLOCKS 时放弃——那多半是核验员在挑整章的毛病，逐块修补
+        // 不如留给用户复核划算。修复走既有 runRewrite：重写这几块 → 全章重新核验
+        // → 干净才原子发布（旧问题标已修）。修不好时草稿作废、上面发布的版本
+        // 原样保留，章节标 NEEDS_REVIEW 等用户在阅读器里逐条处理。
+        var finalBlocks = blocks
+        var finalVersionId = version.id
+        if (recorded.issues.isNotEmpty()) {
+            val repairTargets = autoRepairTargets(recorded)
+            if (repairTargets != null) {
+                val repaired = runRewrite(
+                    projectId = projectId,
+                    planId = planId,
+                    plan = plan,
+                    active = version,
+                    oldBlocks = blocks,
+                    targets = repairTargets.toSet(),
+                    onPhase = onPhase,
+                    onDraftCreated = {},
+                    // 出题挪到函数尾部统一做：无论修复成败，题都出在最终正文上
+                    regenerateQuiz = false,
+                )
+                if (repaired.isSuccess) {
+                    // 修复发布了一个新版本，随后的写回与出题都改认新版
+                    chapterRepository.getActiveVersion(planId)?.let { active ->
+                        finalVersionId = active.id
+                        chapterRepository.getBlocksByVersion(active.id)
+                            .takeIf { it.isNotEmpty() }
+                            ?.let { finalBlocks = it }
+                    }
+                }
+            }
+            if (finalVersionId == version.id) {
+                // 没修（不满足条件）或没修好：正文可读、问题逐条挂在当前版本上，
+                // 状态标「待复核」，由用户在阅读器里逐条处理（接受 / 只重写该段）。
+                // 注意这里不能再走 failAttempt——版本已发布，作废它等于白写这一章。
+                chapterRepository.updateStatus(
+                    planId,
+                    ChapterStatus.NEEDS_REVIEW,
+                    issueSummary(recorded),
+                )
+            }
+        }
         // 推进滚动记忆：runningState 被改写而不是追加，因此长度不随章数增长（问题5）。
-        // 这三步都只依赖「正文通过核验」，与出题成败无关——否则出题失败会让
-        // 下一章续写不上、知识点跳不到正文。
+        // 这三步都只依赖「正文已经发布」（带问题发布也算），与出题成败无关——
+        // 否则出题失败会让下一章续写不上、知识点跳不到正文。
         advanceMemory(bible, output, coveredIds, allNodes.map { it.id }.toSet())
-        writeBackNodeChapters(projectId, planId, blocks)
-        scheduleReviews(projectId, blocks)
+        writeBackNodeChapters(projectId, planId, finalBlocks)
+        scheduleReviews(projectId, finalBlocks)
         refreshProjectStatus(projectId)
 
         // 自测题是可选产物：出题失败只记在 quizState 上，正文照样能读、下一章照样能生成
         onPhase(ChapterPhase.QUIZ)
-        val quizResult = generateQuiz(projectId, plan, nodes, blocks, version.id)
+        val quizResult = generateQuiz(projectId, plan, nodes, finalBlocks, finalVersionId)
         if (quizResult.isSuccess) {
             chapterRepository.updateQuizState(planId, QuizState.READY)
         } else {
@@ -2115,6 +2166,8 @@ class PipelineService(
         oldBlocks: List<ChapterBlock>,
         targets: Set<String>,
         onPhase: ProgressReporter,
+        /** 自动修复复用时关掉：出题由调用方（runChapter 尾部）在最终正文上统一做一次 */
+        regenerateQuiz: Boolean = true,
         onDraftCreated: (ChapterVersion) -> Unit,
     ): Result<Unit> {
         val project = projectRepository.get(projectId)
@@ -2294,17 +2347,21 @@ class PipelineService(
         writeBackNodeChapters(projectId, planId, blocks)
         refreshProjectStatus(projectId)
 
-        // 正文换了版本，旧版本的题问的是被改掉的文字，重新出一次
-        onPhase(ChapterPhase.QUIZ)
-        val quizResult = generateQuiz(projectId, plan, nodes, blocks, draft.id)
-        if (quizResult.isSuccess) {
-            chapterRepository.updateQuizState(planId, QuizState.READY)
-        } else {
-            chapterRepository.updateQuizState(
-                planId,
-                QuizState.FAILED,
-                quizResult.exceptionOrNull()?.message ?: "测验生成失败",
-            )
+        // 正文换了版本，旧版本的题问的是被改掉的文字，重新出一次。
+        // 自动修复链路（runChapter 的核验问题修复）跳过这一步：它会在函数尾部
+        // 对最终正文统一出一次题，这里再出就是重复扣一次题的钱。
+        if (regenerateQuiz) {
+            onPhase(ChapterPhase.QUIZ)
+            val quizResult = generateQuiz(projectId, plan, nodes, blocks, draft.id)
+            if (quizResult.isSuccess) {
+                chapterRepository.updateQuizState(planId, QuizState.READY)
+            } else {
+                chapterRepository.updateQuizState(
+                    planId,
+                    QuizState.FAILED,
+                    quizResult.exceptionOrNull()?.message ?: "测验生成失败",
+                )
+            }
         }
         return Result.success(Unit)
     }
@@ -2390,6 +2447,18 @@ class PipelineService(
      * 否则用户会看到一堆说的是已经被替换掉的文字的问题）。也就是说，
      * 那种情况下这句说明是唯一能告诉用户「哪里不对」的地方。
      */
+    /**
+     * 自动修复的目标块（内部可见，测试直接钉决策口径）。
+     *
+     * 只修**定位得到段落**的问题（rewriteOneBlock 的能力边界），且涉及的块数不超过
+     * [AUTO_REPAIR_MAX_BLOCKS]——超过它说明核验在挑整章的毛病，逐块修补的调用数
+     * 已接近重写整章而成功率更低，交给用户复核更划算。
+     * 返回 null = 不自动修（全是章级问题 / 问题面太大）。
+     */
+    internal fun autoRepairTargets(recorded: IssueRecorder.Recorded): List<String>? =
+        recorded.affectedBlockIds
+            .takeIf { it.isNotEmpty() && it.size <= AUTO_REPAIR_MAX_BLOCKS }
+
     private fun issueSummary(recorded: IssueRecorder.Recorded): String {
         val blockCount = recorded.affectedBlockIds.size
         val unlocated = recorded.chapterScoped.size
@@ -3160,6 +3229,14 @@ class PipelineService(
         }
 
     private companion object {
+        /**
+         * 核验问题自动修复的成本护栏：涉及的正文块数超过这个数就不再逐块修。
+         * 一章通常 20~30 块，超过 6 块有问题多半是核验员在挑整章的毛病，
+         * 逐块修补的调用数（块数 + 1 次全章核验）已经接近重写整章，
+         * 而成功率远不如整章重来——这种情况留给用户复核更划算。
+         */
+        const val AUTO_REPAIR_MAX_BLOCKS = 6
+
         /** 生成中的状态。取消收尾只在章节仍停在这些状态时才动它。 */
         val IN_FLIGHT_STATUSES = listOf(
             ChapterStatus.RUNNING,

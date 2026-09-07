@@ -78,7 +78,11 @@ internal fun selectChaptersToGenerate(
     .filter { plan ->
         when {
             plan.status.isReadable -> false
-            plan.status == ChapterStatus.NEEDS_REVIEW -> includeNeedsReview
+            // 待复核分两种：带问题发布（有可读正文，等用户复核，默认不动它）和
+            // 旧流程/中断留下的空壳（版本已作废、什么都没得读）——后者等于没写完，
+            // 照常进批量，否则项目会卡在「继续说没有要生成的、章节又打不开」的死局
+            plan.status == ChapterStatus.NEEDS_REVIEW ->
+                includeNeedsReview || plan.activeVersionId == null
             else -> true
         }
     }

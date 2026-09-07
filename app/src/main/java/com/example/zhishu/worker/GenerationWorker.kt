@@ -157,9 +157,16 @@ class GenerationWorker(
     private suspend fun summarize(projectTitle: String): Result {
         val plans = container.chapterRepository.getPlans(projectId)
         val readable = plans.count { it.status.isReadable }
+        // 带问题发布（核验挑出问题、自动修复没修干净）的章：正文可读，状态停在待复核。
+        // 不算进「已完成」也不能装作不存在——通知里如实说，用户才知道去哪处理。
+        val needsReview =
+            plans.count { it.status == com.example.zhishu.domain.model.ChapterStatus.NEEDS_REVIEW }
         val missingQuiz = plans.count { it.quizState == com.example.zhishu.domain.model.QuizState.FAILED }
         val detail = buildString {
             append("已完成 $readable/${plans.size} 章，可以开始读了。")
+            if (needsReview > 0) {
+                append("其中 $needsReview 章有待确认的核验问题，正文可读，进章节可逐条处理。")
+            }
             if (missingQuiz > 0) append("其中 $missingQuiz 章的自测题没生成，正文不受影响。")
         }
         GenerationNotifier.notifyOutcome(
