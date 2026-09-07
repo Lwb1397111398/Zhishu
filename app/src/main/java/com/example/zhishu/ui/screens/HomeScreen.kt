@@ -27,11 +27,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Book
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.School
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
@@ -42,7 +42,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -57,6 +56,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -91,6 +91,19 @@ private fun projectStatusLine(status: ProjectStatus): String = when (status) {
     ProjectStatus.OUTLINE -> "讲述路线已就绪"
     ProjectStatus.GENERATING -> "正在生成…"
     ProjectStatus.READY -> "可阅读"
+}
+
+/** 空书架上的一本简化小书：渐变封面 + 右侧圆角书脊，tilted 时斜靠 */
+@Composable
+private fun SimpleBook(width: androidx.compose.ui.unit.Dp, height: androidx.compose.ui.unit.Dp, top: Color, bottom: Color, tilted: Boolean = false) {
+    Box(
+        Modifier
+            .width(width)
+            .height(height)
+            .rotate(if (tilted) 10f else 0f)
+            .clip(RoundedCornerShape(topEnd = 4.dp, bottomEnd = 4.dp, topStart = 1.dp, bottomStart = 1.dp))
+            .background(Brush.verticalGradient(listOf(top, bottom))),
+    )
 }
 
 /** 程序化封面配色：书名哈希稳定选一组，同一本书重开不变样 */
@@ -137,23 +150,43 @@ fun HomeScreen(
         },
     ) { padding ->
         if (projects.isEmpty() && continueEntry == null) {
-            Box(Modifier.padding(padding)) {
-                EmptyState(
-                    icon = Icons.Default.Book,
-                    title = "把想学的东西，读成一个故事",
-                    subtitle = "告诉它你想学什么——比如民法、宏观经济学——它会把这门学科讲成一条能一路读下去的故事。不用准备资料。",
-                    actionLabel = "开始学一门新东西",
-                    onAction = onCreateProject,
+            // 空书架：一本本立着的书 + 引导文案，替代干巴巴的图标空状态
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .padding(32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Row(verticalAlignment = Alignment.Bottom) {
+                    SimpleBook(30.dp, 46.dp, Color(0xFF44617B), Color(0xFF24384A))
+                    Spacer(Modifier.width(6.dp))
+                    SimpleBook(34.dp, 54.dp, Color(0xFFD84315), Color(0xFF7E2A0B))
+                    Spacer(Modifier.width(6.dp))
+                    SimpleBook(30.dp, 48.dp, Color(0xFF8A6D3B), Color(0xFF54401F), tilted = true)
+                }
+                Spacer(Modifier.height(28.dp))
+                Text(
+                    "书架还是空的",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
                 )
-                Column(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    OutlinedButton(onClick = { vm.seedDemo() }) {
-                        Text("先看个示例（民法继承案）")
-                    }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "告诉知述你想学什么——比如民法、宏观经济学——" +
+                        "它会把这门学科讲成一本能一路读下去的书。不用准备资料。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                )
+                Spacer(Modifier.height(24.dp))
+                Button(onClick = onCreateProject) {
+                    Text("开始学一门新东西")
+                }
+                Spacer(Modifier.height(8.dp))
+                TextButton(onClick = { vm.seedDemo() }) {
+                    Text("先看个示例（民法继承案）")
                 }
             }
         } else {

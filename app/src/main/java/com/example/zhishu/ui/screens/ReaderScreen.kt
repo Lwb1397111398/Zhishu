@@ -367,7 +367,11 @@ fun ReaderScreen(
                     )
                 }
                 LaunchedEffect(newPages) {
-                    val keepBlockId = pages.getOrNull(pagerState.currentPage)
+                    // 保持位置：记录当前页（章末页则按最后一页正文算）页首块，
+                    // 重算后跳回包含该块的新页，而不是被甩回章首
+                    val currentPageIdx = pagerState.currentPage
+                        .coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                    val keepBlockId = pages.getOrNull(currentPageIdx)
                         ?.firstOrNull()?.block?.id
                     pages = newPages
                     if (restored) {

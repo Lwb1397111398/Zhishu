@@ -41,9 +41,9 @@ class AppStartupSmokeTest {
 
         composeRule.waitForIdle()
 
-        // 首页顶栏与空态文案出现 = 组合完成、数据库已打开且查询未抛异常
+        // 首页顶栏与空书架文案出现 = 组合完成、数据库已打开且查询未抛异常
         composeRule.onNodeWithText("知述").assertExists()
-        composeRule.onNodeWithText("把想学的东西，读成一个故事").assertExists()
+        composeRule.onNodeWithText("书架还是空的").assertExists()
 
         // Room 真的打开了：版本号是当前 schema 版本
         assertEquals(18, app.container.database.openHelper.readableDatabase.version)
