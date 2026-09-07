@@ -126,6 +126,16 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
         val project: Project,
         val progress: ReadingProgress,
         val chapterTitle: String,
+        val chapterOrder: Int,
+        val totalChapters: Int,
+    )
+
+    /** 书架上一本书的轻量统计（封面下的进度行），随 refresh 一起算 */
+    data class BookStat(
+        val totalChapters: Int,
+        val publishedChapters: Int,
+        /** 最近一次有阅读动作的时间（0 = 从没读过），用于「本周读过」统计 */
+        val lastReadAt: Long,
     )
 
     val projects: StateFlow<List<Project>> =
@@ -158,25 +168,54 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
     private val _continueEntry = MutableStateFlow<ContinueEntry?>(null)
     val continueEntry: StateFlow<ContinueEntry?> = _continueEntry
 
+    /** 每本书的章节数/阅读时间，书架封面下的进度行用 */
+    private val _bookStats = MutableStateFlow<Map<String, BookStat>>(emptyMap())
+    val bookStats: StateFlow<Map<String, BookStat>> = _bookStats
+
+    /** 最近 7 天里有阅读动作的书数（0 不显示） */
+    private val _weekReadCount = MutableStateFlow(0)
+    val weekReadCount: StateFlow<Int> = _weekReadCount
+
+    /** 每本书的知识点数（知识页统计条与列表用） */
+    private val _knowledgeStats = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val knowledgeStats: StateFlow<Map<String, Int>> = _knowledgeStats
+
     init {
         refresh()
     }
 
     fun refresh() {
         launchSafely("HomeViewModel") {
-            _dueCount.value = if (spacedReviewEnabled.value) {
-                container.reviewRepository.getDue(now()).size
-            } else {
-                0
-            }
+            // 知识页的统计条要显示待复习数，所以这里无条件算；
+            // 首页「今日复习」卡片是否出现仍由 reviewEnabled 决定，逻辑不变
+            _dueCount.value = container.reviewRepository.getDue(now()).size
             val all = container.projectRepository.observeAll().first()
-            val latest = all.mapNotNull { project ->
-                val progress = container.progressRepository.get(project.id) ?: return@mapNotNull null
-                val chapter = container.chapterRepository.getPlan(progress.chapterId)
-                    ?: return@mapNotNull null
-                ContinueEntry(project, progress, chapter.title)
-            }.maxByOrNull { it.progress.updatedAt }
-            _continueEntry.value = latest
+            val stats = mutableMapOf<String, BookStat>()
+            val nodeCounts = mutableMapOf<String, Int>()
+            val entries = mutableListOf<ContinueEntry>()
+            val weekAgo = now() - 7 * 24 * 60 * 60 * 1000L
+            all.forEach { project ->
+                val plans = container.chapterRepository.getPlans(project.id).sortedBy { it.order }
+                val progress = container.progressRepository.get(project.id)
+                stats[project.id] = BookStat(
+                    totalChapters = plans.size,
+                    publishedChapters = plans.count { it.isReadable },
+                    lastReadAt = progress?.updatedAt ?: 0L,
+                )
+                nodeCounts[project.id] = container.knowledgeRepository.getByProject(project.id).size
+                if (progress != null) {
+                    val chapter = plans.firstOrNull { it.id == progress.chapterId }
+                    if (chapter != null) {
+                        entries += ContinueEntry(
+                            project, progress, chapter.title, chapter.order, plans.size,
+                        )
+                    }
+                }
+            }
+            _bookStats.value = stats
+            _knowledgeStats.value = nodeCounts
+            _continueEntry.value = entries.maxByOrNull { it.progress.updatedAt }
+            _weekReadCount.value = stats.values.count { it.lastReadAt >= weekAgo }
         }
     }
 
@@ -917,15 +956,32 @@ class ProjectDetailViewModel(
             container.chapterRepository.getPlans(projectId).isNotEmpty()
     }
 
-    /** 修改风格（含「AI 自由发挥」）。改完需重新规划讲述路线才生效（问题6） */
-    fun setGenre(genre: String) {
+    /**
+     * 修改风格（含「AI 自由发挥」）。改完需重新规划讲述路线才生效（问题6）。
+     *
+     * [replan] 为 true 时顺手入队重新规划——前提是项目还没有可读正文
+     * （已有正文时整本重规划被 PipelineService 硬性禁止，这里直接给出
+     * 「从下一卷生效」的说明，而不是让用户在生成横幅里看到失败）。
+     */
+    fun setGenre(genre: String, replan: Boolean = false) {
         viewModelScope.launch {
             val current = container.projectRepository.get(projectId) ?: return@launch
             container.projectRepository.update(
                 // resolvedGenre 清空，让模型在下次规划时重新自选
                 current.copy(genre = genre, resolvedGenre = "", updatedAt = now()),
             )
-            _message.value = "已改为「$genre」，重新规划讲述路线后生效"
+            if (!replan) {
+                _message.value = "已改为「$genre」。到「讲述路线」页点「重新规划」后生效"
+                return@launch
+            }
+            val hasReadable = container.chapterRepository.getPlans(projectId).any { it.isReadable }
+            if (hasReadable) {
+                _message.value = "已改为「$genre」。这本书已有正文，新讲法从「继续下一卷」开始生效"
+                return@launch
+            }
+            launchEnqueue("已改为「$genre」，正在按新讲法重新规划讲述路线") {
+                GenerationEnqueuer.storyBible(getApplication(), projectId)
+            }
         }
     }
 
@@ -1101,6 +1157,28 @@ class ReaderViewModel(
     val prevChapterId = MutableStateFlow<String?>(null)
     val nextChapterId = MutableStateFlow<String?>(null)
 
+    /** 全书章节（按 order 排好）：阅读器内的「全书目录」直接用，不用回项目页 */
+    val allPlans = MutableStateFlow<List<ChapterPlan>>(emptyList())
+
+    // 阅读偏好（翻页/滚动、字号、纸色）——持久化在 LearningPrefs，改了立即生效且记住
+    val readerMode: StateFlow<com.example.zhishu.data.prefs.ReaderMode> =
+        container.learningPrefs.readerMode
+    val readerFontSizeIndex: StateFlow<Int> = container.learningPrefs.readerFontSize
+    val readerPaper: StateFlow<com.example.zhishu.data.prefs.ReaderPaper> =
+        container.learningPrefs.readerPaper
+
+    fun setReaderMode(mode: com.example.zhishu.data.prefs.ReaderMode) {
+        container.learningPrefs.setReaderMode(mode)
+    }
+
+    fun setFontSize(index: Int) {
+        container.learningPrefs.setReaderFontSize(index)
+    }
+
+    fun setPaper(paper: com.example.zhishu.data.prefs.ReaderPaper) {
+        container.learningPrefs.setReaderPaper(paper)
+    }
+
     /** 本章自测题数：0 时不显示「自测」按钮，但绝不阻塞继续读下一章。只数当前版本的题（3A） */
     val quizCount: StateFlow<Int> =
         container.quizRepository.observeActiveByChapter(chapterId)
@@ -1221,6 +1299,7 @@ class ReaderViewModel(
             project.value = container.projectRepository.get(plan.projectId)
             _nodes.value = container.knowledgeRepository.getByProject(plan.projectId)
             val plans = container.chapterRepository.getPlans(plan.projectId).sortedBy { it.order }
+            allPlans.value = plans
             val index = plans.indexOfFirst { it.id == chapterId }
             prevChapterId.value = plans.getOrNull(index - 1)?.id
             nextChapterId.value = plans.getOrNull(index + 1)?.id

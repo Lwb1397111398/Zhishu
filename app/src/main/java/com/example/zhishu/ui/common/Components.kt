@@ -77,13 +77,13 @@ fun EmptyState(
 }
 
 @Composable
-fun SectionTitle(text: String) {
+fun SectionTitle(text: String, modifier: Modifier = Modifier) {
     Text(
         text = text,
         style = MaterialTheme.typography.titleSmall,
         fontWeight = FontWeight.SemiBold,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp),
+        modifier = modifier.padding(top = 16.dp, bottom = 8.dp),
     )
 }
 

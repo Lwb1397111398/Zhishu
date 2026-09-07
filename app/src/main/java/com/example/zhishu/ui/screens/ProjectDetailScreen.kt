@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Map
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.NoteAdd
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -37,6 +38,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -1317,6 +1320,10 @@ private fun OutlineTab(
 ) {
     var editPlan by remember { mutableStateOf<ChapterPlan?>(null) }
     var showGenre by remember { mutableStateOf(false) }
+    // 重新规划讲述路线（换讲法/换知识主干后需要）。已有可读正文时不允许整本重规划（3C 底线）
+    val hasReadable = plans.any { it.isReadable }
+    var showReplanConfirm by remember { mutableStateOf(false) }
+    var showReplanDenied by remember { mutableStateOf(false) }
     // 正在查看问题清单的章节（4B）
     var issuePlan by remember { mutableStateOf<ChapterPlan?>(null) }
     // 重新生成失败的说明按章节取，绑在新版本上而不是覆盖当前正文的核验说明（3A）
@@ -1426,6 +1433,7 @@ private fun OutlineTab(
                             project = project,
                             chapterCount = plans.size,
                             onChangeGenre = { showGenre = true },
+                            onReplan = { if (hasReadable) showReplanDenied = true else showReplanConfirm = true },
                         )
                         Spacer(Modifier.height(8.dp))
                     }
@@ -1472,11 +1480,39 @@ private fun OutlineTab(
     if (showGenre) {
         GenrePickerDialog(
             current = project?.genre.orEmpty(),
-            onPick = {
-                vm.setGenre(it)
+            canReplan = !hasReadable,
+            onPick = { genre, replan ->
+                vm.setGenre(genre, replan)
                 showGenre = false
             },
             onDismiss = { showGenre = false },
+        )
+    }
+
+    if (showReplanConfirm) {
+        ConfirmDialog(
+            title = "重新规划讲述路线",
+            message = "将清空现有的 ${plans.size} 章章节安排，按当前讲法重新规划。" +
+                "目前还没有已写好的正文，不会丢失可读内容。",
+            confirmLabel = "重新规划",
+            onConfirm = { vm.enqueueStoryBible() },
+            onDismiss = { showReplanConfirm = false },
+        )
+    }
+
+    if (showReplanDenied) {
+        AlertDialog(
+            onDismissRequest = { showReplanDenied = false },
+            title = { Text("不能整本重新规划") },
+            text = {
+                Text(
+                    "这本书已经写出了正文，整本重新规划会删掉你读过的内容，所以不被允许。\n\n" +
+                        "想让新讲法生效：等当前卷读完，用「继续下一卷」接着写，新卷会按新讲法来。",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showReplanDenied = false }) { Text("知道了") }
+            },
         )
     }
 
@@ -1500,6 +1536,7 @@ private fun StoryBibleCard(
     project: com.example.zhishu.domain.model.Project?,
     chapterCount: Int,
     onChangeGenre: () -> Unit,
+    onReplan: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
     Card {
@@ -1512,6 +1549,7 @@ private fun StoryBibleCard(
                     modifier = Modifier.weight(1f),
                 )
                 TextButton(onClick = onChangeGenre) { Text("换讲法") }
+                TextButton(onClick = onReplan) { Text("重新规划") }
             }
             if (bible.style.isNotBlank()) {
                 Text(bible.style, style = MaterialTheme.typography.bodyMedium)
@@ -1595,9 +1633,13 @@ private fun StoryBibleCard(
 @Composable
 private fun GenrePickerDialog(
     current: String,
-    onPick: (String) -> Unit,
+    /** 没有已写好的正文时才能立即重新规划（3C 底线） */
+    canReplan: Boolean,
+    onPick: (String, Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    // 换讲法的意图就是让新讲法生效，能重规划就默认勾上
+    var replan by remember { mutableStateOf(true) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("换一种讲法") },
@@ -1613,14 +1655,42 @@ private fun GenrePickerDialog(
                     Row(
                         Modifier
                             .fillMaxWidth()
-                            .clickable { onPick(option) }
+                            .clickable { onPick(option, replan && canReplan) }
                             .padding(vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        RadioButton(selected = option == current, onClick = { onPick(option) })
+                        RadioButton(selected = option == current, onClick = { onPick(option, replan && canReplan) })
                         Spacer(Modifier.width(8.dp))
                         Text(option, style = MaterialTheme.typography.bodyMedium)
                     }
+                }
+                if (canReplan) {
+                    Spacer(Modifier.height(4.dp))
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { replan = !replan }
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(checked = replan, onCheckedChange = { replan = it })
+                        Spacer(Modifier.width(4.dp))
+                        Column {
+                            Text("立即重新规划讲述路线", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "按新讲法重新安排章节（现有章节安排会被清空，目前没有已写好的正文）",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                } else {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "这本书已经写出了正文，已写好的章节不会变，新讲法会从「继续下一卷」开始生效。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         },
@@ -1874,34 +1944,96 @@ private fun ChapterPlanCard(
                     )
                 }
             }
-            Row(Modifier.padding(top = 4.dp)) {
-                TextButton(onClick = onEdit) { Text("编辑") }
-                if (canRead) TextButton(onClick = onRead) { Text("阅读") }
-                if (canQuiz) TextButton(onClick = onQuiz) { Text("测验") }
-                // 补题只调出题阶段，绝不重写正文
-                if (quizMissing) TextButton(onClick = onRegenerateQuiz) { Text("重新生成自测") }
-                // 有可定位到段落的问题时，「逐条处理」排在「重新生成」前面（4B）：
-                // 只重写出问题的那几段，比整章推翻重来便宜得多，也不会把
-                // 写对的部分一起换掉
-                if (openIssues.isNotEmpty()) {
-                    TextButton(onClick = onOpenIssues, enabled = !rewriting) {
-                        Text(if (rewriting) "修改中…" else "逐条处理")
-                    }
+            // 按钮收敛：主操作（阅读/生成/补契约按优先级）留在卡面上，
+            // 其余动作（编辑/测验/补题/逐条处理/重新生成）收进「更多」菜单——
+            // 原先 7 个按钮挤一行是整个讲述路线页最乱的地方，但一个功能都没少
+            val mainIsContract = contractFailed
+            val mainIsRead = !contractFailed && canRead
+            var menuExpanded by remember(plan.id) { mutableStateOf(false) }
+            Row(
+                Modifier.padding(top = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                when {
+                    mainIsContract -> TextButton(
+                        onClick = onRetryContract,
+                        enabled = !retryingContract,
+                    ) { Text(if (retryingContract) "补契约中…" else "补契约") }
+
+                    mainIsRead -> Button(onClick = onRead) { Text("阅读") }
+
+                    else -> TextButton(
+                        onClick = onGenerate,
+                        // 契约没生成的章禁止写正文——点击后会在 pipeline 里被拦下，
+                        // 这里直接禁用，省得用户白点一次再读一句报错
+                        enabled = !rewriting && !contractFailed,
+                    ) { Text(if (needsRetry) "重新生成" else "生成") }
                 }
-                // 补契约排在最前面：它是「生成正文」的前置条件，
-                // 不先解决它，后面几个按钮点了也是报错
-                if (contractFailed) {
-                    TextButton(onClick = onRetryContract, enabled = !retryingContract) {
-                        Text(if (retryingContract) "补契约中…" else "补契约")
-                    }
+                Spacer(Modifier.weight(1f))
+                IconButton(onClick = { menuExpanded = true }) {
+                    Icon(Icons.Default.MoreVert, contentDescription = "更多操作")
                 }
-                TextButton(
-                    onClick = onGenerate,
-                    // 契约没生成的章禁止写正文——点击后会在 pipeline 里被拦下，
-                    // 这里直接禁用，省得用户白点一次再读一句报错
-                    enabled = !rewriting && !contractFailed,
+                DropdownMenu(
+                    expanded = menuExpanded,
+                    onDismissRequest = { menuExpanded = false },
                 ) {
-                    Text(if (needsRetry) "重新生成" else "生成")
+                    DropdownMenuItem(
+                        text = { Text("编辑标题与目标") },
+                        onClick = {
+                            menuExpanded = false
+                            onEdit()
+                        },
+                    )
+                    if (!mainIsRead && canRead) {
+                        DropdownMenuItem(
+                            text = { Text("阅读") },
+                            onClick = {
+                                menuExpanded = false
+                                onRead()
+                            },
+                        )
+                    }
+                    if (canQuiz) {
+                        DropdownMenuItem(
+                            text = { Text("测验") },
+                            onClick = {
+                                menuExpanded = false
+                                onQuiz()
+                            },
+                        )
+                    }
+                    // 补题只调出题阶段，绝不重写正文
+                    if (quizMissing) {
+                        DropdownMenuItem(
+                            text = { Text("重新生成自测") },
+                            onClick = {
+                                menuExpanded = false
+                                onRegenerateQuiz()
+                            },
+                        )
+                    }
+                    // 有可定位到段落的问题时，「逐条处理」比整章重新生成便宜得多，
+                    // 也不会把写对的部分一起换掉
+                    if (openIssues.isNotEmpty()) {
+                        DropdownMenuItem(
+                            text = { Text(if (rewriting) "修改中…" else "逐条处理") },
+                            onClick = {
+                                menuExpanded = false
+                                onOpenIssues()
+                            },
+                            enabled = !rewriting,
+                        )
+                    }
+                    if (mainIsRead) {
+                        DropdownMenuItem(
+                            text = { Text(if (needsRetry) "重新生成正文" else "生成正文") },
+                            onClick = {
+                                menuExpanded = false
+                                onGenerate()
+                            },
+                            enabled = !rewriting && !contractFailed,
+                        )
+                    }
                 }
             }
         }

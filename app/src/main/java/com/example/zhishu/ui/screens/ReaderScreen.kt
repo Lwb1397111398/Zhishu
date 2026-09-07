@@ -1,10 +1,17 @@
 package com.example.zhishu.ui.screens
 
 import android.app.Application
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -16,11 +23,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -37,12 +47,10 @@ import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -55,10 +63,16 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.zhishu.data.prefs.ReaderMode
+import com.example.zhishu.data.prefs.ReaderPaper
 import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
@@ -120,10 +134,19 @@ fun ReaderScreen(
     val blockSources by vm.blockSources.collectAsState()
     val chapterTrust by vm.chapterTrust.collectAsState()
     val staleTargetNotice by vm.staleTargetNotice.collectAsState()
+    // 阅读偏好（小说模式）：翻页/滚动、字号、纸色——都持久化，改了立即生效
+    val readerMode by vm.readerMode.collectAsState()
+    val fontIndex by vm.readerFontSizeIndex.collectAsState()
+    val paper by vm.readerPaper.collectAsState()
+    val allPlans by vm.allPlans.collectAsState()
 
     var selectedNode by remember { mutableStateOf<KnowledgeNode?>(null) }
     var showOutline by remember { mutableStateOf(false) }
     var showTrust by remember { mutableStateOf(false) }
+    // 沉浸式阅读的呼出菜单与两个面板（全书目录 / 阅读设置）
+    var menuShown by remember { mutableStateOf(false) }
+    var showToc by remember { mutableStateOf(false) }
+    var showReaderSettings by remember { mutableStateOf(false) }
     var highlightBlockId by remember { mutableStateOf(targetBlockId) }
     var restored by remember(chapterId) { mutableStateOf(false) }
     // 打开哪一块的来源面板（4A）。默认不展开，阅读体验优先
@@ -131,8 +154,10 @@ fun ReaderScreen(
 
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    val palette = readerPalette(paper)
+    val fontSp = readerFontSizeSp(fontIndex)
 
-    // 安静模式只藏讲解/引文/类比这些"旁注"，但保留 KEY_POINT——
+    // 安静模式（现在叫「只看故事」）只藏讲解/引文/类比这些"旁注"，但保留 KEY_POINT——
     // 那些重述句本身就是推演的骨架，藏掉会让主线断掉（问题2）
     val visibleBlocks = if (dense) {
         blocks
@@ -140,9 +165,9 @@ fun ReaderScreen(
         blocks.filter { it.blockType == BlockType.STORY || it.blockType == BlockType.KEY_POINT }
     }
 
-    // 搜索命中的块若是安静模式下折叠掉的旁注，自动切到密集模式，否则跳过去看不到东西。
+    // 搜索命中的块若是「只看故事」模式下折叠掉的旁注，自动切到「带讲解」，否则跳过去看不到东西。
     // 一次性闸门（按 targetBlockId）：blocks 是 Flow，重生成/进度更新都会再发射，
-    // 不加闸门的话用户手动关掉密集模式后、下一次 blocks 变化又会被强行打开。
+    // 不加闸门的话用户手动关掉讲解后、下一次 blocks 变化又会被强行打开。
     var denseAutoApplied by remember(targetBlockId) { mutableStateOf(false) }
     LaunchedEffect(targetBlockId, blocks) {
         val target = targetBlockId ?: return@LaunchedEffect
@@ -155,8 +180,20 @@ fun ReaderScreen(
         }
     }
 
-    // 恢复位置：优先跳到指定块（搜索/知识地图跳转），否则回到上次读到的块
-    LaunchedEffect(visibleBlocks, savedAnchor, targetBlockId) {
+    // 切换翻页/滚动时内容结构完全变了，恢复闸门重走一遍（锚点会把位置带回来）
+    LaunchedEffect(readerMode) { restored = false }
+
+    // 翻页模式的分页结果（正文页），由翻页分支计算后写入
+    var pages by remember { mutableStateOf<List<List<PageSegment>>>(emptyList()) }
+    // 章末「本章完 / 自测 / 下一章」在翻页模式下独立成最后一页
+    val footerPageCount = if (readerMode == ReaderMode.PAGER) 1 else 0
+
+    // 翻页状态：页数 = 正文页数 + 章末页
+    val pagerState = rememberPagerState { pages.size + footerPageCount }
+
+    // —— 滚动模式：恢复位置。优先跳到指定块（搜索/知识地图跳转），否则回到上次读到的块
+    LaunchedEffect(readerMode, visibleBlocks, savedAnchor, targetBlockId) {
+        if (readerMode != ReaderMode.SCROLL) return@LaunchedEffect
         if (restored || visibleBlocks.isEmpty()) return@LaunchedEffect
         val anchor = savedAnchor ?: return@LaunchedEffect // 进度还没读出来，先别动
         val targetId = targetBlockId ?: anchor.blockId
@@ -166,7 +203,7 @@ fun ReaderScreen(
         }
         val index = visibleBlocks.indexOfFirst { it.id == targetId }
         if (index < 0) {
-            // 块还没出现在当前可见列表里（等待切换密集模式）；确实找不到才算恢复完成
+            // 块还没出现在当前可见列表里（等待切换带讲解）；确实找不到才算恢复完成
             if (blocks.none { it.id == targetId }) {
                 restored = true
                 // 从搜索 / 资料 / 知识地图点进来，而目标段落不属于当前版本：
@@ -179,6 +216,28 @@ fun ReaderScreen(
             index = index + HEADER_ITEMS,
             scrollOffset = if (targetBlockId != null) 0 else anchor.offset,
         )
+        restored = true
+    }
+
+    // —— 翻页模式：恢复位置。pages 切好后找包含锚点块的页，直接跳过去
+    LaunchedEffect(readerMode, pages, savedAnchor, targetBlockId) {
+        if (readerMode != ReaderMode.PAGER) return@LaunchedEffect
+        if (restored || pages.isEmpty()) return@LaunchedEffect
+        val anchor = savedAnchor ?: return@LaunchedEffect
+        val targetId = targetBlockId ?: anchor.blockId
+        if (targetId == null) {
+            restored = true
+            return@LaunchedEffect
+        }
+        val pageIndex = pages.indexOfFirst { page -> page.any { it.block.id == targetId } }
+        if (pageIndex < 0) {
+            if (blocks.none { it.id == targetId }) {
+                restored = true
+                if (targetBlockId != null) vm.reportStaleTarget()
+            }
+            return@LaunchedEffect
+        }
+        pagerState.scrollToPage(pageIndex)
         restored = true
     }
 
@@ -199,8 +258,9 @@ fun ReaderScreen(
         }
     }
 
-    // 进度按块保存：停止滚动 1 秒后写库。恢复完成前不写，否则会把位置覆盖成开头（B10）
-    LaunchedEffect(listState, visibleBlocks, restored) {
+    // —— 滚动模式：进度按块保存，停止滚动 1 秒后写库。恢复完成前不写（B10）
+    LaunchedEffect(readerMode, listState, visibleBlocks, restored) {
+        if (readerMode != ReaderMode.SCROLL) return@LaunchedEffect
         if (!restored || visibleBlocks.isEmpty()) return@LaunchedEffect
         snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
             .debounce(1000)
@@ -212,97 +272,179 @@ fun ReaderScreen(
             }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(chapter?.title ?: "阅读", style = MaterialTheme.typography.titleMedium)
-                        project?.let { Text(it.title, style = MaterialTheme.typography.bodySmall) }
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "返回") }
-                },
-                actions = {
-                    // 章节级来源摘要（4C）。只在这一章确实有来源或待核对项时出现——
-                    // 一个点开只会说「什么都没有」的按钮不如不给
-                    if (!chapterTrust.isEmpty) {
-                        IconButton(onClick = { showTrust = true }) {
-                            Icon(
-                                Icons.Default.Info,
-                                contentDescription = "本章来源",
-                                tint = if (chapterTrust.needsAttentionCount > 0) {
-                                    MaterialTheme.colorScheme.tertiary
-                                } else {
-                                    LocalContentColor.current
-                                },
-                            )
-                        }
-                    }
-                    IconButton(onClick = { showOutline = true }) {
-                        Icon(Icons.Default.List, contentDescription = "本章导览")
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            if (dense) "密集" else "安静",
-                            style = MaterialTheme.typography.labelMedium,
-                        )
-                        Switch(
-                            checked = dense,
-                            onCheckedChange = { vm.denseMode.value = it },
-                        )
-                    }
-                },
-            )
-        },
-        bottomBar = {
-            // 主操作是「下一章」，不是「去做测验」——读下去才是这个 App 的主线
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                TextButton(
-                    onClick = { prevChapterId?.let(onOpenChapter) },
-                    enabled = prevChapterId != null,
-                ) { Text(if (prevChapterId != null) "上一章" else "已是第一章") }
-                TextButton(onClick = { showOutline = true }) { Text("本章导览") }
-                Button(
-                    onClick = { nextChapterId?.let(onOpenChapter) },
-                    enabled = nextChapterId != null,
-                ) { Text(if (nextChapterId != null) "下一章" else "已是最后一章") }
+    // —— 翻页模式：翻到稳定页后写库（记该页第一段的块；章末页保持最后一页正文的位置）
+    LaunchedEffect(readerMode, pages, restored) {
+        if (readerMode != ReaderMode.PAGER) return@LaunchedEffect
+        if (!restored || pages.isEmpty()) return@LaunchedEffect
+        snapshotFlow { pagerState.settledPage }
+            .debounce(600)
+            .distinctUntilChanged()
+            .collectLatest { pageIdx ->
+                val segs = pages.getOrNull(pageIdx) ?: return@collectLatest
+                vm.saveProgress(segs.firstOrNull()?.block?.id, 0)
             }
-        },
-    ) { padding ->
+    }
+
+    val headerNotices = buildList {
+        if (bodyUpdatedNotice) add("本章正文已更新，从章首开始阅读。")
+        if (staleTargetNotice) {
+            add(
+                "你点的那一段属于本章的旧版本，正文后来更新过，" +
+                    "所以只能从章首开始。可以用本章导览或搜索重新定位。",
+            )
+        }
+    }
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(palette.background),
+    ) {
         if (blocks.isEmpty()) {
+            // 空状态：保留返回手段，其他信息照旧，只是换成纸面配色
             Column(
                 Modifier
                     .fillMaxSize()
-                    .padding(padding)
+                    .statusBarsPadding()
+                    .navigationBarsPadding()
                     .padding(32.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.Default.ArrowBack, contentDescription = "返回", tint = palette.text)
+                }
                 Spacer(Modifier.height(80.dp))
                 Text(
                     "本章正文尚未生成",
                     style = MaterialTheme.typography.titleMedium,
+                    color = palette.text,
                 )
                 Text(
                     "回到项目详情，在「故事大纲」中生成该章节。",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = palette.secondary,
                 )
             }
+        } else if (readerMode == ReaderMode.PAGER) {
+            // ================= 翻页模式（默认）：像小说软件一样左右翻页 =================
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                val density = LocalDensity.current
+                // 页内容左右各 24dp；页高扣除上下留白 16dp、页码区 20dp、防裁切余量 10dp
+                val pageWidthPx = with(density) { (maxWidth - 48.dp).roundToPx().coerceAtLeast(200) }
+                val pageHeightPx = with(density) {
+                    (maxHeight - 16.dp - 16.dp - 20.dp - 10.dp).roundToPx().coerceAtLeast(200)
+                }
+                val gapPx = with(density) { 16.dp.roundToPx() }
+                val textMeasurer = rememberTextMeasurer(cacheSize = 512)
+                val headerTitle = chapter?.title ?: "阅读"
+                val headerOrder = "第 ${chapter?.order ?: 1} 章"
+                val measurer = remember(density, textMeasurer, pageWidthPx) {
+                    PageMeasurer(
+                        measure = { text, style ->
+                            textMeasurer.measure(
+                                text,
+                                style,
+                                maxLines = Int.MAX_VALUE,
+                                softWrap = true,
+                                constraints = Constraints(maxWidth = pageWidthPx),
+                            ).size.height
+                        },
+                        density = density,
+                    )
+                }
+                val headerHeightPx = measurer.header(headerTitle, headerOrder, headerNotices)
+
+                // 切页：正文块流 → 页。字号/模式/正文变化都会重算，重算后停回当前阅读位置
+                val newPages = remember(
+                    visibleBlocks, fontSp, pageWidthPx, pageHeightPx, gapPx, headerHeightPx, measurer,
+                ) {
+                    buildReaderPages(
+                        visibleBlocks = visibleBlocks,
+                        measurer = measurer,
+                        fontSp = fontSp,
+                        pageHeightPx = pageHeightPx,
+                        gapPx = gapPx,
+                        headerHeightPx = headerHeightPx,
+                    )
+                }
+                LaunchedEffect(newPages) {
+                    val keepBlockId = pages.getOrNull(pagerState.currentPage)
+                        ?.firstOrNull()?.block?.id
+                    pages = newPages
+                    if (restored) {
+                        val target = keepBlockId?.let { id ->
+                            newPages.indexOfFirst { page -> page.any { it.block.id == id } }
+                        }
+                        pagerState.scrollToPage(if (target != null && target >= 0) target else 0)
+                    }
+                }
+
+                PagedReaderBody(
+                    pageCount = pages.size + footerPageCount,
+                    pagerState = pagerState,
+                    palette = palette,
+                ) { pageIndex ->
+                    if (pageIndex < pages.size) {
+                        Column(
+                            Modifier
+                                .fillMaxSize()
+                                .padding(horizontal = 24.dp)
+                                .padding(top = 16.dp),
+                        ) {
+                            if (pageIndex == 0) {
+                                ReaderPageHeader(
+                                    title = headerTitle,
+                                    order = headerOrder,
+                                    notices = headerNotices,
+                                    palette = palette,
+                                )
+                                Spacer(Modifier.height(8.dp))
+                            }
+                            pages.getOrElse(pageIndex) { emptyList() }.forEachIndexed { i, seg ->
+                                if (i > 0 && seg.firstOfBlock) Spacer(Modifier.height(16.dp))
+                                BlockContent(
+                                    block = seg.block,
+                                    dense = dense,
+                                    nodes = nodes,
+                                    highlighted = seg.block.id == highlightBlockId,
+                                    sourceSummary = blockSources[seg.block.id],
+                                    onOpenNode = { selectedNode = it },
+                                    onOpenSources = { sourceBlockId = seg.block.id },
+                                    palette = palette,
+                                    fontSp = fontSp,
+                                    textOverride = if (seg.block.blockType == BlockType.STORY) seg.text else null,
+                                    showAttachments = seg.lastOfBlock,
+                                )
+                            }
+                        }
+                    } else {
+                        // 章末页：本章完 / 待核实断言 / 自测 / 下一章（内容超页时可滚动兜底）
+                        Column(
+                            Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState())
+                                .padding(horizontal = 24.dp)
+                                .padding(top = 24.dp, bottom = 40.dp),
+                        ) {
+                            ChapterFooter(
+                                chapter = chapter,
+                                quizCount = quizCount,
+                                hasNext = nextChapterId != null,
+                                onSelfTest = { onOpenQuiz(chapterId) },
+                                onNext = { nextChapterId?.let(onOpenChapter) },
+                                palette = palette,
+                            )
+                        }
+                    }
+                }
+            }
         } else {
-            // LazyColumn + 稳定 key：长章节不再一次性组合全文，块级定位与进度也才站得住
+            // ================= 滚动模式：保留块级定位与逐段进度，纸面化 =================
             LazyColumn(
                 state = listState,
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(padding),
+                    .statusBarsPadding()
+                    .navigationBarsPadding(),
                 contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
@@ -310,28 +452,29 @@ fun ReaderScreen(
                     Column {
                         Text(
                             chapter?.title ?: "",
-                            style = MaterialTheme.typography.headlineMedium,
+                            fontSize = 24.sp,
                             fontWeight = FontWeight.Bold,
+                            color = palette.text,
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
                             "第 ${chapter?.order ?: 1} 章",
                             style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = palette.secondary,
                         )
                         // 正文换过版本：说清楚为什么回到了章首（3D）。
                         // 只说一次，中性底色，不做成警告——正文更新是好事，不是出错
                         if (bodyUpdatedNotice) {
                             Spacer(Modifier.height(12.dp))
                             Surface(
-                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                color = palette.cardContainer,
                                 shape = MaterialTheme.shapes.small,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Text(
                                     "本章正文已更新，从章首开始阅读。",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = palette.cardContent,
                                     modifier = Modifier.padding(10.dp),
                                 )
                             }
@@ -341,7 +484,7 @@ fun ReaderScreen(
                         if (staleTargetNotice) {
                             Spacer(Modifier.height(12.dp))
                             Surface(
-                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                color = palette.cardContainer,
                                 shape = MaterialTheme.shapes.small,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
@@ -349,7 +492,7 @@ fun ReaderScreen(
                                     "你点的那一段属于本章的旧版本，正文后来更新过，" +
                                         "所以只能从章首开始。可以用本章导览或搜索重新定位。",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = palette.cardContent,
                                     modifier = Modifier.padding(10.dp),
                                 )
                             }
@@ -365,6 +508,8 @@ fun ReaderScreen(
                         sourceSummary = blockSources[block.id],
                         onOpenNode = { selectedNode = it },
                         onOpenSources = { sourceBlockId = block.id },
+                        palette = palette,
+                        fontSp = fontSp,
                     )
                 }
                 item(key = "__footer__") {
@@ -374,9 +519,85 @@ fun ReaderScreen(
                         hasNext = nextChapterId != null,
                         onSelfTest = { onOpenQuiz(chapterId) },
                         onNext = { nextChapterId?.let(onOpenChapter) },
+                        palette = palette,
                     )
                 }
             }
+        }
+
+        // 点击手势层：翻页模式点左/右 1/3 翻页，中间呼出菜单；滚动模式任意点按呼出菜单。
+        // detectTapGestures 只消费点按，不干扰翻页滑动与滚动
+        Box(
+            Modifier
+                .fillMaxSize()
+                .pointerInput(readerMode) {
+                    detectTapGestures { offset ->
+                        when {
+                            readerMode == ReaderMode.PAGER && offset.x < size.width / 3f ->
+                                scope.launch {
+                                    if (pagerState.currentPage > 0) {
+                                        pagerState.animateScrollToPage(pagerState.currentPage - 1)
+                                    }
+                                }
+
+                            readerMode == ReaderMode.PAGER &&
+                                offset.x > size.width * 2f / 3f ->
+                                scope.launch {
+                                    val last = pages.size + footerPageCount - 1
+                                    if (pagerState.currentPage < last) {
+                                        pagerState.animateScrollToPage(pagerState.currentPage + 1)
+                                    }
+                                }
+
+                            else -> menuShown = !menuShown
+                        }
+                    }
+                },
+        )
+
+        // 呼出菜单：顶部（返回/书名章节/带讲解/来源/导览）与底部（目录/翻章/进度/设置）。
+        // 菜单是覆盖层，点菜单外的空白处会再触发一次 toggle 收起
+        AnimatedVisibility(
+            visible = menuShown,
+            modifier = Modifier.align(Alignment.TopStart),
+            enter = slideInVertically(initialOffsetY = { -it }) + fadeIn(),
+            exit = slideOutVertically(targetOffsetY = { -it }) + fadeOut(),
+        ) {
+            ReaderTopMenu(
+                bookTitle = project?.title.orEmpty(),
+                chapterTitle = chapter?.title.orEmpty(),
+                dense = dense,
+                onToggleDense = { vm.denseMode.value = it },
+                showTrust = !chapterTrust.isEmpty,
+                trustNeedsAttention = chapterTrust.needsAttentionCount > 0,
+                palette = palette,
+                onBack = onBack,
+                onOutline = { showOutline = true },
+                onTrust = { showTrust = true },
+            )
+        }
+        AnimatedVisibility(
+            visible = menuShown,
+            modifier = Modifier.align(Alignment.BottomStart),
+            enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
+            exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
+        ) {
+            ReaderBottomMenu(
+                mode = readerMode,
+                page = pagerState.currentPage,
+                pageCount = pages.size + footerPageCount,
+                chapterLabel = "第 ${chapter?.order ?: 1} 章",
+                hasPrev = prevChapterId != null,
+                hasNext = nextChapterId != null,
+                palette = palette,
+                onPrev = { prevChapterId?.let(onOpenChapter) },
+                onNext = { nextChapterId?.let(onOpenChapter) },
+                onToc = { showToc = true },
+                onSettings = { showReaderSettings = true },
+                onSeek = { pageIdx ->
+                    scope.launch { pagerState.scrollToPage(pageIdx) }
+                },
+            )
         }
     }
 
@@ -388,11 +609,24 @@ fun ReaderScreen(
                 visibleBlocks = visibleBlocks,
                 nodes = nodes,
                 onJumpBlock = { blockId ->
-                    val index = visibleBlocks.indexOfFirst { it.id == blockId }
-                    if (index >= 0) {
-                        highlightBlockId = blockId
-                        showOutline = false
-                        scope.launch { listState.animateScrollToItem(index + HEADER_ITEMS) }
+                    highlightBlockId = blockId
+                    showOutline = false
+                    when (readerMode) {
+                        ReaderMode.SCROLL -> {
+                            val index = visibleBlocks.indexOfFirst { it.id == blockId }
+                            if (index >= 0) {
+                                scope.launch { listState.animateScrollToItem(index + HEADER_ITEMS) }
+                            }
+                        }
+
+                        ReaderMode.PAGER -> {
+                            val pageIndex = pages.indexOfFirst { page ->
+                                page.any { it.block.id == blockId }
+                            }
+                            if (pageIndex >= 0) {
+                                scope.launch { pagerState.animateScrollToPage(pageIndex) }
+                            }
+                        }
                     }
                 },
                 onOpenNode = {
@@ -401,6 +635,30 @@ fun ReaderScreen(
                 },
             )
         }
+    }
+
+    if (showToc) {
+        BookTocSheet(
+            plans = allPlans,
+            currentChapterId = chapterId,
+            onOpen = { plan ->
+                showToc = false
+                if (plan.id != chapterId) onOpenChapter(plan.id)
+            },
+            onDismiss = { showToc = false },
+        )
+    }
+
+    if (showReaderSettings) {
+        ReaderSettingsSheet(
+            fontIndex = fontIndex,
+            onFont = { vm.setFontSize(it) },
+            paper = paper,
+            onPaper = { vm.setPaper(it) },
+            mode = readerMode,
+            onMode = { vm.setReaderMode(it) },
+            onDismiss = { showReaderSettings = false },
+        )
     }
 
     selectedNode?.let { node ->
@@ -441,6 +699,42 @@ fun ReaderScreen(
                     if (projectId != null) onOpenTrustCenter(projectId)
                 },
             )
+        }
+    }
+}
+
+/** 翻页模式第一页的章首头：章名 + 章序 + 必要的一次性提示 */
+@Composable
+private fun ReaderPageHeader(
+    title: String,
+    order: String,
+    notices: List<String>,
+    palette: ReaderPalette,
+) {
+    Column {
+        Text(
+            title,
+            fontSize = 24.sp,
+            lineHeight = 32.sp,
+            fontWeight = FontWeight.Bold,
+            color = palette.text,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(order, style = MaterialTheme.typography.labelMedium, color = palette.secondary)
+        notices.forEach { notice ->
+            Spacer(Modifier.height(12.dp))
+            Surface(
+                color = palette.cardContainer,
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    notice,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.cardContent,
+                    modifier = Modifier.padding(10.dp),
+                )
+            }
         }
     }
 }
@@ -821,12 +1115,13 @@ private fun ChapterFooter(
     hasNext: Boolean,
     onSelfTest: () -> Unit,
     onNext: () -> Unit,
+    palette: ReaderPalette,
 ) {
     Column(Modifier.fillMaxWidth()) {
         Text(
             "本章完",
             style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.outline,
+            color = palette.secondary,
         )
         // 无资料模式：章末列出需要自己核对的断言（问题3）
         chapter?.unverifiedClaims?.takeIf { it.isNotEmpty() }?.let { claims ->
@@ -847,7 +1142,7 @@ private fun ChapterFooter(
             Text(
                 "自测完全可选，不做也能继续往下读。",
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = palette.secondary,
             )
         }
         Spacer(Modifier.height(24.dp))
@@ -858,7 +1153,7 @@ private fun ChapterFooter(
  * 本章导览（章节内目录）。
  *
  * 回答三个问题：这一章在解决什么、涉及哪些知识点、关键结论在哪。
- * 关键结论用 KEY_POINT 块当锚点——它在安静与密集模式下都显示，跳过去一定看得到。
+ * 关键结论用 KEY_POINT 块当锚点——它在只看故事与带讲解两种模式下都显示，跳过去一定看得到。
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -991,11 +1286,18 @@ private fun BlockContent(
     sourceSummary: BlockSourceSummary?,
     onOpenNode: (KnowledgeNode) -> Unit,
     onOpenSources: () -> Unit,
+    palette: ReaderPalette,
+    /** 正文基准字号（sp），随阅读设置变化 */
+    fontSp: Int,
+    /** 翻页模式下本段实际渲染的文本（STORY 段落级切分）；null 表示整块 */
+    textOverride: String? = null,
+    /** 翻页模式下只有块的最后一段才挂知识点 chip 与来源入口 */
+    showAttachments: Boolean = true,
 ) {
     // 命中的块闪一下底色，让人一眼看到"就是这里"
     val highlightColor by animateColorAsState(
         targetValue = if (highlighted) {
-            MaterialTheme.colorScheme.tertiaryContainer
+            palette.cardContainer
         } else {
             Color.Transparent
         },
@@ -1011,33 +1313,31 @@ private fun BlockContent(
         when (block.blockType) {
             BlockType.STORY -> {
                 Text(
-                    block.text,
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontSize = 17.sp,
-                    lineHeight = 28.sp,
+                    textOverride ?: block.text,
+                    fontSize = fontSp.sp,
+                    lineHeight = (fontSp * 1.7f).sp,
+                    color = palette.text,
                 )
             }
 
             // 推演的落锤处：一句话钉住结论，用左侧竖线 + 大字号让它在长文里跳出来（问题2）
             BlockType.KEY_POINT -> {
+                val kpFs = fontSp + 2
                 Row(Modifier.fillMaxWidth()) {
                     Box(
                         Modifier
                             .width(3.dp)
                             .heightIn(min = 24.dp)
                             .fillMaxHeight()
-                            .background(
-                                MaterialTheme.colorScheme.primary,
-                                RoundedCornerShape(2.dp),
-                            ),
+                            .background(palette.accent, RoundedCornerShape(2.dp)),
                     )
                     Spacer(Modifier.width(14.dp))
                     Text(
                         block.text,
-                        style = MaterialTheme.typography.titleMedium,
+                        fontSize = kpFs.sp,
+                        lineHeight = (kpFs * 1.55f).sp,
                         fontWeight = FontWeight.SemiBold,
-                        lineHeight = 30.sp,
-                        color = MaterialTheme.colorScheme.onSurface,
+                        color = palette.text,
                         modifier = Modifier.weight(1f),
                     )
                 }
@@ -1046,33 +1346,37 @@ private fun BlockContent(
             BlockType.EXPLANATION -> BlockCard(
                 label = "📘 知识讲解",
                 text = block.text,
-                container = MaterialTheme.colorScheme.secondaryContainer,
-                content = MaterialTheme.colorScheme.onSecondaryContainer,
+                container = palette.cardContainer,
+                content = palette.cardContent,
+                fontSp = fontSp,
             )
 
             BlockType.FACT -> BlockCard(
                 label = "📄 原始事实",
                 text = block.text,
-                container = MaterialTheme.colorScheme.tertiaryContainer,
-                content = MaterialTheme.colorScheme.onTertiaryContainer,
+                container = palette.cardContainer,
+                content = palette.cardContent,
+                fontSp = fontSp,
             )
 
             BlockType.ANALOGY -> BlockCard(
                 label = "💡 类比说明",
                 text = block.text,
-                container = MaterialTheme.colorScheme.surfaceVariant,
-                content = MaterialTheme.colorScheme.onSurfaceVariant,
+                container = palette.cardContainer,
+                content = palette.cardContent,
+                fontSp = fontSp,
             )
 
             BlockType.FICTION -> BlockCard(
                 label = "🎭 虚构演绎",
                 text = block.text,
-                container = MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
-                content = MaterialTheme.colorScheme.onSurfaceVariant,
+                container = palette.cardContainer,
+                content = palette.cardContent,
+                fontSp = fontSp,
             )
         }
 
-        if (dense && block.knowledgeNodeIds.isNotEmpty()) {
+        if (showAttachments && dense && block.knowledgeNodeIds.isNotEmpty()) {
             Spacer(Modifier.height(8.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 block.knowledgeNodeIds.forEach { nodeId ->
@@ -1087,10 +1391,10 @@ private fun BlockContent(
             }
         }
 
-        // 来源入口（4A，判据在 4C 收紧）。克制显示：密集模式下有来源就给入口；
-        // 安静模式下只在**读者应该知道**的时候出现——出处没对上，或者这一段
+        // 来源入口（4A，判据在 4C 收紧）。克制显示：带讲解时有来源就给入口；
+        // 只看故事时只在**读者应该知道**的时候出现——出处没对上，或者这一段
         // 有待处理的核验问题。「这一段有 3 处正常来源」不该在读故事时反复打断视线
-        if (sourceSummary != null && sourceSummary.hasAnything &&
+        if (showAttachments && sourceSummary != null && sourceSummary.hasAnything &&
             (dense || sourceSummary.deservesAttention)
         ) {
             Spacer(Modifier.height(4.dp))
@@ -1107,9 +1411,9 @@ private fun BlockContent(
                     },
                     style = MaterialTheme.typography.labelMedium,
                     color = if (sourceSummary.deservesAttention) {
-                        MaterialTheme.colorScheme.tertiary
+                        palette.attention
                     } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
+                        palette.secondary
                     },
                 )
             }
@@ -1123,7 +1427,9 @@ private fun BlockCard(
     text: String,
     container: Color,
     content: Color,
+    fontSp: Int,
 ) {
+    val bodyFs = (fontSp - 2).coerceAtLeast(13)
     Surface(
         color = container,
         shape = MaterialTheme.shapes.medium,
@@ -1132,7 +1438,12 @@ private fun BlockCard(
         Column(Modifier.padding(12.dp)) {
             Text(label, style = MaterialTheme.typography.labelMedium, color = content)
             Spacer(Modifier.height(4.dp))
-            Text(text, style = MaterialTheme.typography.bodyMedium, color = content)
+            Text(
+                text,
+                fontSize = bodyFs.sp,
+                lineHeight = (bodyFs * 1.55f).sp,
+                color = content,
+            )
         }
     }
 }
