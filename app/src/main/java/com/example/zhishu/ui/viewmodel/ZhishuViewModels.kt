@@ -136,7 +136,15 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
         val publishedChapters: Int,
         /** 最近一次有阅读动作的时间（0 = 从没读过），用于「本周读过」统计 */
         val lastReadAt: Long,
-    )
+        /** 上次读到的章：点书直读的第一优先 */
+        val readingChapterId: String? = null,
+        /** 还没读过时从第一章可读章开始 */
+        val firstReadableChapterId: String? = null,
+    ) {
+        /** 点书直读的目标章：上次读到的 > 第一章可读的。null = 这本书还没有可读内容 */
+        val directReadChapterId: String?
+            get() = readingChapterId ?: firstReadableChapterId
+    }
 
     val projects: StateFlow<List<Project>> =
         container.projectRepository.observeAll()
@@ -201,6 +209,15 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
                     totalChapters = plans.size,
                     publishedChapters = plans.count { it.isReadable },
                     lastReadAt = progress?.updatedAt ?: 0L,
+                    readingChapterId = progress?.chapterId?.takeIf { id ->
+                        // 与项目页章节卡 canRead 同口径：待复核但有正文的章也能读
+                        plans.any {
+                            it.id == id && (it.isReadable || it.status == ChapterStatus.NEEDS_REVIEW)
+                        }
+                    },
+                    firstReadableChapterId = plans
+                        .firstOrNull { it.isReadable || it.status == ChapterStatus.NEEDS_REVIEW }
+                        ?.id,
                 )
                 nodeCounts[project.id] = container.knowledgeRepository.getByProject(project.id).size
                 if (progress != null) {

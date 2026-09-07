@@ -133,6 +133,8 @@ fun ProjectDetailScreen(
     onOpenTrustCenter: (String) -> Unit = {},
     /** 从正文跳回知识地图时带上的知识点：直接打开「知识主干」页并展开它 */
     focusNodeId: String? = null,
+    /** 初始落地的 tab（0 资料 / 1 知识主干 / 2 讲述路线）。知识页「查看地图」直达 tab 1 */
+    initialTab: Int = 0,
 ) {
     val app = LocalContext.current.applicationContext as Application
     val vm: ProjectDetailViewModel = rememberZhishuViewModel(key = "detail_$projectId") {
@@ -149,8 +151,11 @@ fun ProjectDetailScreen(
     val message by vm.message.collectAsState()
     val nodeAnchors by vm.nodeAnchors.collectAsState()
 
-    // 带 focusNodeId 进来就是「从正文回看知识地图」，直接停在知识主干页
-    var tab by rememberSaveable { mutableIntStateOf(if (focusNodeId != null) 1 else 0) }
+    // 带 focusNodeId 进来就是「从正文回看知识地图」，直接停在知识主干页；
+    // focusNodeId 为空时按路由给的 initialTab 落地（知识页「查看地图」直达 tab 1）
+    var tab by rememberSaveable {
+        mutableIntStateOf(if (focusNodeId != null) 1 else initialTab)
+    }
     var confirmDelete by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()

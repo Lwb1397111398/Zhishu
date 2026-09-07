@@ -48,6 +48,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -139,6 +140,17 @@ fun HomeScreen(
     val weekReadCount by vm.weekReadCount.collectAsState()
     var deleteTarget by remember { mutableStateOf<Project?>(null) }
 
+    // 每次回到书架都刷新阅读统计：点书直读靠它找「上次读到的章」，
+    // 不刷新的话读完一章返回再点同一本书，会被带回上一章而不是刚读到的位置
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) vm.refresh()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(title = { Text("知述", fontWeight = FontWeight.Bold) })
@@ -190,9 +202,10 @@ fun HomeScreen(
                 }
             }
         } else {
-            // 书架：继续阅读/复习横幅各占整行，书卡两列一排，点封面进书、长按管理
+            // 书架：继续阅读/复习横幅各占整行，书卡自适应列宽（手机 2 列、平板 3-4 列），
+            // 点封面直读、长按管理
             LazyVerticalGrid(
-                columns = GridCells.Fixed(2),
+                columns = GridCells.Adaptive(minSize = 150.dp),
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding),
@@ -263,7 +276,11 @@ fun HomeScreen(
                     BookCard(
                         project = project,
                         stat = bookStats[project.id],
-                        onOpen = { onOpenProject(project.id) },
+                        onRead = { chapterId ->
+                            // 不传 blockId：阅读器自己按保存的块恢复，位置更准
+                            onOpenReader(chapterId, null)
+                        },
+                        onOpenProject = { onOpenProject(project.id) },
                         onDelete = { deleteTarget = project },
                     )
                 }
@@ -361,19 +378,25 @@ private fun ContinueReadingCard(
 }
 
 /**
- * 书架上的书卡：程序化封面（渐变底 + 书名 + 讲法），点封面进书、长按弹出管理菜单。
- * 原项目卡片上的常驻「打开/删除」按钮收进长按菜单，减少视觉噪音但不减少功能。
+ * 书架上的书卡：程序化封面（渐变底 + 书名 + 讲法）。
+ *
+ * 点封面**直接进阅读**（有可读正文时，接着上次读到的那页；这正是老板说的
+ * 「点进去就仿佛小说软件一样」）；没有可读内容才进项目页。
+ * 长按弹出管理菜单：直接阅读 / 项目详情 / 删除——原来的常驻按钮收进来，
+ * 减少视觉噪音但不减少功能。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun BookCard(
     project: Project,
     stat: BookStat?,
-    onOpen: () -> Unit,
+    onRead: (String) -> Unit,
+    onOpenProject: () -> Unit,
     onDelete: () -> Unit,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
     val palette = coverPalette(project.id)
+    val directChapterId = stat?.directReadChapterId
 
     Column {
         Box {
@@ -385,7 +408,9 @@ private fun BookCard(
                     .clip(RoundedCornerShape(8.dp))
                     .background(Brush.verticalGradient(listOf(palette.top, palette.bottom)))
                     .combinedClickable(
-                        onClick = onOpen,
+                        onClick = {
+                            if (directChapterId != null) onRead(directChapterId) else onOpenProject()
+                        },
                         onLongClick = { menuExpanded = true },
                     ),
             ) {
@@ -428,11 +453,20 @@ private fun BookCard(
                 expanded = menuExpanded,
                 onDismissRequest = { menuExpanded = false },
             ) {
+                if (directChapterId != null) {
+                    DropdownMenuItem(
+                        text = { Text("直接阅读") },
+                        onClick = {
+                            menuExpanded = false
+                            onRead(directChapterId)
+                        },
+                    )
+                }
                 DropdownMenuItem(
-                    text = { Text("打开这本书") },
+                    text = { Text("项目详情") },
                     onClick = {
                         menuExpanded = false
-                        onOpen()
+                        onOpenProject()
                     },
                 )
                 DropdownMenuItem(
@@ -471,7 +505,8 @@ private fun BookCard(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun KnowledgeHubScreen(
-    onOpenProject: (String) -> Unit,
+    /** 点某本书 = 看它的知识地图（导航层直达项目详情的「知识主干」tab） */
+    onOpenMap: (String) -> Unit,
     onSearch: () -> Unit,
 ) {
     val app = LocalContext.current.applicationContext as Application
@@ -549,7 +584,7 @@ fun KnowledgeHubScreen(
                     KnowledgeProjectCard(
                         project = project,
                         nodeCount = knowledgeStats[project.id] ?: 0,
-                        onOpen = { onOpenProject(project.id) },
+                        onOpen = { onOpenMap(project.id) },
                     )
                 }
                 item(key = "__bottom__") { Spacer(Modifier.height(24.dp)) }

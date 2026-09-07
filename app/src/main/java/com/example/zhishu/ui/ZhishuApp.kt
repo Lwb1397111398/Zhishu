@@ -41,7 +41,7 @@ object Routes {
     const val REVIEW = "review"
     const val SETTINGS = "settings"
     const val CREATE = "create"
-    const val PROJECT = "project/{projectId}?nodeId={nodeId}"
+    const val PROJECT = "project/{projectId}?nodeId={nodeId}&tab={tab}"
     const val READER = "reader/{chapterId}?blockId={blockId}"
     const val QUIZ = "quiz/{chapterId}"
     const val SEARCH = "search?projectId={projectId}"
@@ -53,8 +53,8 @@ object Routes {
     const val TRUST = "trust/{projectId}"
 
     /** [nodeId] 不为空时直接打开「知识主干」页并展开该知识点（正文 → 知识地图） */
-    fun project(projectId: String, nodeId: String? = null) =
-        "project/$projectId?nodeId=${nodeId.orEmpty()}"
+    fun project(projectId: String, nodeId: String? = null, tab: Int = 0) =
+        "project/$projectId?nodeId=${nodeId.orEmpty()}&tab=$tab"
 
     /** [blockId] 不为空时阅读器滚动到该正文块并短暂高亮（搜索/地图/资料 → 正文） */
     fun reader(chapterId: String, blockId: String? = null) =
@@ -142,7 +142,8 @@ fun ZhishuRoot(
             }
             composable(Routes.KNOWLEDGE) {
                 KnowledgeHubScreen(
-                    onOpenProject = { navController.navigate(Routes.project(it)) },
+                    // 知识页的卡片语义就是「看这本书的知识地图」，直达对应 tab
+                    onOpenMap = { navController.navigate(Routes.project(it, tab = 1)) },
                     onSearch = { navController.navigate(Routes.search()) },
                 )
             }
@@ -174,11 +175,16 @@ fun ZhishuRoot(
                         nullable = true
                         defaultValue = null
                     },
+                    navArgument("tab") {
+                        type = NavType.IntType
+                        defaultValue = 0
+                    },
                 ),
             ) { entry ->
                 val projectId = entry.arguments?.getString("projectId").orEmpty()
                 ProjectDetailScreen(
                     projectId = projectId,
+                    initialTab = entry.arguments?.getInt("tab") ?: 0,
                     focusNodeId = entry.arguments?.getString("nodeId")?.takeIf { it.isNotBlank() },
                     onBack = { navController.popBackStack() },
                     onOpenReader = { chapterId, blockId ->
