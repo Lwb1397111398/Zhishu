@@ -832,18 +832,22 @@ private fun MapTab(
                 )
                 Spacer(Modifier.height(8.dp))
             }
+            // 统计与操作分两行：一行说状态，一行放按钮——挤在一行时
+            // 左侧文字会被两个按钮压成三四行（「页面挤压」的典型现场）
+            Column(Modifier.fillMaxWidth()) {
+                Text("共 ${nodes.size} 个知识点", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "点进节点能看到它「从哪来、又引出什么」",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Row(
-                Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
+                Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+                horizontalArrangement = Arrangement.End,
             ) {
-                Column(Modifier.weight(1f)) {
-                    Text("共 ${nodes.size} 个知识点", style = MaterialTheme.typography.bodySmall)
-                    Text(
-                        "点进节点能看到它「从哪来、又引出什么」",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
                 OutlinedButton(
                     onClick = { vm.enqueueKnowledgeMap(KnowledgeMapMode.FULL) },
                     enabled = !busy,
