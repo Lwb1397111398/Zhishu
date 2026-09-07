@@ -83,6 +83,37 @@ class CreateProjectViewModelTest {
         assertTrue(empty.createProject().isFailure)
     }
 
+    /**
+     * 学习画像三项真的落库（用户反馈：「想学什么这个太笼统了」）。
+     *
+     * 这是主干怎么切的依据——同样填「民法」，研究生深化 / 非专业自学 / 法考备考
+     * 是三种完全不同的切法，所以从创建页到数据库这一段不能断。
+     */
+    @Test
+    fun createProject_persistsLearnerProfile() = runBlocking {
+        vm.learnerIdentity.value = "民商法研究生，本科民法基础不牢"
+        vm.learningPurpose.value = "写论文需要深化理论"
+        vm.learningGoal.value = "能比较各家学说并给出自己的论证"
+        vm.addTextSource("第一份", "第一段内容。")
+
+        val id = vm.createProject().getOrThrow()
+        val project = container.projectRepository.get(id)
+        assertEquals("民商法研究生，本科民法基础不牢", project?.learnerIdentity)
+        assertEquals("写论文需要深化理论", project?.learningPurpose)
+        assertEquals("能比较各家学说并给出自己的论证", project?.learningGoal)
+    }
+
+    /** 三项都不填仍能建项目：老流程不被新字段卡住，读出来是空串而不是 null */
+    @Test
+    fun createProject_withoutLearnerProfile_stillWorks() = runBlocking {
+        vm.addTextSource("第一份", "第一段内容。")
+        val id = vm.createProject().getOrThrow()
+        val project = container.projectRepository.get(id)
+        assertEquals("", project?.learnerIdentity)
+        assertEquals("", project?.learningPurpose)
+        assertEquals("", project?.learningGoal)
+    }
+
     @Test
     fun removeSource_dropsPendingEntry() {
         vm.addTextSource("A", "内容 A")

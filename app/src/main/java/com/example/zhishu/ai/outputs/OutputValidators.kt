@@ -42,18 +42,33 @@ object OutputValidators {
     /**
      * 单链展开校验（批次化生成）。
      *
-     * [expectedKeys] 是骨架阶段程序分配的 nodeKey 集合——模型必须原样回传
-     * 标识才能匹配到占位节点；[knownTitles] 是骨架阶段的标题集合——模型给出的
-     * 标题不在骨架里的（超纲节点）按「模型改了标题」丢弃，写进 gaps 提示，
-     * 而不是让整条链失败。没带 nodeKey、或带了不认识标识的节点一律丢弃。
+     * [expectedKeys] 是骨架阶段程序分配的 nodeKey 集合——模型原样回传标识
+     * 即可匹配；[knownTitles] 是骨架阶段的标题集合，作为第二通道兜底：
+     * 标识抄错/没带但标题与骨架一致时仍算有效（回填方按标题找节点）。
+     * 原来只认标识、静默丢弃，一个字符抄错就丢掉整个节点且链照样标「完成」，
+     * 用户看到的是一张缺内容的地图却没有任何报错。
+     * 标题也不在骨架里的（超纲节点）按「模型改了标题」丢弃，写进 gaps 提示，
+     * 而不是让整条链失败。
      */
     fun validateChainNodes(
         output: ChainNodesOutput,
         expectedKeys: Set<String>,
         knownTitles: Set<String>,
     ): Result<Pair<List<NodeDto>, List<String>>> {
-        val valid = output.nodes.filter { it.nodeKey.isNotBlank() && it.nodeKey in expectedKeys }
-        val unmatched = output.nodes.map { it.title.trim() }
+        val valid = output.nodes.filter { dto ->
+            // 没有 definition 的节点没有任何可写入的内容：多半是截断修复剪出来的
+            // 残壳。放它过去会把占位节点标成 COMPLETED——用户看到一个空节点，
+            // 而 COMPLETED 永远不再重试，这个洞就补不回来了。丢弃后它保持
+            // 占位，本链会被判为「没填满」并重新展开。
+            dto.definition.isNotBlank() &&
+                (
+                    (dto.nodeKey.isNotBlank() && dto.nodeKey in expectedKeys) ||
+                        dto.title.trim() in knownTitles
+                    )
+        }
+        val unmatched = output.nodes
+            .filter { it.definition.isNotBlank() }
+            .map { it.title.trim() }
             .filter { it.isNotBlank() }
             .distinct()
             .filter { title -> title !in knownTitles }
@@ -67,25 +82,6 @@ object OutputValidators {
             .filter { it.topic.isNotBlank() }
             .distinctBy { it.topic.trim() }
         return Result.success(output.copy(gaps = gaps, conflicts = conflicts))
-    }
-
-    fun validateKnowledgeMap(output: KnowledgeMapOutput): Result<KnowledgeMapOutput> {
-        val nodes = output.nodes.filter { it.title.isNotBlank() }
-        if (nodes.isEmpty()) {
-            return Result.failure(ModelError.Invalid("知识地图没有任何有效知识点"))
-        }
-        val duplicated = nodes.groupBy { it.title.trim() }.filterValues { it.size > 1 }.keys
-        if (duplicated.isNotEmpty()) {
-            return Result.failure(
-                ModelError.Invalid("知识点标题重复：${duplicated.take(3).joinToString("、")}"),
-            )
-        }
-        // 演进链只保留能映射到既有节点的部分，链本身缺失不算失败（章节规划可退回按节点顺序切分）
-        val titles = nodes.map { it.title.trim() }.toSet()
-        val chains = output.chains
-            .map { chain -> chain.copy(nodeTitles = chain.nodeTitles.map { it.trim() }.filter { it in titles }) }
-            .filter { it.nodeTitles.size >= 2 }
-        return Result.success(output.copy(nodes = nodes, chains = chains))
     }
 
     /**
@@ -156,8 +152,20 @@ object OutputValidators {
      *
      * 注意边界：APPLY 的「正文真的应用了知识」由核验阶段判断（no_application），
      * 这里只校验模型的**声明**，不越权替核验下结论。
+     *
+     * [knownNodeKeys] 非空时按**编号**比对（三段式逐章契约）：编号是批次内稳定标识，
+     * 杜绝了标题匹配「差一个字整章作废」的失败模式。为空时退回标题比对（旧一次成型路径）。
+     *
+     * 之所以做成 public：三段式里契约是逐章生成、逐章校验的，校验入口在
+     * `PipelineService` 而不是某次整体输出的 `validateXxx` 里。
      */
-    private fun contractViolation(chapter: ChapterPlanDto, knownNodeTitles: Set<String>): String? {
+    fun contractViolation(
+        chapter: ChapterPlanDto,
+        knownNodeTitles: Set<String>,
+        knownNodeKeys: Set<String> = emptySet(),
+    ): String? {
+        // 编号模式下「存在的节点」= 白名单里的编号；标题模式不变
+        val known = if (knownNodeKeys.isNotEmpty()) knownNodeKeys else knownNodeTitles
         if (chapter.contract.isEmpty) {
             return "章节「${chapter.title}」缺少因果契约（第 ${chapter.order} 章）。" +
                 "新版本路线必须为每一章生成契约，否则无法保证因果结构。"
@@ -172,15 +180,16 @@ object OutputValidators {
         val contractTitles = (c.introducedNodeTitles + c.appliedNodeTitles)
             .map { it.trim() }
             .filter { it.isNotBlank() }
-        val unknownInContract = contractTitles.filter { it !in knownNodeTitles }.distinct()
+        val unknownInContract = contractTitles.filter { it !in known }.distinct()
         if (unknownInContract.isNotEmpty()) {
-            return "章节「${chapter.title}」的契约引用了不存在的知识点：" +
+            val unit = if (knownNodeKeys.isNotEmpty()) "编号" else "知识点"
+            return "章节「${chapter.title}」的契约引用了不存在的$unit：" +
                 "${unknownInContract.take(5).joinToString("、")}（第 ${chapter.order} 章）"
         }
-        // 有效节点（存在于地图上的去重标题）
-        val effectiveNodes = contractTitles.filter { it in knownNodeTitles }.distinct()
-        val introduced = c.introducedNodeTitles.map { it.trim() }.filter { it in knownNodeTitles }.toSet()
-        val applied = c.appliedNodeTitles.map { it.trim() }.filter { it in knownNodeTitles }.toSet()
+        // 有效节点（存在于地图上的去重标题/编号）
+        val effectiveNodes = contractTitles.filter { it in known }.distinct()
+        val introduced = c.introducedNodeTitles.map { it.trim() }.filter { it in known }.toSet()
+        val applied = c.appliedNodeTitles.map { it.trim() }.filter { it in known }.toSet()
         return when (type) {
             ChapterType.INTRODUCE -> when {
                 c.knowledgeGap.isBlank() -> "INTRODUCE 章节「${chapter.title}」缺少 knowledgeGap（读者必须感到缺一块解释）"

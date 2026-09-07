@@ -32,10 +32,10 @@ import com.example.zhishu.R
 internal object GenerationNotifier {
 
     /** 正在生成的前台通知渠道。低优先级，不出声不弹横幅。 */
-    const val CHANNEL_PROGRESS = "generation_progress"
+    private const val CHANNEL_PROGRESS = "generation_progress"
 
     /** 结果通知渠道。默认优先级，用户会看到一条可点开的总结。 */
-    const val CHANNEL_RESULT = "generation_result"
+    private const val CHANNEL_RESULT = "generation_result"
 
     /** 前台通知固定用这个 ID，多章串行时复用同一条，不会堆一屏 */
     private const val NOTIFICATION_ID_PROGRESS = 4101
@@ -76,8 +76,6 @@ internal object GenerationNotifier {
         total: Int,
     ): ForegroundInfo {
         ensureChannels(context)
-        val cancelIntent = WorkManager.getInstance(context)
-            .createCancelPendingIntent(java.util.UUID.randomUUID())
         val builder = NotificationCompat.Builder(context, CHANNEL_PROGRESS)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle(projectTitle.ifBlank { "正在生成" })

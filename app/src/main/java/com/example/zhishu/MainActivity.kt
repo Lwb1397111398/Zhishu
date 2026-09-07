@@ -20,14 +20,22 @@ class MainActivity : ComponentActivity() {
      */
     private var pendingProjectId by mutableStateOf<String?>(null)
 
+    /**
+     * 通知点击的序号：每点一次自增。
+     * 只有 pendingProjectId 不够——同一项目的通知点第二次时 ID 没变，
+     * 组合层的 LaunchedEffect(key) 不会重跑，用户已经导航去别处就跳不回来。
+     */
+    private var projectNavToken by mutableStateOf(0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // 渠道尽早建好：Worker 里再建也行，但那时通知已经要发了
         GenerationNotifier.ensureChannels(this)
         pendingProjectId = intent?.projectIdExtra()
+        if (pendingProjectId != null) projectNavToken++
         setContent {
             ZhishuTheme {
-                ZhishuAppContent(initialProjectId = pendingProjectId)
+                ZhishuAppContent(initialProjectId = pendingProjectId, navToken = projectNavToken)
             }
         }
     }
@@ -36,6 +44,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         pendingProjectId = intent.projectIdExtra()
+        if (pendingProjectId != null) projectNavToken++
     }
 
     private fun Intent.projectIdExtra(): String? =
@@ -43,6 +52,6 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun ZhishuAppContent(initialProjectId: String?) {
-    ZhishuRoot(initialProjectId = initialProjectId)
+private fun ZhishuAppContent(initialProjectId: String?, navToken: Int) {
+    ZhishuRoot(initialProjectId = initialProjectId, projectNavToken = navToken)
 }

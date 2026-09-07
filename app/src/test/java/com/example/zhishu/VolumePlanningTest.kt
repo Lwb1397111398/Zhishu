@@ -55,6 +55,7 @@ class VolumePlanningTest {
             ApplicationProvider.getApplicationContext(),
             AppDatabase::class.java,
         ).allowMainThreadQueries().build()
+        RouteStubs.reset()
         router = VolumeRouter()
         ids = 0
         pipeline = PipelineService(
@@ -68,6 +69,7 @@ class VolumePlanningTest {
                 db = db,
                 conflictDao = db.knowledgeConflictDao(),
                 batchDao = db.knowledgeMapBatchDao(),
+                routeBatchDao = db.routeBatchDao(),
             ),
             chapterRepository = DefaultChapterRepository(
                 db.chapterPlanDao(),
@@ -104,7 +106,9 @@ class VolumePlanningTest {
     @Test
     fun firstPlanning_trimsOversizedPlanToVolumeCap() = runBlocking {
         seedMap()
-        router.bibleChapterCount = 20
+        // 桩给 20 章，程序只收前 VOLUME_MAX_CHAPTERS 章（三段式后章数由桩控制，
+        // 不再受「节点数封顶」影响——节点封顶是另一条独立约束）
+        RouteStubs.outlineChapterCount = 20
         pipeline.generateStoryBible("p-1").getOrThrow()
 
         assertEquals(8, db.chapterPlanDao().getByProject("p-1").size)
@@ -296,6 +300,24 @@ class VolumePlanningTest {
 
     private suspend fun seedPlannedVolume() {
         seedMap()
+        // 三段式之后第一卷按「每章 1~4 个节点」把 4 个知识点全讲了（旧路径只讲 2 个），
+        // 续卷就没有「还没讲过的知识点」可讲。这里补两个后续节点，
+        // 让「续卷讲的是新知识点」这条性质仍然可测——补的是种子数据，不是被测行为。
+        db.knowledgeNodeDao().upsertAll(
+        // 这两个标题不能与骨架链上的节点重名：重名会让「待讲清单」算成同一个概念，
+        // 续卷只产 1 章，「续卷讲的是新知识点」和「讲完就 MainLineDone」都对不上
+        listOf("遗赠扶养协议", "特留份").mapIndexed { index, title ->
+                com.example.zhishu.domain.model.KnowledgeNode(
+                    id = "n-extra-$index",
+                    projectId = "p-1",
+                    nodeKey = "nk-extra-$index",
+                    title = title,
+                    definition = "$title 的定义。",
+                    sourceRefs = listOf("c-1"),
+                    depth = 2,
+                )
+            },
+        )
         pipeline.generateStoryBible("p-1").getOrThrow()
     }
 

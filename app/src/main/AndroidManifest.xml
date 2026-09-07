@@ -5,9 +5,19 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!--
-      生成一章要连着调三次模型（正文、核验、出题），加上退避重试可能接近普通 Worker
-      的执行窗口，所以真正跑模型的 Worker 会 setForeground。dataSync 对应
+      生成一章要连着调三次模型（正文、核验、出题），讲述路线还要逐章生成契约，
+      一个 Worker 里串着好几轮调用，早就超过后台任务的执行窗口，
+      所以真正跑模型的 Worker 会 setForeground。dataSync 对应
       「代替用户完成一段网络工作」，与实际行为一致。
+
+      两条权限缺一不可：
+      - FOREGROUND_SERVICE：Android 9 起所有前台服务的基础权限；
+      - FOREGROUND_SERVICE_DATA_SYNC：targetSdk 34+ 起按类型额外要求的一条。
+
+      只留类型那一条会抛 SecurityException——前台服务根本起不来，长任务失去保护，
+      被系统按后台任务的 10 分钟窗口掐断。而失败时 Worker 拿不到任何原因，
+      界面只剩一句「生成失败，请检查网络与模型配置后重试」，看起来像配置问题，
+      其实是长任务被系统收走了。
     -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />

@@ -45,6 +45,15 @@ data class Project(
     /** 模型为本项目自选/沿用的叙事风格，genre 为自由发挥时由故事总纲阶段回填 */
     @ColumnInfo(defaultValue = "")
     val resolvedGenre: String = "",
+    /** 为什么学习这门学科，例如工作、考试、研究或兴趣 */
+    @ColumnInfo(defaultValue = "")
+    val learningPurpose: String = "",
+    /** 学习者身份与使用场景，例如民商法研究生、法考考生 */
+    @ColumnInfo(defaultValue = "")
+    val learnerIdentity: String = "",
+    /** 学完希望达到的可观察结果 */
+    @ColumnInfo(defaultValue = "")
+    val learningGoal: String = "",
 ) {
     val usesModelKnowledge: Boolean get() = sourceMode == SourceMode.MODEL
 

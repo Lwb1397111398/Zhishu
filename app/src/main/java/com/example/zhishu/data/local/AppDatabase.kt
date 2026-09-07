@@ -15,17 +15,21 @@ import com.example.zhishu.data.local.dao.CitationDao
 import com.example.zhishu.data.local.dao.KnowledgeConflictDao
 import com.example.zhishu.data.local.dao.KnowledgeGapDao
 import com.example.zhishu.data.local.dao.KnowledgeMapBatchDao
+import com.example.zhishu.data.local.dao.ApiProfileDao
 import com.example.zhishu.data.local.dao.KnowledgeNodeDao
-import com.example.zhishu.data.local.dao.ModelConfigDao
 import com.example.zhishu.data.local.dao.ProjectDao
 import com.example.zhishu.data.local.dao.QuizDao
 import com.example.zhishu.data.local.dao.ReadingProgressDao
 import com.example.zhishu.data.local.dao.ReviewItemDao
+import com.example.zhishu.data.local.dao.RoleAssignmentDao
+import com.example.zhishu.data.local.dao.RouteBatchDao
 import com.example.zhishu.data.local.dao.SourceChunkDao
 import com.example.zhishu.data.local.dao.SourceDocumentDao
 import com.example.zhishu.data.local.dao.StoryBibleDao
 import com.example.zhishu.data.local.dao.VerificationIssueDao
 import com.example.zhishu.domain.model.AnswerRecord
+import com.example.zhishu.domain.model.ApiProfile
+import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterBlockFts
 import com.example.zhishu.domain.model.ChapterPlan
@@ -35,11 +39,12 @@ import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeMapBatch
 import com.example.zhishu.domain.model.KnowledgeNode
-import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.Quiz
 import com.example.zhishu.domain.model.ReadingProgress
 import com.example.zhishu.domain.model.ReviewItem
+import com.example.zhishu.domain.model.RoleAssignment
+import com.example.zhishu.domain.model.RouteBatch
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceChunkFts
 import com.example.zhishu.domain.model.SourceDocument
@@ -70,10 +75,12 @@ import kotlinx.serialization.json.Json
         AnswerRecord::class,
         ReviewItem::class,
         ReadingProgress::class,
-        ModelConfig::class,
+        ApiProfile::class,
+        RoleAssignment::class,
         StoryBible::class,
+        RouteBatch::class,
     ],
-    version = 15,
+    version = 18,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)
@@ -94,8 +101,10 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun answerRecordDao(): AnswerRecordDao
     abstract fun reviewItemDao(): ReviewItemDao
     abstract fun readingProgressDao(): ReadingProgressDao
-    abstract fun modelConfigDao(): ModelConfigDao
+    abstract fun apiProfileDao(): ApiProfileDao
+    abstract fun roleAssignmentDao(): RoleAssignmentDao
     abstract fun storyBibleDao(): StoryBibleDao
+    abstract fun routeBatchDao(): RouteBatchDao
 
     companion object {
         private const val DATABASE_NAME = "zhishu.db"
@@ -832,6 +841,138 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v15 → v16：`projects` 增加学习画像三列。
+         *
+         * 「想学什么」只有 topic 太笼统——「民法」对民商法研究生、非法学自学者、
+         * 法考考生应该切出完全不同的知识主干。三列都是 TEXT 默认空串：
+         * 旧项目读出来为空，提示词里那一节整体省略，行为与改造前一致；
+         * 老备份导入时新列落默认值，新备份导出时默认值字段省略，
+         * 上一版应用仍能读（ignoreUnknownKeys），formatVersion 不升位。
+         */
+        val MIGRATION_15_16 = object : Migration(15, 16) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE projects ADD COLUMN learningPurpose TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE projects ADD COLUMN learnerIdentity TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE projects ADD COLUMN learningGoal TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
+        /**
+         * v16 → v17（三段式改造 + gaps 闭环）。
+         *
+         * 1. 新增 `route_batches`：讲述路线「分卷 → 大纲 → 契约」三段的批次断点，
+         *    与 `knowledge_map_batches` 同构。一章契约失败只标那一章，重跑只补没做完的。
+         * 2. `chapters` 增加 `contractStatus`，默认 DONE——老数据已有 contractJson
+         *    （或明确无契约），不能被新逻辑误判成「契约待生成」。
+         * 3. `knowledge_gaps` 增加类型与处理状态四列：PATCH 补节点后该条标 RESOLVED，
+         *    UI 不再显示；`status` 默认空串，读取方把空串视为 OPEN，老数据可见性不变。
+         * 4. `knowledge_conflicts` 增加 `status`，同样默认空串视为 OPEN。
+         */
+        val MIGRATION_16_17 = object : Migration(16, 17) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `route_batches` (" +
+                        "`id` TEXT NOT NULL, `projectId` TEXT NOT NULL, " +
+                        "`volumeIndex` INTEGER NOT NULL DEFAULT 0, " +
+                        "`outlineJson` TEXT NOT NULL DEFAULT '', " +
+                        "`contractStatuses` TEXT NOT NULL DEFAULT '[]', " +
+                        "`introducedKeysJson` TEXT NOT NULL DEFAULT '[]', " +
+                        "`outlineDone` INTEGER NOT NULL DEFAULT 0, " +
+                        "`contractsDone` INTEGER NOT NULL DEFAULT 0, " +
+                        "`failedChapterCount` INTEGER NOT NULL DEFAULT 0, " +
+                        "`completed` INTEGER NOT NULL DEFAULT 0, " +
+                        "`failed` INTEGER NOT NULL DEFAULT 0, " +
+                        "`createdAt` INTEGER NOT NULL DEFAULT 0, " +
+                        "`updatedAt` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_route_batches_projectId` " +
+                        "ON `route_batches` (`projectId`)",
+                )
+                db.execSQL("ALTER TABLE chapters ADD COLUMN contractStatus TEXT NOT NULL DEFAULT 'DONE'")
+                db.execSQL("ALTER TABLE knowledge_gaps ADD COLUMN gapType TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE knowledge_gaps ADD COLUMN status TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE knowledge_gaps ADD COLUMN anchorNodeId TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE knowledge_gaps ADD COLUMN suggestedTitle TEXT NOT NULL DEFAULT ''")
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_knowledge_gaps_projectId_status` " +
+                        "ON `knowledge_gaps` (`projectId`, `status`)",
+                )
+                db.execSQL("ALTER TABLE knowledge_conflicts ADD COLUMN status TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
+        /**
+         * v17 → v18：API 配置与「谁在用」分离——配置方案库 + 三档分配。
+         *
+         * 原来 `model_configs` 每个角色一行完整配置（主键就是 role），想试不同的
+         * 模型就得把地址与 Key 在三张卡片里重填一遍。现在拆成两张表：
+         *
+         * 1. `api_profiles`：一套套完整的 API 配置方案（名称/地址/模型/Key/参数），
+         *    数量不限；
+         * 2. `role_assignments`：FAST/STORY/VERIFY 各自指向哪个方案。
+         *
+         * 旧表里已保存的配置逐行搬成方案（名称带原角色，方便辨认），并把对应
+         * 角色分配过去——升级后什么都不用重填。只填了一半的配置也搬（至少少敲
+         * 一遍地址），三样全空的行没有搬的价值，跳过。
+         *
+         * Key 密文原样复制、不解密：加密走本机 keystore 的固定别名
+         * （ConfiguredModelRouter.KEY_ALIAS），换表名不影响解密。
+         */
+        val MIGRATION_17_18 = object : Migration(17, 18) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `api_profiles` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`name` TEXT NOT NULL, `baseUrl` TEXT NOT NULL, `modelName` TEXT NOT NULL, " +
+                        "`maxTokens` INTEGER NOT NULL, `temperature` REAL NOT NULL, " +
+                        "`supportsJson` INTEGER NOT NULL, `keyRef` TEXT)",
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `role_assignments` (" +
+                        "`role` TEXT NOT NULL, `profileId` INTEGER, PRIMARY KEY(`role`))",
+                )
+                db.query(
+                    "SELECT role, baseUrl, modelName, maxTokens, temperature, supportsJson, keyRef FROM model_configs",
+                ).use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val role = cursor.getString(0)
+                        val baseUrl = cursor.getString(1).orEmpty()
+                        val modelName = cursor.getString(2).orEmpty()
+                        val keyRef = cursor.getString(6)
+                        if (baseUrl.isBlank() && modelName.isBlank() && keyRef.isNullOrBlank()) continue
+                        db.execSQL(
+                            "INSERT INTO api_profiles " +
+                                "(name, baseUrl, modelName, maxTokens, temperature, supportsJson, keyRef) " +
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            arrayOf<Any?>(
+                                "原「${displayNameOf(role)}」配置",
+                                baseUrl,
+                                modelName,
+                                cursor.getInt(3),
+                                cursor.getFloat(4),
+                                cursor.getInt(5),
+                                keyRef,
+                            ),
+                        )
+                        val profileId = db.query("SELECT last_insert_rowid()").use { c ->
+                            c.moveToFirst()
+                            c.getLong(0)
+                        }
+                        db.execSQL(
+                            "INSERT OR REPLACE INTO role_assignments (role, profileId) VALUES (?, ?)",
+                            arrayOf<Any?>(role, profileId),
+                        )
+                    }
+                }
+                db.execSQL("DROP TABLE IF EXISTS model_configs")
+            }
+
+            private fun displayNameOf(role: String): String =
+                runCatching { ModelRole.valueOf(role).displayName }.getOrDefault(role)
+        }
+
         /** 迁移里手工拼列表时用的 JSON 编解码，与 [Converters] 保持一致 */
         val LIST_JSON = Json
         val LIST_SERIALIZER = ListSerializer(String.serializer())
@@ -853,6 +994,9 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_12_13,
                     MIGRATION_13_14,
                     MIGRATION_14_15,
+                    MIGRATION_15_16,
+                    MIGRATION_16_17,
+                    MIGRATION_17_18,
                 )
                 .build()
     }

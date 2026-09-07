@@ -115,7 +115,4 @@ interface CitationDao {
             "WHERE chunkId IN (SELECT id FROM source_chunks WHERE sourceId = :sourceId)",
     )
     suspend fun unconfirmForSource(sourceId: String, deleted: CitationStatus)
-
-    @Query("SELECT COUNT(*) FROM citations WHERE projectId = :projectId")
-    suspend fun countAllVersionsByProject(projectId: String): Int
 }

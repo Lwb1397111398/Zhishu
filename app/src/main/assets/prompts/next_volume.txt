@@ -5,8 +5,6 @@
 ## 已经走到哪里
 
 主题：{topic}
-学习目标：{goal}
-读者起点：{baseline}
 已完成的卷：第 {currentVolume} 卷
 故事累积状态：{runningState}
 上一章结束时的处境：{lastEndingState}
@@ -17,6 +15,10 @@
 
 **还没讲到**的知识点（新卷应当优先安排这些）：
 {pendingNodes}
+
+## 学习者画像（决定新卷讲到什么深度、按什么框架编排）
+
+{learnerProfile}
 
 ## 规则
 

@@ -44,12 +44,15 @@ class SourceDetailViewModel(
 
     private fun load() {
         viewModelScope.launch {
+            // 先按 ID 直查资料本身：原来靠「片段的 projectId」反推资料，
+            // 一份解析失败或内容为空的资料（0 片段）会走不到赋值那一步，
+            // 页面于是把「还在库里的资料」误报成「这份资料已经不在库里了」（D4）。
+            val document = container.sourceRepository.getById(sourceId)
+            _source.value = document
             val chunkList = container.sourceRepository.getChunks(sourceId).sortedBy { it.ordinal }
             _chunks.value = chunkList
-            val projectId = chunkList.firstOrNull()?.projectId
+            val projectId = document?.projectId ?: chunkList.firstOrNull()?.projectId
                 ?: return@launch
-            _source.value = container.sourceRepository.getByProject(projectId)
-                .firstOrNull { it.id == sourceId }
 
             // 三次整表查询换掉「每个片段查一次」：一份 PDF 切出上百个片段，
             // 逐个查会在打开页面时打出上百条 SQL

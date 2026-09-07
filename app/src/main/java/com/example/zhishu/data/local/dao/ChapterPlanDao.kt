@@ -40,9 +40,6 @@ interface ChapterPlanDao {
         wordTarget: Int,
     )
 
-    @Query("UPDATE chapters SET nodeIds = :nodeIds WHERE id = :id")
-    suspend fun updateNodeIds(id: String, nodeIds: List<String>)
-
     @Query("UPDATE chapters SET status = :status, verificationNote = :note WHERE id = :id")
     suspend fun updateStatus(id: String, status: ChapterStatus, note: String)
 

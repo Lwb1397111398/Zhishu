@@ -78,6 +78,7 @@ class SourceTraceTest {
                 db = db,
                 conflictDao = db.knowledgeConflictDao(),
                 batchDao = db.knowledgeMapBatchDao(),
+                routeBatchDao = db.routeBatchDao(),
             ),
             chapterRepository = DefaultChapterRepository(
                 db.chapterPlanDao(),

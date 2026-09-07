@@ -37,7 +37,22 @@
 - `ANALOGY`：打比方
 - `FICTION`：明确标记为虚构演绎的部分
 
+**注意：上面「本章类型」里的 INTRODUCE / APPLY / CONTRAST / REVIEW / ASSESS 是章节类型，
+不是段落类型，绝不能出现在块的 `type` 字段里。** 做概念辨析（CONTRAST）时，那些
+"停下来分辨"的段落用 `EXPLANATION` 标记。
+
 ## 每个块必须填写的字段
+
+每个块（`blocks` 数组的元素）都是一个 JSON 对象，**恰好包含这四个字段，字段名必须一字不差**：
+
+```json
+{"type": "STORY", "text": "……这个块的正文文字……", "knowledgeNodeTitles": ["标题一"], "sourceRefs": []}
+```
+
+- `type`：段落类型，取上面列出的六个值之一
+- `text`：**这个块的正文文字就放在这个字段里**——不是 `content`、不是 `body`，就是 `text`，值为字符串
+- `knowledgeNodeTitles`：对应的知识点标题
+- `sourceRefs`：没有资料引用时给空数组 `[]`
 
 **`knowledgeNodeTitles` 是必填字段，不能为空数组**（程序会校验，缺失会导致整章被拒收）：
 

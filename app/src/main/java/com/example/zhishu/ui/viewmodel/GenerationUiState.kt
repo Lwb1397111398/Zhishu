@@ -108,8 +108,12 @@ internal fun List<WorkInfo>.toGenerationState(): GenerationUiState {
     val failed = current.lastOrNull { it.state == WorkInfo.State.FAILED }
     if (failed != null) {
         return GenerationUiState(
+            // Worker 没写下原因，说明它不是走到业务失败分支，而是整个任务被中断了
+            // （执行窗口到点、进程被系统等）。这时再让用户去查网络与模型配置是误导——
+            // 那两样多半是好的。如实说「没拿到原因」，并指向能查到原因的地方。
             error = failed.outputData.getString(GenerationWorker.KEY_ERROR)
-                ?: "生成失败，请检查网络与模型配置后重试",
+                ?: "这一步被中断了，并且没有拿到具体原因（多数是长任务在后台被系统收走，与网络、模型配置无关）。" +
+                    "请重试；反复出现时到「我的 → 诊断日志」看最近一条失败记录。",
             outcome = failed.outputData.getString(GenerationWorker.KEY_OUTCOME)
                 ?.let { name -> GenerationOutcome.entries.firstOrNull { it.name == name } }
                 ?: GenerationOutcome.FAILED,

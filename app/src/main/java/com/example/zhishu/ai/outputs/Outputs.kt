@@ -2,16 +2,37 @@ package com.example.zhishu.ai.outputs
 
 import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.QuizType
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonTransformingSerializer
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
-@Serializable
-data class KnowledgeMapOutput(
-    val nodes: List<NodeDto> = emptyList(),
-    /** 演进链，直接用作章节骨架（问题7） */
-    val chains: List<ChainDto> = emptyList(),
-    val gaps: List<String> = emptyList(),
-    val conflicts: List<ConflictDto> = emptyList(),
-)
+/**
+ * conflicts 字段的容错反序列化：部分模型（实测含 deepseek-v4 系列）在骨架/审计
+ * 阶段会把「对象数组」写成纯字符串数组 `["对立观点描述"]`，默认解析会整次调用
+ * 失败。这里在解析前把字符串元素包成 `{topic=描述, description=描述}`，
+ * 让输出变体不再炸掉整张知识地图；标准对象数组原样通过。
+ */
+internal object ConflictDtoListSerializer : JsonTransformingSerializer<List<ConflictDto>>(ListSerializer(ConflictDto.serializer())) {    override fun transformDeserialize(element: JsonElement): JsonElement = when (element) {
+        is JsonArray -> JsonArray(
+            element.map { item ->
+                if (item is JsonPrimitive && item.isString) {
+                    buildJsonObject {
+                        put("topic", item.content)
+                        put("description", item.content)
+                    }
+                } else {
+                    item
+                }
+            },
+        )
+        else -> element
+    }
+}
 
 /**
  * 知识地图分批生成（批次化）：骨架阶段的输出。
@@ -26,6 +47,7 @@ data class KnowledgeMapSkeletonOutput(
     /** 骨架阶段的缺口预览（最终审计会整体替换） */
     val gaps: List<String> = emptyList(),
     /** 骨架阶段的冲突预览（最终审计会整体替换） */
+    @Serializable(with = ConflictDtoListSerializer::class)
     val conflicts: List<ConflictDto> = emptyList(),
 )
 
@@ -40,7 +62,32 @@ data class ChainNodesOutput(
 @Serializable
 data class KnowledgeMapAuditOutput(
     val gaps: List<String> = emptyList(),
+    /**
+     * 结构化缺口（gaps 闭环）。
+     *
+     * 旧模型不输出本字段 → 空数组，[gaps] 照常落库；两者并存而不是替换，
+     * 是因为把 [gaps] 直接改成对象数组会让旧模型输出反序列化失败、整批审计崩掉。
+     * 结构化优先：有它时按类型分流（MISSING_NODE 可驱动补节点，其余只是提示）。
+     */
+    val structuredGaps: List<GapDto> = emptyList(),
+    @Serializable(with = ConflictDtoListSerializer::class)
     val conflicts: List<ConflictDto> = emptyList(),
+)
+
+/**
+ * 一条结构化的知识缺口（gaps 闭环）。
+ *
+ * [type] 是宽松字符串，解析层用 [com.example.zhishu.domain.model.GapType.parse]
+ * 归一化——未知值落 UNSPECIFIED，绝不让模型的输出变体炸掉审计。
+ */
+@Serializable
+data class GapDto(
+    val type: String = "UNSPECIFIED",
+    val description: String = "",
+    /** 缺口挂靠的知识点编号（当前批次 nodeKey），可为空 */
+    val anchorNodeKey: String = "",
+    /** 建议补充的知识点标题（type = MISSING_NODE 时给出） */
+    val suggestedTitle: String = "",
 )
 
 /** 一条「前一个制度长出后一个」的演进链 */
@@ -53,7 +100,13 @@ data class ChainDto(
 
 @Serializable
 data class NodeDto(
-    val title: String,
+    /**
+     * 默认空串而不是必填：截断修复把最后一个节点剪到 title 之前时，
+     * 必填字段会让**整个** payload 抛 MissingFieldException，
+     * 连前面已经完整的节点一起陪葬。空标题的节点由
+     * [OutputValidators.validateChainNodes] 按「无内容」丢弃。
+     */
+    val title: String = "",
     val definition: String = "",
     /** 它从哪个前序概念、因为什么缺口才出现（问题2） */
     val arisesFrom: String = "",
@@ -171,6 +224,15 @@ data class ChapterPlanDto(
     val plotGoal: String = "",
     val learningGoals: List<String> = emptyList(),
     val nodeTitles: List<String> = emptyList(),
+    /**
+     * 本章涉及的知识点**编号**（三段式改造）。
+     *
+     * 编号是当前 active 批次内的 `nodeKey`（nk-1、nk-2…），只在模型交互层使用：
+     * 标题会被模型改一个空格/标点就匹配失败——这正是旧路线「引用了不存在的
+     * 知识点」整卷作废的最大来源；编号短到抄不错。落库前由调用方反解成节点 ID，
+     * [nodeTitles] 保留给旧流程兼容，新路径只填 [nodeKeys]。
+     */
+    val nodeKeys: List<String> = emptyList(),
     val wordTarget: Int = 1200,
     val openingHook: String = "",
     val closingHook: String = "",
@@ -186,6 +248,51 @@ data class ChapterPlanDto(
      */
     val prerequisiteNodeTitles: List<String> = emptyList(),
 )
+
+/**
+ * 三段式路线规划：大纲阶段的输出（分卷是纯程序计算，没有模型调用）。
+ *
+ * 与旧 [StoryBibleOutput] 的区别：一次只规划一卷、只出**大纲**不出契约、
+ * 章节用 [ChapterPlanDto.nodeKeys] 编号引用知识点。卷标题/卷目标由大纲顺带给出。
+ */
+@Serializable
+data class VolumeOutlineOutput(
+    val volumeTitle: String = "",
+    val volumeGoal: String = "",
+    val chapters: List<ChapterPlanDto> = emptyList(),
+)
+
+/**
+ * 三段式路线规划：单章契约的输出。
+ *
+ * 知识点用**编号**（nodeKey）引用——[allowedNodeKeys] 白名单约束下，
+ * 编号匹配杜绝了标题匹配「差一个字整章作废」的失败模式。
+ * 落库前由调用方反解成标题再 encode 进 [ChapterContractDto]。
+ */
+@Serializable
+data class ChapterContractOutput(
+    val entryQuestion: String = "",
+    val priorIntuition: String = "",
+    val obstacle: String = "",
+    val knowledgeGap: String = "",
+    val introducedNodeKeys: List<String> = emptyList(),
+    val appliedNodeKeys: List<String> = emptyList(),
+    val requiredBeats: List<String> = emptyList(),
+    val resultingChange: String = "",
+    val bridgeToNext: String = "",
+) {
+    /** 全空 = 模型什么都没给。校验层按「缺契约」处理，不静默通过 */
+    val isEmpty: Boolean
+        get() = entryQuestion.isBlank() &&
+            priorIntuition.isBlank() &&
+            obstacle.isBlank() &&
+            knowledgeGap.isBlank() &&
+            introducedNodeKeys.isEmpty() &&
+            appliedNodeKeys.isEmpty() &&
+            requiredBeats.isEmpty() &&
+            resultingChange.isBlank() &&
+            bridgeToNext.isBlank()
+}
 
 /**
  * 续卷规划的产出（第三阶段 3C）。
@@ -223,7 +330,12 @@ data class ChapterOutput(
 
 @Serializable
 data class BlockDto(
-    val type: BlockType,
+    // 默认值是解码兜底的关键：jsonDecoder 的 coerceInputValues 只对声明了默认值的
+    // 字段生效。模型偶尔会把章节类型（CONTRAST 等）串进块 type（长输出里
+    // 「本章类型」一节就在上下文里，极易混淆），没有默认值时一个未知值就炸掉
+    // 上万 token 的整章正文，还要再烧一次修复调用；有默认值则该块自动降级为
+    // 普通正文块，阅读与核验不受影响。
+    val type: BlockType = BlockType.STORY,
     val text: String,
     val knowledgeNodeTitles: List<String> = emptyList(),
     val sourceRefs: List<String> = emptyList(),
@@ -323,7 +435,9 @@ data class QuizSetOutput(
 @Serializable
 data class QuizDto(
     val question: String,
-    val type: QuizType,
+    // 同 BlockDto.type：默认值让 coerceInputValues 能把未知题型兜底成 RECALL，
+    // 而不是让一章的自测题整体报废。
+    val type: QuizType = QuizType.RECALL,
     val options: List<String> = emptyList(),
     val answer: String,
     val explanation: String,

@@ -51,8 +51,15 @@ class CarryOverSplitTest {
     private var ids = 0
 
     /** 带占位符的章节模板：只有这样才能从提示词里读出各段前情的来源 */
+    /**
+     * 带占位符的章节模板：只有这样才能从提示词里读出各段前情的来源。
+     *
+     * 末尾的 `{nodes}` 不能省：正文桩要按「本章实际关联的知识点」标注节点，
+     * 核验器会检查正文引用的知识点属于本章，标错了就是真违规。
+     */
     private val chapterTemplate =
-        "[[CHAPTER]] 上一章结尾=<{previousEndingState}> 开头钩子=<{openingHook}> 口子=<{closingHook}>"
+        "[[CHAPTER]] 上一章结尾=<{previousEndingState}> 开头钩子=<{openingHook}> " +
+            "口子=<{closingHook}> {nodes}"
 
     @Before
     fun setUp() {
@@ -61,6 +68,7 @@ class CarryOverSplitTest {
             AppDatabase::class.java,
         ).allowMainThreadQueries().build()
         router = ScriptedRouter()
+        RouteStubs.reset()
         ids = 0
         pipeline = PipelineService(
             router = router,
@@ -73,6 +81,7 @@ class CarryOverSplitTest {
                 db = db,
                 conflictDao = db.knowledgeConflictDao(),
                 batchDao = db.knowledgeMapBatchDao(),
+                routeBatchDao = db.routeBatchDao(),
             ),
             chapterRepository = DefaultChapterRepository(
                 db.chapterPlanDao(),
@@ -321,6 +330,10 @@ class CarryOverSplitTest {
             ),
         )
         pipeline.generateKnowledgeMap("p-1").getOrThrow()
+        // 三段式之后章数由测试桩给（种子只有 2 个知识点，节点封顶后只有 1 章），
+        // 这里是测试前置：被测的是「前情从哪来」，不是「规划几章」
+        RouteStubs.outlineChapterCount = 2
+        RouteStubs.openingHooks = listOf("从一封律师函开始", "庭审当天的清晨")
         pipeline.generateStoryBible("p-1").getOrThrow()
         router.calls.clear()
     }

@@ -76,31 +76,7 @@ interface KnowledgeNodeDao {
     )
     suspend fun searchFuzzy(projectId: String, query: String): List<KnowledgeNode>
 
-    /** 按稳定标识取节点（批次化生成：单链回填按 nodeKey 匹配，不按标题） */
-    @Query("SELECT * FROM knowledge_nodes WHERE projectId = :projectId AND nodeKey = :nodeKey LIMIT 1")
-    suspend fun getByNodeKey(projectId: String, nodeKey: String): KnowledgeNode?
-
     /** 字段级状态更新：展开失败/重试时只动生成状态，不覆盖已有内容（批次化生成） */
     @Query("UPDATE knowledge_nodes SET generateStatus = :status WHERE id = :id")
     suspend fun updateGenerateStatus(id: String, status: String)
-
-    /**
-     * 单链展开回填（批次化生成）。
-     * 只写内容与层级字段，不碰 mastery / confirmed / chapterIds（用户与发布流程的字段）。
-     */
-    @Query("UPDATE knowledge_nodes SET generateStatus = :status, parentId = :parentId, depth = :depth, definition = :definition, arisesFrom = :arisesFrom, leadsTo = :leadsTo, prerequisites = :prerequisites, related = :related, confusions = :confusions, examples = :examples, sourceRefs = :sourceRefs WHERE id = :id")
-    suspend fun fillFromChain(
-        id: String,
-        status: String,
-        parentId: String?,
-        depth: Int,
-        definition: String,
-        arisesFrom: String,
-        leadsTo: String,
-        prerequisites: List<String>,
-        related: List<String>,
-        confusions: List<String>,
-        examples: List<String>,
-        sourceRefs: List<String>,
-    )
 }

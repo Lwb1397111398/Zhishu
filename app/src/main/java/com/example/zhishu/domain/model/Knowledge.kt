@@ -5,6 +5,9 @@ import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.json.Json
 
 @Serializable
 @Entity(
@@ -112,7 +115,51 @@ enum class KnowledgeMapChainStatus {
     FAILED,
 }
 
-/** 知识地图生成时模型报告的资料缺口（B12） */
+/**
+ * 知识缺口的类型（gaps 闭环）。
+ *
+ * 原来所有 gap 混成一个纯文本列表，「地区差异提醒」和「骨架漏了知识点」
+ * 语义完全不同却同样式展示——前者是免责提示（不该驱动改地图），
+ * 后者才该出现「补上这个知识点」按钮。
+ */
+enum class GapType {
+    /** 骨架漏掉 / 单链展开被丢弃的知识点——可行动，驱动 PATCH 补节点 */
+    MISSING_NODE,
+
+    /** 内容可能过时——免责提示 */
+    OUTDATED,
+
+    /** 存在地区/版本差异——免责提示 */
+    REGIONAL,
+
+    /** 各家说法不一——免责提示 */
+    CONTESTED,
+
+    /** 无法核实——免责提示 */
+    UNVERIFIED,
+
+    /** 旧数据 / 模型未声明类型 */
+    UNSPECIFIED,
+    ;
+    companion object {
+        /** 宽松映射：未知/空值一律 UNSPECIFIED，防模型输出变体炸掉解析 */
+        fun parse(raw: String?): GapType = entries.firstOrNull { it.name == raw?.trim()?.uppercase() } ?: UNSPECIFIED
+    }
+}
+
+/** gap 的处理状态。UI 默认只显示 OPEN——已补上的、用户已知晓的不再出现，避免「看起来没处理」的混淆 */
+enum class GapStatus {
+    /** 未处理：显示在「别只信AI」区域，按类型给按钮 */
+    OPEN,
+
+    /** 已通过 PATCH 补上知识点，不再显示 */
+    RESOLVED,
+
+    /** 用户点「知道了」关闭（免责提示型 / 暂不处理），不再显示 */
+    DISMISSED,
+}
+
+/** 知识地图生成时模型报告的资料缺口（B12；gaps 闭环加结构化字段） */
 @Serializable
 @Entity(
     tableName = "knowledge_gaps",
@@ -123,9 +170,30 @@ data class KnowledgeGap(
     val projectId: String,
     val description: String,
     val order: Int = 0,
-)
+    /** 缺口类型。空串 = 旧数据（读取时按 [GapType] 宽松映射为 UNSPECIFIED） */
+    @ColumnInfo(defaultValue = "")
+    val gapType: String = "",
+    /** 处理状态。空串 = 旧数据，读取时视为 OPEN（保持既有可见性，不凭空消失） */
+    @ColumnInfo(defaultValue = "")
+    val status: String = "",
+    /** 缺口挂靠的节点 ID（可为空：模型可能只给出主题级缺口） */
+    @ColumnInfo(defaultValue = "")
+    val anchorNodeId: String = "",
+    /** 建议补充的知识点标题（MISSING_NODE 时模型给出） */
+    @ColumnInfo(defaultValue = "")
+    val suggestedTitle: String = "",
+) {
+    /** 解析后的类型。空串/未知值 → UNSPECIFIED */
+    val type: GapType get() = GapType.parse(gapType)
 
-/** 知识地图生成时模型报告的资料冲突（B12） */
+    /** 解析后的状态。空串（旧数据）→ OPEN，与改造前行为一致 */
+    val gapStatus: GapStatus get() = if (status.isBlank()) GapStatus.OPEN else GapStatus.entries.firstOrNull { it.name == status } ?: GapStatus.OPEN
+
+    /** 是否是「可以驱动补节点」的可行动缺口 */
+    val actionable: Boolean get() = type == GapType.MISSING_NODE
+}
+
+/** 知识地图生成时模型报告的资料冲突（B12）。与 gap 同样支持「知道了」关闭 */
 @Serializable
 @Entity(
     tableName = "knowledge_conflicts",
@@ -138,4 +206,29 @@ data class KnowledgeConflict(
     val sources: List<String> = emptyList(),
     val description: String = "",
     val order: Int = 0,
-)
+    /** 处理状态。空串 = 旧数据，读取时视为 OPEN */
+    @ColumnInfo(defaultValue = "")
+    val status: String = "",
+) {
+    /** 解析后的状态。空串（旧数据）→ OPEN */
+    val conflictStatus: GapStatus get() = if (status.isBlank()) GapStatus.OPEN else GapStatus.entries.firstOrNull { it.name == status } ?: GapStatus.OPEN
+}
+
+/**
+ * 解码批次里逐链展开状态（与链条顺序一致）。
+ *
+ * 管线与 UI 共用：管线靠它跳过已完成的链，UI 靠它显示「几条链已展开 / 几条失败」。
+ * 存的是 JSON 字符串数组；解析失败按「无状态」处理（全部视为待展开，宁可重跑也不误跳）。
+ */
+fun KnowledgeMapBatch.chainStatusList(): List<KnowledgeMapChainStatus> = runCatching {
+    if (chainStatuses.isBlank() || chainStatuses == "[]") {
+        emptyList()
+    } else {
+        Json.decodeFromString(ListSerializer(String.serializer()), chainStatuses)
+            .mapNotNull { name -> KnowledgeMapChainStatus.entries.firstOrNull { it.name == name } }
+    }
+}.getOrDefault(emptyList())
+
+/** 把链状态编码回批次存储的 JSON 字符串（与 [chainStatusList] 互逆） */
+fun List<KnowledgeMapChainStatus>.encodeStatuses(): String =
+    Json.encodeToString(ListSerializer(String.serializer()), map { it.name })

@@ -11,11 +11,13 @@ import com.example.zhishu.data.local.dao.KnowledgeConflictDao
 import com.example.zhishu.data.local.dao.KnowledgeGapDao
 import com.example.zhishu.data.local.dao.KnowledgeMapBatchDao
 import com.example.zhishu.data.local.dao.KnowledgeNodeDao
-import com.example.zhishu.data.local.dao.ModelConfigDao
+import com.example.zhishu.data.local.dao.ApiProfileDao
 import com.example.zhishu.data.local.dao.ProjectDao
 import com.example.zhishu.data.local.dao.QuizDao
 import com.example.zhishu.data.local.dao.ReadingProgressDao
 import com.example.zhishu.data.local.dao.ReviewItemDao
+import com.example.zhishu.data.local.dao.RoleAssignmentDao
+import com.example.zhishu.data.local.dao.RouteBatchDao
 import com.example.zhishu.data.local.dao.SourceChunkDao
 import com.example.zhishu.data.local.dao.SourceDocumentDao
 import com.example.zhishu.data.local.dao.StoryBibleDao
@@ -33,13 +35,15 @@ import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeMapBatch
 import com.example.zhishu.domain.model.KnowledgeNode
-import com.example.zhishu.domain.model.ModelConfig
+import com.example.zhishu.domain.model.ApiProfile
 import com.example.zhishu.domain.model.ModelRole
+import com.example.zhishu.domain.model.RoleAssignment
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.Quiz
 import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.ReadingProgress
 import com.example.zhishu.domain.model.ReviewItem
+import com.example.zhishu.domain.model.RouteBatch
 import com.example.zhishu.domain.model.ReviewStatus
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
@@ -75,6 +79,8 @@ class DefaultSourceRepository(
 
     override suspend fun getByProject(projectId: String): List<SourceDocument> =
         documentDao.getByProject(projectId)
+
+    override suspend fun getById(sourceId: String): SourceDocument? = documentDao.getById(sourceId)
 
     override suspend fun addSource(source: SourceDocument, chunks: List<SourceChunk>) {
         documentDao.upsert(source)
@@ -138,6 +144,7 @@ class DefaultKnowledgeRepository(
     private val gapDao: KnowledgeGapDao,
     private val conflictDao: KnowledgeConflictDao,
     private val batchDao: KnowledgeMapBatchDao,
+    private val routeBatchDao: RouteBatchDao,
 ) : KnowledgeRepository {
     override fun observeByProject(projectId: String): Flow<List<KnowledgeNode>> =
         dao.observeByProject(projectId)
@@ -164,8 +171,14 @@ class DefaultKnowledgeRepository(
     override fun observeGaps(projectId: String): Flow<List<KnowledgeGap>> =
         gapDao.observeByProject(projectId)
 
+    override suspend fun getGaps(projectId: String): List<KnowledgeGap> =
+        gapDao.getByProject(projectId)
+
     override fun observeConflicts(projectId: String): Flow<List<KnowledgeConflict>> =
         conflictDao.observeByProject(projectId)
+
+    override suspend fun getConflicts(projectId: String): List<KnowledgeConflict> =
+        conflictDao.getByProject(projectId)
 
     override suspend fun replaceInsights(
         projectId: String,
@@ -180,6 +193,9 @@ class DefaultKnowledgeRepository(
 
     override suspend fun getLatestBatch(projectId: String): KnowledgeMapBatch? =
         batchDao.getLatest(projectId)
+
+    override fun observeLatestBatch(projectId: String): Flow<KnowledgeMapBatch?> =
+        batchDao.observeLatest(projectId)
 
     override suspend fun saveBatch(batch: KnowledgeMapBatch) = batchDao.upsert(batch)
 
@@ -196,6 +212,20 @@ class DefaultKnowledgeRepository(
 
     override suspend fun updateGenerateStatus(id: String, status: String) =
         dao.updateGenerateStatus(id, status)
+
+    override suspend fun updateGap(gap: KnowledgeGap) = gapDao.upsert(gap)
+
+    override suspend fun updateConflict(conflict: KnowledgeConflict) = conflictDao.upsert(conflict)
+
+    override suspend fun getLatestRouteBatch(projectId: String): RouteBatch? =
+        routeBatchDao.getLatest(projectId)
+
+    override fun observeLatestRouteBatch(projectId: String): Flow<RouteBatch?> =
+        routeBatchDao.observeLatest(projectId)
+
+    override suspend fun saveRouteBatch(batch: RouteBatch) = routeBatchDao.upsert(batch)
+
+    override suspend fun clearRouteBatch(projectId: String) = routeBatchDao.clearByProject(projectId)
 }
 
 class DefaultChapterRepository(
@@ -552,9 +582,38 @@ class DefaultProgressRepository(private val dao: ReadingProgressDao) : ProgressR
     override suspend fun clearForProject(projectId: String) = dao.deleteByProject(projectId)
 }
 
-class DefaultSettingsRepository(private val dao: ModelConfigDao) : SettingsRepository {
-    override suspend fun getAllConfigs(): List<ModelConfig> = dao.getAll()
-    override suspend fun getConfig(role: ModelRole): ModelConfig? = dao.getByRole(role.name)
-    override suspend fun saveConfig(config: ModelConfig) = dao.upsert(config)
-    override suspend fun clearConfigs() = dao.clearAll()
+class DefaultSettingsRepository(
+    private val profileDao: ApiProfileDao,
+    private val assignmentDao: RoleAssignmentDao,
+) : SettingsRepository {
+    override suspend fun getProfiles(): List<ApiProfile> = profileDao.getAll()
+
+    override suspend fun getProfile(id: Long): ApiProfile? = profileDao.getById(id)
+
+    override suspend fun saveProfile(profile: ApiProfile): ApiProfile =
+        if (profile.id == 0L) {
+            profile.copy(id = profileDao.insert(profile))
+        } else {
+            profileDao.update(profile)
+            profile
+        }
+
+    override suspend fun deleteProfile(id: Long) {
+        profileDao.deleteById(id)
+        assignmentDao.clearProfile(id)
+    }
+
+    override suspend fun getAssignments(): Map<ModelRole, Long?> =
+        ModelRole.entries.associateWith { role ->
+            assignmentDao.getByRole(role.name)?.profileId
+        }
+
+    override suspend fun assignRole(role: ModelRole, profileId: Long?) {
+        assignmentDao.upsert(RoleAssignment(role = role.name, profileId = profileId))
+    }
+
+    override suspend fun getAssignedProfile(role: ModelRole): ApiProfile? {
+        val profileId = assignmentDao.getByRole(role.name)?.profileId ?: return null
+        return profileDao.getById(profileId)
+    }
 }

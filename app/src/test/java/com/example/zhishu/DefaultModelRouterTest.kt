@@ -167,6 +167,171 @@ class DefaultModelRouterTest {
         }
     }
 
+    // ---- max_tokens 降档：把「窗口装不下」这类硬失败救回来 ----
+
+    /**
+     * 输出上限已按用户意愿放到模型允许的最大（5 万）。窗口更小的模型会返回 400，
+     * 而 400 是 InvalidRequest（retryable=false）——原来这会让该步**永久**失败。
+     * 现在路由认出这是「嫌 max_tokens 太大」，减半重发。
+     */
+    @Test
+    fun maxTokensTooLarge_downgradesAndSucceeds() = runBlocking {
+        val provider = RecordingProvider(
+            listOf(
+                Result.failure(ModelError.InvalidRequest("max_tokens is too large: 50000（HTTP 400）")),
+                Result.success("{\"ok\":true}"),
+            ),
+        )
+        val router = DefaultModelRouter(provider, retryDelaysMillis = listOf(1L, 1L))
+        val result = router.generate(
+            ModelRole.FAST,
+            request().copy(maxTokens = 50_000),
+            decoder,
+        )
+        assertTrue("降档重发应该成功，实际：${result.exceptionOrNull()?.message}", result.isSuccess)
+        assertEquals(listOf(50_000, 25_000), provider.requestedMaxTokens)
+    }
+
+    /** 一直嫌大就一路降到底，然后如实报错——不无限降、不无限烧钱 */
+    @Test
+    fun maxTokensTooLarge_stopsDowngradingAtFloor() = runBlocking {
+        val provider = RecordingProvider(
+            listOf(Result.failure(ModelError.InvalidRequest("maximum context length exceeded"))),
+        )
+        val router = DefaultModelRouter(provider, retryDelaysMillis = listOf(1L, 1L))
+        val result = router.generate(
+            ModelRole.FAST,
+            request().copy(maxTokens = 50_000),
+            decoder,
+        )
+        assertTrue(result.exceptionOrNull() is ModelError.InvalidRequest)
+        // 首次 + 最多 3 次降档（MAX_TOKEN_DOWNGRADES），到 6250 就不再降
+        assertEquals(listOf(50_000, 25_000, 12_500, 6_250), provider.requestedMaxTokens)
+    }
+
+    /**
+     * 降档不许吃掉业务调用预算。
+     *
+     * maxProviderCalls=4 是给「1 次业务 + 3 次退避重试」留的，不是给降档阶梯用的。
+     * 降档正好也是 4 次（50000→25000→12500→6250），一旦占预算，降档成功后
+     * **一次网络抖动都扛不住、也没配额做 JSON 修复**，整步直接失败——用户看到的
+     * 就是「有一堆调用记录，结果全没用上」。所以降档要退还配额。
+     */
+    @Test
+    fun downgrade_doesNotConsumeRetryBudget() = runBlocking {
+        val tooLarge = Result.failure<String>(ModelError.InvalidRequest("max_tokens is too large"))
+        val provider = RecordingProvider(
+            listOf(
+                tooLarge,
+                tooLarge,
+                tooLarge,
+                // 降到底后才轮到真正的一次业务调用，这次撞上网络抖动
+                Result.failure(ModelError.Network("timeout")),
+                // 退避重试仍必须有配额——降档吃掉预算的话这一步根本发不出去
+                Result.success("{\"ok\":true}"),
+            ),
+        )
+        val router = DefaultModelRouter(provider, retryDelaysMillis = listOf(1L, 1L, 1L))
+        val result = router.generate(
+            ModelRole.FAST,
+            request().copy(maxTokens = 50_000),
+            decoder,
+        )
+        assertTrue(
+            "降档 3 次后仍应保有重试配额，实际：${result.exceptionOrNull()?.message}",
+            result.isSuccess,
+        )
+        assertEquals(
+            listOf(50_000, 25_000, 12_500, 6_250, 6_250),
+            provider.requestedMaxTokens,
+        )
+    }
+
+    /**
+     * 不是 token 长度问题的 400 不许降档重试。
+     * 「模型名写错」需要用户改配置，偷偷重发只会多花钱、还把真正的原因藏起来。
+     */
+    @Test
+    fun otherInvalidRequest_doesNotDowngrade() = runBlocking {
+        val provider = RecordingProvider(
+            listOf(Result.failure(ModelError.InvalidRequest("The model `gpt-nonexistent` does not exist"))),
+        )
+        val router = DefaultModelRouter(provider, retryDelaysMillis = listOf(1L, 1L))
+        val result = router.generate(
+            ModelRole.FAST,
+            request().copy(maxTokens = 50_000),
+            decoder,
+        )
+        assertTrue(result.exceptionOrNull() is ModelError.InvalidRequest)
+        assertEquals(listOf(50_000), provider.requestedMaxTokens)
+    }
+
+    /**
+     * 中文服务商的「输出上限」类 400 也要能认出并降档。
+     *
+     * 早先关键词表只有英文和「上下文/最大长度/长度超」，国内服务商常见的
+     * 「超出最大输出上限」这类文案匹配不上，真·长度错误反而不降档。
+     */
+    @Test
+    fun chineseTokenLimitMessage_downgrades() = runBlocking {
+        val provider = RecordingProvider(
+            listOf(
+                Result.failure(ModelError.InvalidRequest("请求失败：超出模型最大输出上限（HTTP 400）")),
+                Result.success("{\"ok\":true}"),
+            ),
+        )
+        val router = DefaultModelRouter(provider, retryDelaysMillis = listOf(1L, 1L))
+        val result = router.generate(
+            ModelRole.FAST,
+            request().copy(maxTokens = 8_000),
+            decoder,
+        )
+        assertTrue("中文长度类 400 应降档重发，实际：${result.exceptionOrNull()?.message}", result.isSuccess)
+        assertEquals(listOf(8_000, 4_000), provider.requestedMaxTokens)
+    }
+
+    /**
+     * 截断（Truncated）不降档、不重试，直接如实失败。
+     *
+     * 降 max_tokens 对截断只会让输出更短、更截，是帮倒忙；正确自救在调用方
+     * （骨架降级重试会「少要点内容」）。路由层这里必须一次都不重发。
+     */
+    @Test
+    fun truncated_doesNotDowngradeOrRetry() = runBlocking {
+        val provider = RecordingProvider(
+            listOf(Result.failure(ModelError.Truncated("输出被截断（finish_reason=length）"))),
+        )
+        val router = DefaultModelRouter(provider, retryDelaysMillis = listOf(1L, 1L))
+        val result = router.generate(
+            ModelRole.FAST,
+            request().copy(maxTokens = 8_000),
+            decoder,
+        )
+        assertTrue(result.exceptionOrNull() is ModelError.Truncated)
+        assertEquals(listOf(8_000), provider.requestedMaxTokens)
+    }
+
+    /** 记录每次请求实际发出的 maxTokens */
+    private class RecordingProvider(
+        private val results: List<Result<String>>,
+    ) : ModelProvider {
+        var calls = 0
+        val requestedMaxTokens = mutableListOf<Int?>()
+
+        override suspend fun listModels(): Result<List<String>> = Result.success(emptyList())
+
+        override suspend fun complete(
+            request: ModelRequest,
+            onUsage: (UsageInfo) -> Unit,
+            onRawResponse: (String) -> Unit,
+        ): Result<String> {
+            requestedMaxTokens += request.maxTokens
+            val index = calls.coerceAtMost(results.size - 1)
+            calls += 1
+            return results[index]
+        }
+    }
+
     // ---- 第二轮 P1-1：成本统计口径（业务 / 重试 / JSON 修复 / 总） ----
 
     @Test

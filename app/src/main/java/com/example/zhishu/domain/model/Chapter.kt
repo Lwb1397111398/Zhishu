@@ -160,6 +160,16 @@ data class ChapterPlan(
      */
     @ColumnInfo(defaultValue = "")
     val contractJson: String = "",
+    /**
+     * 契约生成状态（三段式改造）。
+     *
+     * 大纲与契约拆开后，一章失败不再连累整卷：失败的章标 FAILED，
+     * 重试只补它；DONE 之前禁止写正文——契约是正文的因果骨架，
+     * 「有正文必有契约」这条底线靠这一列把守。
+     * 默认 DONE：老数据已有 contractJson（或明确无契约），不能被误判成待生成。
+     */
+    @ColumnInfo(defaultValue = "DONE")
+    val contractStatus: String = ContractStatus.DONE.name,
 ) {
     /** 正文是否已可阅读。测验状态一概不参与判断。 */
     val isReadable: Boolean get() = status.isReadable

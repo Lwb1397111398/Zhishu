@@ -58,10 +58,12 @@ class GenerationCancellationTest {
             AppDatabase::class.java,
         ).allowMainThreadQueries().build()
         router = ScriptedRouter()
+        RouteStubs.reset()
         ids = 0
         pipeline = PipelineService(
             router = router,
-            prompts = TaggedPromptProvider(),
+            // 正文桩要按本章实际节点标注，模板必须带 {nodes}
+            prompts = TaggedPromptProvider(chapterTemplate = "[[CHAPTER]] {nodes}"),
             projectRepository = DefaultProjectRepository(db.projectDao()),
             sourceRepository = DefaultSourceRepository(db.sourceDocumentDao(), db.sourceChunkDao()),
             knowledgeRepository = DefaultKnowledgeRepository(
@@ -70,6 +72,7 @@ class GenerationCancellationTest {
                 db = db,
                 conflictDao = db.knowledgeConflictDao(),
                 batchDao = db.knowledgeMapBatchDao(),
+                routeBatchDao = db.routeBatchDao(),
             ),
             chapterRepository = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao(), db.chapterVersionDao()),
             citationRepository = DefaultCitationRepository(db.citationDao()),
@@ -305,6 +308,10 @@ class GenerationCancellationTest {
             ),
         )
         pipeline.generateKnowledgeMap("p-1").getOrThrow()
+        // 种子地图只有 2 个知识点，按「章数 = ceil(节点数/4)」封顶只会规划出 1 章，
+        // 而本类里有两个用例要断言「取消 A 章不影响 B 章」。这里显式要 2 章，
+        // 与改造前 BIBLE 桩给出的章数一致，属于测试前置条件而非被测行为。
+        RouteStubs.outlineChapterCount = 2
         pipeline.generateStoryBible("p-1").getOrThrow()
         router.calls.clear()
         return db.chapterPlanDao().getByProject("p-1").sortedBy { it.order }.first().id

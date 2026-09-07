@@ -1,6 +1,9 @@
 package com.example.zhishu.di
 
 import android.content.Context
+import android.database.sqlite.SQLiteException
+import android.util.Log
+import java.io.File
 import com.example.zhishu.ai.AssetsPromptProvider
 import com.example.zhishu.ai.ConfiguredModelRouter
 import com.example.zhishu.ai.pipeline.PipelineService
@@ -49,6 +52,7 @@ class AppContainer(context: Context) {
         gapDao = database.knowledgeGapDao(),
         conflictDao = database.knowledgeConflictDao(),
         batchDao = database.knowledgeMapBatchDao(),
+        routeBatchDao = database.routeBatchDao(),
     )
     val chapterRepository: ChapterRepository = DefaultChapterRepository(
         planDao = database.chapterPlanDao(),
@@ -63,7 +67,8 @@ class AppContainer(context: Context) {
     val quizRepository: QuizRepository = DefaultQuizRepository(database.quizDao(), database.answerRecordDao())
     val reviewRepository: ReviewRepository = DefaultReviewRepository(database.reviewItemDao())
     val progressRepository: ProgressRepository = DefaultProgressRepository(database.readingProgressDao())
-    val settingsRepository: SettingsRepository = DefaultSettingsRepository(database.modelConfigDao())
+    val settingsRepository: SettingsRepository =
+        DefaultSettingsRepository(database.apiProfileDao(), database.roleAssignmentDao())
 
     /** 学习方式偏好（间隔复习开关，默认关） */
     val learningPrefs: LearningPrefs = LearningPrefs(appContext)
@@ -80,6 +85,8 @@ class AppContainer(context: Context) {
     val router = ConfiguredModelRouter(
         settingsRepository = settingsRepository,
         keyCipherProvider = { keyCipher },
+        // 生成卡住时界面只显示「已开始」，没有这份记录就只能靠猜
+        diagnosticsContext = appContext,
     )
 
     val pipeline: PipelineService = PipelineService(
@@ -104,4 +111,53 @@ class AppContainer(context: Context) {
 
     /** 供 ViewModel / TransferManager 做原子写入（N5/N6/N7） */
     suspend fun <T> inTransaction(block: suspend () -> T): T = database.withTransaction(block)
+
+    /**
+     * 启动预热：在后台线程打开数据库（建库或跑完迁移）。
+     *
+     * 两个目的：
+     * 1. 迁移与 Compose 首帧并行，用户点开图标时数据库多半已就绪，首页查询不用等；
+     * 2. 数据库文件损坏（断电、进程被杀在写盘中途）时在这里自愈——
+     *    Room 打不开库的异常如果冒到首个查询的协程里，APP 会「一打开就闪退」且每次如此。
+     *    自愈把损坏文件改名保留（不删，现场还在），然后重建空库，让 APP 至少能打开。
+     */
+    fun warmUpDatabase() {
+        try {
+            database.openHelper.writableDatabase
+        } catch (e: SQLiteException) {
+            recoverAfterOpenFailure(e)
+        } catch (e: IllegalStateException) {
+            // Room 的 schema 校验失败也走这里：真机上它和文件损坏一样表现为启动闪退循环
+            recoverAfterOpenFailure(e)
+        }
+    }
+
+    /**
+     * 打不开库时的恢复：损坏文件连同 wal/shm 改名留存，再打开就是新建的空库。
+     * 恢复失败（例如磁盘满）只记日志——此时查询仍会失败，但由 ViewModel 层兜底显示错误，
+     * 不允许任何一个异常直接杀死进程。
+     */
+    private fun recoverAfterOpenFailure(cause: Exception) {
+        Log.e(TAG, "数据库打开失败，保留现场并重建", cause)
+        runCatching { database.close() }
+        val dbFile = appContext.getDatabasePath(DATABASE_FILE_NAME)
+        if (dbFile.exists()) {
+            val stamp = System.currentTimeMillis()
+            val kept = File(dbFile.parentFile, "$DATABASE_FILE_NAME.corrupt-$stamp")
+            runCatching { dbFile.renameTo(kept) }
+            listOf("-wal", "-shm").forEach { suffix ->
+                val sidecar = File(dbFile.parentFile, "$DATABASE_FILE_NAME$suffix")
+                if (sidecar.exists()) {
+                    runCatching { sidecar.renameTo(File(dbFile.parentFile, kept.name + suffix)) }
+                }
+            }
+        }
+        runCatching { database.openHelper.writableDatabase }
+            .onFailure { Log.e(TAG, "重建后仍无法打开数据库", it) }
+    }
+
+    private companion object {
+        const val TAG = "ZhishuApp"
+        const val DATABASE_FILE_NAME = "zhishu.db"
+    }
 }

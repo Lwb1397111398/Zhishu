@@ -43,3 +43,12 @@ test-classpath.txt
 .workbuddy/
 samples/runs/
 _archive_20260822/
+
+# 运行快照与探针输出（samples/ 下按日期命名的目录）
+samples/20*/
+samples/probes/
+
+# 本地工具目录
+.codegraph/
+.test-shots/
+.zcode/

@@ -4,17 +4,20 @@ import com.example.zhishu.ai.ModelError
 import com.example.zhishu.ai.ModelRequest
 import com.example.zhishu.ai.ModelRouter
 import com.example.zhishu.ai.PromptProvider
+import com.example.zhishu.ai.TokenBudget
 import com.example.zhishu.ai.jsonDecoder
 import com.example.zhishu.ai.outputs.BlockRewriteOutput
 import com.example.zhishu.ai.outputs.ChainDto
 import com.example.zhishu.ai.outputs.ChainNodesOutput
 import com.example.zhishu.ai.outputs.ChapterContractDto
+import com.example.zhishu.ai.outputs.ChapterContractOutput
 import com.example.zhishu.ai.outputs.ChapterOutput
 import com.example.zhishu.ai.outputs.ChapterPlanDto
+import com.example.zhishu.ai.outputs.ChapterType
 import com.example.zhishu.ai.outputs.ConflictDto
+import com.example.zhishu.ai.outputs.GapDto
 import com.example.zhishu.ai.outputs.ContractCodec
 import com.example.zhishu.ai.outputs.KnowledgeMapAuditOutput
-import com.example.zhishu.ai.outputs.KnowledgeMapOutput
 import com.example.zhishu.ai.outputs.KnowledgeMapSkeletonOutput
 import com.example.zhishu.ai.outputs.NextVolumeOutput
 import com.example.zhishu.ai.outputs.NodeDto
@@ -24,13 +27,17 @@ import com.example.zhishu.ai.outputs.RouteAudit
 import com.example.zhishu.ai.outputs.RouteAuditIssue
 import com.example.zhishu.ai.outputs.StoryBibleOutput
 import com.example.zhishu.ai.outputs.VerificationOutput
+import com.example.zhishu.ai.outputs.VolumeOutlineOutput
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.Citation
+import com.example.zhishu.domain.model.ContractStatus
 import com.example.zhishu.domain.model.KnowledgeConflict
+import com.example.zhishu.domain.model.GapStatus
+import com.example.zhishu.domain.model.GapType
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeMapBatch
 import com.example.zhishu.domain.model.KnowledgeMapChainStatus
@@ -43,10 +50,15 @@ import com.example.zhishu.domain.model.Quiz
 import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.ReviewItem
 import com.example.zhishu.domain.model.ReviewStatus
+import com.example.zhishu.domain.model.RouteBatch
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.StoryBible
 import com.example.zhishu.domain.model.VerificationIssue
+import com.example.zhishu.domain.model.chainStatusList
+import com.example.zhishu.domain.model.contractStatusList
+import com.example.zhishu.domain.model.encodeContractStatuses
+import com.example.zhishu.domain.model.encodeStatuses
 import com.example.zhishu.domain.repository.ChapterRepository
 import com.example.zhishu.domain.repository.CitationRepository
 import com.example.zhishu.domain.repository.KnowledgeRepository
@@ -65,6 +77,15 @@ import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+
+/**
+ * 知识主干生成的推进模式（分步生成）。
+ *
+ * - [FULL]：骨架（若未完成）→ 全部演进链 → 全局审计，一口气跑完。一键开讲链用这个。
+ * - [SKELETON]：只做骨架就停。链怎么展开由用户看着结构自己决定——逐条或全部。
+ * - [NEXT_CHAIN]：推进下一条未完成的链；链全部完成时做全局审计收尾。
+ */
+enum class KnowledgeMapMode { FULL, SKELETON, NEXT_CHAIN }
 
 class PipelineService(
     private val router: ModelRouter,
@@ -114,7 +135,7 @@ class PipelineService(
     /**
      * 知识地图分批生成：骨架 → 逐链展开 → 全局审计（批次化）。
      *
-     * 原来一次性让模型输出 14-44 个节点 + 3-8 条演进链，单次 2 万 token 输出、
+     * 原来一次性让模型输出 14-44 个节点 + 全部演进链，单次 2 万 token 输出、
      * 最坏几分钟不出结果；现在拆成三步，每步一次小调用（30-90 秒），
      * 失败只重试该步，进度逐链上报。
      *
@@ -122,10 +143,15 @@ class PipelineService(
      * 从 [KnowledgeMapBatch] 里读到已完成的部分直接跳过，只补没做完的。
      * 重新生成（旧批次已完成/已失败）开新批次并清掉旧地图，旧节点不会被误认成断点。
      *
-     * [onProgress] 逐阶段上报文案与单元数（默认不上报，保持既有调用方不变）。
+     * 单条链展开失败不再中止整批：失败链标记后继续后面的链，最后汇总报
+     * 「N 条中 M 条失败」，续跑只补失败链。审计只在全部链完成后进行。
+     *
+     * [mode] 控制推进节奏（见 [KnowledgeMapMode]）；[onProgress] 逐阶段上报
+     * 文案与单元数（默认不上报，保持既有调用方不变）。
      */
     suspend fun generateKnowledgeMap(
         projectId: String,
+        mode: KnowledgeMapMode = KnowledgeMapMode.FULL,
         onProgress: suspend (GenerationProgress) -> Unit = {},
     ): Result<Unit> {
         val project = projectRepository.get(projectId)
@@ -159,25 +185,27 @@ class PipelineService(
             updatedAt = clock(),
         )
 
+        // 旧处理状态快照，必须在骨架阶段之前读——见下面两条：
+        //
+        // 1. 骨架分支里的 replaceInsights 是**全量 clear + 重写**，写进去的是预览行
+        //    （status 空、suggestedTitle 空）；
+        // 2. 而 gaps/conflicts 的重建发生在**审计阶段**，若那时再调 getGaps 读继承，
+        //    读到的就是骨架刚写入的预览行，用户的 RESOLVED / DISMISSED 一条都继承不到。
+        //
+        // 结果就是「补过的、点掉的，重新梳理一次全冒回来」——这是这个功能最伤信任的
+        // 失败模式。所以在这里（也在 isFirstGeneration 的 clearForProject 之前）先把
+        // 已处理条目的状态抄成 Map，后面的重建只认这份快照。
+        val inheritedGapStatus = knowledgeRepository.getGaps(projectId)
+            .filter { it.gapStatus != GapStatus.OPEN && it.suggestedTitle.isNotBlank() }
+            .associate { it.suggestedTitle.trim() to it.gapStatus.name }
+        val inheritedConflictStatus = knowledgeRepository.getConflicts(projectId)
+            .filter { it.conflictStatus != GapStatus.OPEN && it.topic.isNotBlank() }
+            .associate { it.topic.trim() to it.conflictStatus.name }
+
         // ===== 1. 骨架（一次小调用，只列链结构与节点标题清单） =====
         if (!batch.skeletonDone) {
             onProgress(GenerationProgress("正在梳理知识主干（骨架）", 0, -1))
-            val skeletonPrompt = prompts.load(PROMPT_KNOWLEDGE_MAP_SKELETON)
-                .replace("{topic}", project.topic)
-                .replace("{depth}", project.depth)
-                .replace("{goal}", project.title)
-                .replace("{baseline}", project.baseline)
-            val skeletonRaw = router.generate(
-                role = ModelRole.FAST,
-                request = ModelRequest(
-                    role = ModelRole.FAST,
-                    system = SYSTEM_MAP_SKELETON,
-                    user = skeletonPrompt,
-                    jsonMode = true,
-                ),
-                decoder = jsonDecoder(KnowledgeMapSkeletonOutput.serializer()),
-            ).getOrElse { return Result.failure(it) }
-            val skeleton = OutputValidators.validateSkeleton(skeletonRaw)
+            val skeleton = generateSkeleton(project)
                 .getOrElse { return Result.failure(it) }
 
             // 占位节点：nodeKey 由程序分配（稳定标识），标题只做显示；节点归属本批次
@@ -192,16 +220,7 @@ class PipelineService(
                 gaps = skeleton.gaps.filter { it.isNotBlank() }.mapIndexed { index, text ->
                     KnowledgeGap(id = idFactory(), projectId = projectId, description = text, order = index)
                 },
-                conflicts = skeleton.conflicts.mapIndexed { index, dto ->
-                    KnowledgeConflict(
-                        id = idFactory(),
-                        projectId = projectId,
-                        topic = dto.topic,
-                        sources = dto.sources,
-                        description = dto.description,
-                        order = index,
-                    )
-                },
+                conflicts = buildConflicts(projectId, skeleton.conflicts, inheritedConflictStatus),
             )
             batch = batch.copy(
                 skeletonDone = true,
@@ -234,142 +253,294 @@ class PipelineService(
             )
         }
 
+        // 分步生成：骨架先行，用户看过链结构再决定逐条展开还是全部展开
+        if (mode == KnowledgeMapMode.SKELETON) {
+            onProgress(GenerationProgress("骨架已完成，可逐条或全部展开演进链", 1, 1))
+            return Result.success(Unit)
+        }
+
         val chains = decodeChains(batch.chainsJson)
         if (chains.isEmpty()) return Result.failure(IllegalStateException("骨架没有演进链，无法展开"))
         val total = chains.size + 2 // 骨架 + 审计
         var completed = 1
 
         // ===== 2. 逐链展开（每链一次小调用，写完即落库） =====
-        val statuses = decodeChainStatuses(batch.chainStatuses).toMutableList()
+        val statuses = batch.chainStatusList().toMutableList()
         val unmatchedTitles = mutableListOf<String>()
+        var failedChains = 0
+        // 每条失败链的具体原因：原来只汇总「N 条中 M 条失败」，用户看不到到底是
+        // 网络、限流、还是输出被截断——而这三者的下一步动作完全不同
+        val chainFailures = mutableListOf<String>()
+        var stepped = false // 单步模式：本轮已推进过一条链（成功或失败都算）
 
         chains.forEachIndexed { index, chain ->
             if (statuses.getOrElse(index) { KnowledgeMapChainStatus.PENDING } == KnowledgeMapChainStatus.DONE) {
                 completed += 1
                 return@forEachIndexed
             }
+            if (mode == KnowledgeMapMode.NEXT_CHAIN && stepped) return@forEachIndexed
             statuses[index] = KnowledgeMapChainStatus.RUNNING
             knowledgeRepository.saveBatch(
                 batch.copy(
-                    chainStatuses = encodeStatuses(statuses),
+                    chainStatuses = statuses.encodeStatuses(),
                     updatedAt = clock(),
                 ),
             )
             onProgress(GenerationProgress("正在展开第 ${index + 1}/${chains.size} 条演进链", completed, total))
 
-            // 每条链开始时从库里刷新节点：上一链回填的结果必须在这里可见，
-            // 共享节点才能「先到先得」不被覆盖，断点重试也能看到真实进度
-            val nodes = knowledgeRepository.getByProjectAll(projectId)
-            val keyToNode = nodes.associateBy { it.nodeKey }
-            val titleToNode = nodes.associateBy { it.title.trim() }
-            // 本链资料检索（有资料模式）：按链主题 + 节点标题匹配片段，引用只能落在本次提供的片段上
-            val chainChunks = if (modelKnowledge) emptyList() else selectChunksForChain(chunks, chain)
-            val chainChunkIds = chainChunks.map { it.id }.toSet()
-            // 已填充节点摘要（共享节点防打架：后写链只能引用，不能重写）
-            val filledSummary = nodes
-                .filter { it.generateStatus == NodeGenerateStatus.COMPLETED.name && it.definition.isNotBlank() }
-                .joinToString("\n") { "- ${it.title}：${it.definition.take(NODE_EXCERPT)}" }
-            val nodeKeyTitles = chain.nodeTitles.joinToString("\n") { title ->
-                val node = titleToNode[title.trim()]
-                if (node != null) "${node.nodeKey}：${node.title}" else title
-            }
-            val chainPrompt = prompts.load(PROMPT_KNOWLEDGE_MAP_CHAIN)
-                .replace("{chainTheme}", chain.theme)
-                .replace("{chainOpening}", chain.opening)
-                .replace("{nodeTitles}", chain.nodeTitles.joinToString(" → "))
-                .replace("{filledNodes}", filledSummary.ifBlank { "暂无" })
-                .replace("{chunks}", formatChunks(chainChunks))
-                .replace("{nodeKeyTitles}", nodeKeyTitles)
+            // 一条链可能要多轮才能填满：单次输出被 max_tokens 截断时，本地剪裁只能
+            // 救回前面的完整节点，尾部节点仍是占位。这里按「还差哪些节点」继续追问，
+            // 每轮只要剩下的那些——输出随之变短，长链因此能在一次生成里走完，
+            // 而不是每次都把整条链重跑一遍（既贵又同样会在同一处截断）。
+            var chainFailure: Throwable? = null
+            var pass = 0
+            val maxPasses = chainMaxPasses(chain.nodeTitles.size)
+            while (pass < maxPasses) {
+                pass += 1
+                // 每轮开始时从库里刷新节点：上一链/上一轮回填的结果必须在这里可见，
+                // 共享节点才能「先到先得」不被覆盖，断点重试也能看到真实进度。
+                // 只看本批次的节点：序号 nodeKey（nk-1、nk-2…）在批次间会重复，
+                // 混入旧批次节点会匹配到错误目标；已展开摘要同理不该被旧地图污染
+                val nodes = knowledgeRepository.getByProjectAll(projectId)
+                    .filter { it.batchId == batch.id }
+                val keyToNode = nodes.associateBy { it.nodeKey }
+                val titleToNode = nodes.associateBy { it.title.trim() }
+                val filledKeys = nodes
+                    .filter { it.generateStatus == NodeGenerateStatus.COMPLETED.name }
+                    .map { it.nodeKey }
+                    .toSet()
+                // 本轮还要填的节点：链上尚未 COMPLETED 的那些（跨链共享的已填节点自然跳过）。
+                // 一轮最多问 CHAIN_NODES_PER_PASS 个：骨架允许长链（20+ 节点），
+                // 一次问完输出必然超长，而超长的代价是整轮白费。分批问，每轮输出短、
+                // 稳定落库，剩下的下一轮继续——CHAIN_MAX_PASSES 保证能问完。
+                val pending = chain.nodeTitles
+                    .mapNotNull { titleToNode[it.trim()] }
+                    .filter { it.nodeKey !in filledKeys }
+                if (pending.isEmpty()) break // 全填满了（含被别的链填完的情况）
+                val remaining = pending.take(CHAIN_NODES_PER_PASS)
 
-            val chainRaw = router.generate(
-                role = ModelRole.FAST,
-                request = ModelRequest(
+                // 上下文分档（见 ChainPromptContext）：首轮给这条链的全景，
+                // 续轮/重试只给「还差哪些 + 接口在哪」。
+                //
+                // 用户的意见是对的：重试时把所有资料和所有已写节点的来处/去处/易混/案例
+                // 整套重发一遍，除了让 prompt 更长、更贵、更容易撞上下文上限，没有任何收益。
+                // 模型这一轮真正需要的只有两样：还差哪几个节点，以及紧挨着它们的上下游
+                // 长什么样（arisesFrom/leadsTo 才咬得上）。其余节点只给标题。
+                val isFirstPass = pass == 1
+                val remainingTitles = remaining.map { it.title.trim() }
+                // 本链已完成节点引用过的片段不再随下一轮重发：它们的内容
+                // 已经通过 filledSection 给过模型，重发纯粹是重复计费
+                val chainTitleSet = chain.nodeTitles.map { it.trim() }.toSet()
+                val citedByChain = nodes
+                    .filter {
+                        it.generateStatus == NodeGenerateStatus.COMPLETED.name &&
+                            it.title.trim() in chainTitleSet
+                    }
+                    .flatMap { it.sourceRefs }
+                    .toSet()
+                // 资料同理：续轮只按还差的那几个节点检索，不再整条链重新捞一遍
+                val chainChunks = if (modelKnowledge) {
+                    emptyList()
+                } else {
+                    selectChunksForChain(
+                        allChunks = chunks,
+                        chain = chain,
+                        focusTitles = if (isFirstPass) emptyList() else remainingTitles,
+                        pass = pass,
+                        excludeIds = citedByChain,
+                    )
+                }
+                val chainChunkIds = chainChunks.map { it.id }.toSet()
+                val filledNodes = nodes.filter {
+                    it.generateStatus == NodeGenerateStatus.COMPLETED.name && it.definition.isNotBlank()
+                }
+                val filledSection = if (isFirstPass) {
+                    ChainPromptContext.firstPassFilledSection(
+                        chainTitles = chain.nodeTitles,
+                        remainingTitles = remainingTitles,
+                        filledByTitle = filledNodes.associateBy { it.title.trim() },
+                    )
+                } else {
+                    ChainPromptContext.followUpFilledSection(
+                        chainTitles = chain.nodeTitles,
+                        remainingTitles = remainingTitles,
+                        filledByTitle = filledNodes.associateBy { it.title.trim() },
+                    )
+                }
+                val nodeKeyTitles = remaining.joinToString("\n") { "${it.nodeKey}：${it.title}" }
+                val chainPrompt = prompts.load(PROMPT_KNOWLEDGE_MAP_CHAIN)
+                    .replace("{learnerProfile}", LearnerProfile.section(project))
+                    .replace("{chainTheme}", chain.theme)
+                    .replace("{chainOpening}", chain.opening)
+                    .replace("{nodeTitles}", chain.nodeTitles.joinToString(" → "))
+                    .replace("{filledNodes}", filledSection)
+                    .replace("{chunks}", chainChunkSection(modelKnowledge, chainChunks))
+                    .replace("{nodeKeyTitles}", nodeKeyTitles)
+
+                val chainRaw = router.generate(
                     role = ModelRole.FAST,
-                    system = SYSTEM_MAP_CHAIN,
-                    user = chainPrompt,
-                    jsonMode = true,
-                ),
-                decoder = jsonDecoder(ChainNodesOutput.serializer()),
-            ).getOrElse {
+                    request = ModelRequest(
+                        role = ModelRole.FAST,
+                        system = SYSTEM_MAP_CHAIN,
+                        user = chainPrompt,
+                        // 一轮最多 6 个节点，常规输出上限为 8K；输入意外变长时
+                        // TokenBudget 会继续收紧，避免 prompt + max_tokens 越窗。
+                        maxTokens = TokenBudget.outputLimit(
+                            system = SYSTEM_MAP_CHAIN,
+                            user = chainPrompt,
+                            stageCap = TokenBudget.Stage.CHAIN,
+                        ),
+                        jsonMode = true,
+                        stageLabel = "MAP_CHAIN#${index + 1}.p$pass",
+                    ),
+                    decoder = jsonDecoder(ChainNodesOutput.serializer()),
+                ).getOrElse { error ->
+                    chainFailure = error
+                    null
+                } ?: break // 调用失败：不再追问，交给下面的失败收尾
+
+                val (valid, unmatched) = OutputValidators.validateChainNodes(
+                    chainRaw,
+                    keyToNode.keys,
+                    titleToNode.keys,
+                ).getOrElse { return Result.failure(it) }
+                unmatchedTitles += unmatched
+
+                // 回填：nodeKey 优先；标识抄错/没带时按骨架标题兜底，不让一个字符的
+                // 抄写失误吞掉整个节点。已 COMPLETED 的共享节点跳过（先到先得）
+                var filledThisPass = 0
+                for (dto in valid) {
+                    val node = keyToNode[dto.nodeKey]
+                        ?: titleToNode[dto.title.trim()]
+                        ?: continue
+                    if (node.generateStatus == NodeGenerateStatus.COMPLETED.name) continue
+                    val parentId = dto.parentTitle?.trim()?.let { titleToNode[it]?.id }
+                    knowledgeRepository.upsert(
+                        node.copy(
+                            generateStatus = NodeGenerateStatus.COMPLETED.name,
+                            parentId = parentId ?: node.parentId,
+                            depth = dto.depth.coerceIn(1, 3),
+                            definition = dto.definition,
+                            arisesFrom = dto.arisesFrom,
+                            leadsTo = dto.leadsTo,
+                            prerequisites = dto.prerequisites,
+                            related = dto.related,
+                            confusions = dto.confusions,
+                            examples = dto.examples,
+                            // 引用只能落在本次提供的片段上；骨架后新增的片段 ID 一律丢弃
+                            sourceRefs = dto.sourceRefs.filter { it in chainChunkIds }.distinct(),
+                        ),
+                    )
+                    filledThisPass += 1
+                }
+                // 一个都没填上：再问一遍也是同样结果，停下别烧 token
+                if (filledThisPass == 0) break
+                // 还差的是「整条链」剩下的（pending），不只是本轮那一批（remaining）
+                if (filledThisPass < pending.size && pass < maxPasses) {
+                    onProgress(
+                        GenerationProgress(
+                            "第 ${index + 1} 条链还差 ${pending.size - filledThisPass} 个知识点，继续补",
+                            completed,
+                            total,
+                        ),
+                    )
+                }
+            }
+
+            // 本链是否真的填满了（多轮之后仍有占位 = 没填满）
+            val chainTitles = chain.nodeTitles.map { it.trim() }.toSet()
+            val leftover = knowledgeRepository.getByProjectAll(projectId)
+                .filter { it.batchId == batch.id }
+                .filter { it.title.trim() in chainTitles }
+                .filter { it.generateStatus != NodeGenerateStatus.COMPLETED.name }
+            if (leftover.isNotEmpty()) {
+                // 单链失败不再中止整批：后面的链照常展开，最后汇总报「N 条中 M 条失败」。
+                // 原来这里直接 return，任何一条链抖一下整批就报失败，
+                // 用户重试时已完成的链白跑一遍体验、失败链的资料费再交一次
                 statuses[index] = KnowledgeMapChainStatus.FAILED
                 knowledgeRepository.saveBatch(
                     batch.copy(
-                        chainStatuses = encodeStatuses(statuses),
+                        chainStatuses = statuses.encodeStatuses(),
                         updatedAt = clock(),
                     ),
                 )
                 // 本链尚未展开的节点标失败（UI 可见），重试时重新展开
-                chain.nodeTitles.mapNotNull { titleToNode[it.trim()] }
-                    .filter { it.generateStatus != NodeGenerateStatus.COMPLETED.name }
-                    .forEach { knowledgeRepository.updateGenerateStatus(it.id, NodeGenerateStatus.FAILED.name) }
-                return Result.failure(it)
-            }
-            val (valid, unmatched) = OutputValidators.validateChainNodes(
-                chainRaw,
-                keyToNode.keys,
-                titleToNode.keys,
-            ).getOrElse { return Result.failure(it) }
-            unmatchedTitles += unmatched
-
-            // 回填：按 nodeKey 匹配；已 COMPLETED 的共享节点跳过（先到先得）
-            for (dto in valid) {
-                val node = keyToNode[dto.nodeKey] ?: continue
-                if (node.generateStatus == NodeGenerateStatus.COMPLETED.name) continue
-                val parentId = dto.parentTitle?.trim()?.let { titleToNode[it]?.id }
-                knowledgeRepository.upsert(
-                    node.copy(
-                        generateStatus = NodeGenerateStatus.COMPLETED.name,
-                        parentId = parentId ?: node.parentId,
-                        depth = dto.depth.coerceIn(1, 3),
-                        definition = dto.definition,
-                        arisesFrom = dto.arisesFrom,
-                        leadsTo = dto.leadsTo,
-                        prerequisites = dto.prerequisites,
-                        related = dto.related,
-                        confusions = dto.confusions,
-                        examples = dto.examples,
-                        // 引用只能落在本次提供的片段上；骨架后新增的片段 ID 一律丢弃
-                        sourceRefs = dto.sourceRefs.filter { it in chainChunkIds }.distinct(),
-                    ),
-                )
+                leftover.forEach {
+                    knowledgeRepository.updateGenerateStatus(it.id, NodeGenerateStatus.FAILED.name)
+                }
+                failedChains += 1
+                stepped = true
+                chainFailures += chainFailureNote(index, chain, leftover.size, chainFailure)
+                onProgress(GenerationProgress("第 ${index + 1} 条链展开失败，继续下一条", completed, total))
+                return@forEachIndexed
             }
             statuses[index] = KnowledgeMapChainStatus.DONE
             knowledgeRepository.saveBatch(
                 batch.copy(
-                    chainStatuses = encodeStatuses(statuses),
+                    chainStatuses = statuses.encodeStatuses(),
                     updatedAt = clock(),
                 ),
             )
+            stepped = true
             completed += 1
             onProgress(GenerationProgress("正在展开第 ${index + 1}/${chains.size} 条演进链", completed, total))
         }
-        batch = batch.copy(chainStatuses = encodeStatuses(statuses), updatedAt = clock())
+        batch = batch.copy(chainStatuses = statuses.encodeStatuses(), updatedAt = clock())
         knowledgeRepository.saveBatch(batch)
+
+        // 部分链失败：已展开的内容保留，审计不做（缺口/冲突清单等地图补齐再定稿），
+        // 返回失败让 UI 明示还差哪几条；续跑只补失败链
+        if (failedChains > 0) {
+            onProgress(GenerationProgress("${chains.size} 条链中 $failedChains 条失败", completed, total))
+            return Result.failure(
+                IllegalStateException(
+                    buildString {
+                        append("${chains.size} 条演进链中 $failedChains 条展开失败，已完成的链不受影响；")
+                        append("可点「展开下一条链」继续，失败链会自动重试。")
+                        chainFailures.take(CHAIN_FAILURE_DETAIL_LIMIT).forEach { append("\n").append(it) }
+                    },
+                ),
+            )
+        }
+        // 单步模式：本轮只推进一条链，审计等全部链完成后（用户再点一次）再做
+        if (mode == KnowledgeMapMode.NEXT_CHAIN && statuses.any { it != KnowledgeMapChainStatus.DONE }) {
+            onProgress(GenerationProgress("已展开一条演进链", completed, total))
+            return Result.success(Unit)
+        }
 
         // ===== 3. 全局审计（一次小调用，生成最终 gaps/conflicts） =====
         onProgress(GenerationProgress("正在做全局审计", completed, total))
         val allNodes = knowledgeRepository.getByProjectAll(projectId)
+            .filter { it.batchId == batch.id }
         val auditResult = runCatching {
+            // 审计只吃节点摘要 + 资料清单，不再带原文：原来一次塞全项目 50 条×500 字
+            // （2-3 万 token）只为产出缺口/冲突清单，失败重试还按次计费
             val auditPrompt = prompts.load(PROMPT_KNOWLEDGE_MAP_AUDIT)
+                .replace("{learnerProfile}", LearnerProfile.section(project))
                 .replace("{topic}", project.topic)
-                .replace("{goal}", project.title)
+                .replace("{goal}", LearnerProfile.goal(project))
                 .replace("{nodes}", allNodes.joinToString("\n") { node ->
                     "- ${node.title}：${node.definition.take(NODE_EXCERPT)}"
                 }.ifBlank { "（地图为空）" })
-                .replace("{chunks}", formatChunks(chunks))
+                .replace("{sources}", formatSourceDigest(chunks))
             router.generate(
                 role = ModelRole.FAST,
                 request = ModelRequest(
                     role = ModelRole.FAST,
                     system = SYSTEM_MAP_AUDIT,
                     user = auditPrompt,
+                    maxTokens = TokenBudget.outputLimit(
+                        system = SYSTEM_MAP_AUDIT,
+                        user = auditPrompt,
+                        stageCap = TokenBudget.Stage.AUDIT,
+                    ),
                     jsonMode = true,
+                    stageLabel = "MAP_AUDIT",
                 ),
                 decoder = jsonDecoder(KnowledgeMapAuditOutput.serializer()),
             )
         }
         val audit = auditResult.getOrNull()?.getOrNull()
-        val auditSucceeded = audit != null
         var finalGaps = audit?.gaps ?: decodeStringList(batch.previewGaps)
         var finalConflicts = audit?.conflicts ?: decodeConflicts(batch.previewConflicts)
 
@@ -387,38 +558,25 @@ class PipelineService(
             softGaps += unmatchedTitles.take(5).map { "「$it」未纳入知识地图（单链展开给出的标题不在骨架内）" }
         }
 
-        if (!auditSucceeded) {
-            // 审计失败：不推翻已展开节点，地图内容可用；但批次不置 completed，
-            // 下次续跑只补审计，UI 通过错误横幅明确标「全局审计待重试」，不误报为全部完成。
+        if (audit == null) {
+            // 审计失败按软失败收尾：所有链已展开成功、地图内容完整，缺口/冲突清单
+            // 只是锦上添花——为它报「生成失败」会让用户以为整张地图废了，重试又把
+            // 2-3 万 token 的审计输入再交一遍钱。gaps 落一条说明，批次照常完成
             val reason = auditResult.exceptionOrNull()?.message ?: "模型调用失败"
-            batch = batch.copy(auditFailed = true, updatedAt = clock())
+            batch = batch.copy(auditFailed = true, completed = true, active = true, updatedAt = clock())
             knowledgeRepository.saveBatch(batch)
-            // 首次生成：地图已在用（骨架即 active），落一份带说明的保底 insights
-            if (batch.active) {
-                val gaps = (finalGaps + softGaps +
-                    "全局审计未完成（$reason），可稍后重试。以上缺口清单为骨架阶段的预览。").distinct()
-                knowledgeRepository.replaceInsights(
-                    projectId = projectId,
-                    gaps = gaps.mapIndexed { index, text ->
-                        KnowledgeGap(id = idFactory(), projectId = projectId, description = text, order = index)
-                    },
-                    conflicts = finalConflicts.distinctBy { it.topic }.mapIndexed { index, dto ->
-                        KnowledgeConflict(
-                            id = idFactory(),
-                            projectId = projectId,
-                            topic = dto.topic,
-                            sources = dto.sources,
-                            description = dto.description,
-                            order = index,
-                        )
-                    },
-                )
-                projectRepository.update(project.copy(status = ProjectStatus.MAP, updatedAt = clock()))
+            if (!isFirstGeneration) {
+                knowledgeRepository.switchActiveBatch(projectId, batch.id)
             }
-            onProgress(GenerationProgress("全局审计未完成，可重试", completed, total))
-            return Result.failure(
-                IllegalStateException("全局审计未完成（$reason）。知识地图内容已可用，可重试补齐审计。"),
+            finalGaps = (finalGaps + softGaps + "全局审计未完成（$reason），以上缺口清单为骨架阶段的预览；可重新梳理补齐。").distinct()
+            knowledgeRepository.replaceInsights(
+                projectId = projectId,
+                gaps = buildGaps(projectId, finalGaps, audit?.structuredGaps.orEmpty(), allNodes, inheritedGapStatus),
+                conflicts = buildConflicts(projectId, finalConflicts, inheritedConflictStatus),
             )
+            projectRepository.update(project.copy(status = ProjectStatus.MAP, updatedAt = clock()))
+            onProgress(GenerationProgress("知识主干梳理完成（全局审计未完成，不影响使用）", total, total))
+            return Result.success(Unit)
         }
 
         // 审计成功：整批完成。重新生成场景下旧地图此刻才下线（原子切换），
@@ -432,29 +590,298 @@ class PipelineService(
         finalGaps = (finalGaps + softGaps).distinct()
         knowledgeRepository.replaceInsights(
             projectId = projectId,
-            gaps = finalGaps.mapIndexed { index, text ->
-                KnowledgeGap(id = idFactory(), projectId = projectId, description = text, order = index)
-            },
-            conflicts = finalConflicts.distinctBy { it.topic }.mapIndexed { index, dto ->
-                KnowledgeConflict(
-                    id = idFactory(),
-                    projectId = projectId,
-                    topic = dto.topic,
-                    sources = dto.sources,
-                    description = dto.description,
-                    order = index,
-                )
-            },
+            gaps = buildGaps(projectId, finalGaps, audit?.structuredGaps.orEmpty(), allNodes, inheritedGapStatus),
+            conflicts = buildConflicts(projectId, finalConflicts, inheritedConflictStatus),
         )
         projectRepository.update(project.copy(status = ProjectStatus.MAP, updatedAt = clock()))
         onProgress(GenerationProgress("知识主干梳理完成", total, total))
         return Result.success(Unit)
     }
 
-    suspend fun generateStoryBible(projectId: String): Result<Unit> {
+    /**
+     * 把审计产出组装成待落库的缺口清单（gaps 闭环）。
+     *
+     * 三件事，缺一不可：
+     *
+     * 1. **结构化优先**：有 `structuredGaps` 时按它带类型/建议标题落库；旧模型
+     *    不输出该字段时退回纯文本，一律 `UNSPECIFIED`。两者并存而不是替换，
+     *    是把 `gaps` 改成对象数组会让旧模型输出反序列化失败——整批审计会崩。
+     * 2. **状态继承**：[replaceInsights] 是全量 clear + 重建，直接覆盖会把用户
+     *    已经补上或已经点掉的一条打回 OPEN。「补过的又冒出来」比「没提示」更糟，
+     *    所以重建时按「建议标题」继承旧的 RESOLVED / DISMISSED。
+     *    **继承来源必须是调用方在骨架阶段之前拍的快照**（[inheritedByTitle]）——
+     *    骨架阶段的 replaceInsights 已经把库换成了预览行，这里再读库只会读到空状态。
+     * 3. **已补上的自动 RESOLVED**：建议标题能在当前地图节点标题里匹配到，
+     *    说明知识点已经补进来了——审计再把它列为缺口是自相矛盾。
+     */
+    private fun buildGaps(
+        projectId: String,
+        textGaps: List<String>,
+        structured: List<GapDto>,
+        nodes: List<KnowledgeNode>,
+        inheritedByTitle: Map<String, String>,
+    ): List<KnowledgeGap> {
+        val nodeTitles = nodes.map { it.title.trim() }.filter { it.isNotEmpty() }
+        val nodeByKey = nodes.associate { it.nodeKey to it.id }
+        val items = if (structured.isNotEmpty()) {
+            structured.map { dto ->
+                GapItem(
+                    description = dto.description.ifBlank { dto.suggestedTitle },
+                    type = GapType.parse(dto.type),
+                    anchorNodeId = nodeByKey[dto.anchorNodeKey.trim()].orEmpty(),
+                    suggestedTitle = dto.suggestedTitle.trim(),
+                )
+            }
+        } else {
+            textGaps.map { text -> GapItem(description = text, type = GapType.UNSPECIFIED) }
+        }
+        return items
+            .filter { it.description.isNotBlank() }
+            .distinctBy { it.description.trim() }
+            .mapIndexed { index, item ->
+                val status = when {
+                    item.suggestedTitle.isNotBlank() && inheritedByTitle.containsKey(item.suggestedTitle) ->
+                        inheritedByTitle.getValue(item.suggestedTitle)
+                    item.suggestedTitle.isNotBlank() && nodeTitles.any { matchesTitle(it, item.suggestedTitle) } ->
+                        GapStatus.RESOLVED.name
+                    else -> GapStatus.OPEN.name
+                }
+                KnowledgeGap(
+                    id = idFactory(),
+                    projectId = projectId,
+                    description = item.description,
+                    order = index,
+                    gapType = item.type.name,
+                    status = status,
+                    anchorNodeId = item.anchorNodeId,
+                    suggestedTitle = item.suggestedTitle,
+                )
+            }
+    }
+
+    /**
+     * 把冲突组装成待落库的清单（与 [buildGaps] 同一套继承逻辑）。
+     *
+     * 冲突没有 `suggestedTitle`，按 **topic** 继承——同一个对立观点的 topic 在两次
+     * 梳理间通常是稳定的字符串，比 description 稳。继承来源同样是调用方拍的快照。
+     */
+    private fun buildConflicts(
+        projectId: String,
+        dtos: List<ConflictDto>,
+        inheritedByTopic: Map<String, String>,
+    ): List<KnowledgeConflict> = dtos
+        .map { it.copy(topic = it.topic.trim()) }
+        .filter { it.topic.isNotBlank() }
+        .distinctBy { it.topic }
+        .mapIndexed { index, dto ->
+            KnowledgeConflict(
+                id = idFactory(),
+                projectId = projectId,
+                topic = dto.topic,
+                sources = dto.sources,
+                description = dto.description,
+                order = index,
+                status = inheritedByTopic[dto.topic] ?: GapStatus.OPEN.name,
+            )
+        }
+
+    /** 标题是否被「同一件事」匹配到：trim 后相等，或一方包含另一方（模型/用户都可能加修饰词） */
+    private fun matchesTitle(existing: String, suggested: String): Boolean =
+        existing == suggested || existing.contains(suggested) || suggested.contains(existing)
+
+    private data class GapItem(
+        val description: String,
+        val type: GapType,
+        val anchorNodeId: String = "",
+        val suggestedTitle: String = "",
+    )
+
+    /**
+     * 按一条缺口把漏掉的知识点补进知识主干（gaps 闭环）。
+     *
+     * 只补**一个**节点、只发**一次**调用：gap 说的是「这里缺一个东西」，
+     * 为它重跑整张地图（几万 token、几分钟）是纯粹的浪费。
+     *
+     * 幂等：`status != OPEN` 直接返回成功——用户连点两下、或 Worker 被重试，
+     * 都不该把同一个知识点补两遍。
+     *
+     * **不触发 `switchActiveBatch`**：那一步会删掉不属于新批次的节点，
+     * 而这里只是往当前生效批次上追加一个节点。补完提示用户去续卷，
+     * 不自动重跑审计——「补 → 又发现新缺口 → 再补」的无限递归没有任何价值。
+     *
+     * @return 补上的节点标题，供 UI 提示「已补上 X，点继续下一卷把它讲进去」
+     */
+    suspend fun generateKnowledgeMapPatch(projectId: String, gapId: String): Result<String> {
         val project = projectRepository.get(projectId)
             ?: return Result.failure(IllegalStateException("项目不存在"))
-        val nodes = knowledgeRepository.getByProject(projectId)
+        val gap = knowledgeRepository.getGaps(projectId).firstOrNull { it.id == gapId }
+            ?: return Result.failure(IllegalStateException("这条提示已经不在了，刷新一下看看"))
+        if (gap.gapStatus != GapStatus.OPEN) {
+            // 已处理（补过 / 用户点过「知道了」）：幂等返回，不重复烧调用
+            return Result.success(gap.suggestedTitle)
+        }
+        if (!gap.actionable) {
+            return Result.failure(
+                IllegalStateException("这一条是「要多留个心眼」的提醒，不是漏掉的知识点，补不了也不该关掉"),
+            )
+        }
+        val title = gap.suggestedTitle.trim()
+        if (title.isBlank()) {
+            return Result.failure(IllegalStateException("这条提示没给出要补的知识点名称，无法补充"))
+        }
+
+        val batch = knowledgeRepository.getLatestBatch(projectId)
+            ?: return Result.failure(IllegalStateException("还没有知识主干，先梳理一次"))
+        val nodes = knowledgeRepository.getByProjectAll(projectId).filter { it.batchId == batch.id }
+        if (nodes.any { matchesTitle(it.title.trim(), title) }) {
+            // 已经有同名/近名节点了（可能是用户手动加的）：直接闭环，不必再问模型
+            knowledgeRepository.updateGap(gap.copy(status = GapStatus.RESOLVED.name))
+            return Result.success(title)
+        }
+
+        // 新编号取当前批次最大序号 +1，避免与已有节点撞号
+        val nextKey = "nk-${nodes.size + 1}"
+        val modelKnowledge = project.usesModelKnowledge
+        val chunks = if (modelKnowledge) {
+            emptyList()
+        } else {
+            selectChunksForChain(
+                allChunks = sourceRepository.getChunksByProject(projectId),
+                chain = ChainDto(theme = title, nodeTitles = listOf(title)),
+                focusTitles = listOf(title),
+                pass = 1,
+            )
+        }
+        val chunkIds = chunks.map { it.id }.toSet()
+        val placeholder = KnowledgeNode(
+            id = idFactory(),
+            projectId = projectId,
+            title = title,
+            order = nodes.size,
+            depth = 2,
+            nodeKey = nextKey,
+            batchId = batch.id,
+            generateStatus = NodeGenerateStatus.PLACEHOLDER.name,
+        )
+        knowledgeRepository.upsertAll(listOf(placeholder))
+
+        val prompt = prompts.load(PROMPT_KNOWLEDGE_MAP_CHAIN)
+            .replace("{learnerProfile}", LearnerProfile.section(project))
+            .replace("{chainTheme}", "补充：${gap.description}")
+            .replace("{chainOpening}", gap.description)
+            .replace("{nodeTitles}", title)
+            .replace("{filledNodes}", "（这是一个补充节点，与它相邻的已有知识点见下）")
+            .replace("{chunks}", chainChunkSection(modelKnowledge, chunks))
+            .replace("{nodeKeyTitles}", "$nextKey：$title")
+        val raw = router.generate(
+            role = ModelRole.FAST,
+            request = ModelRequest(
+                role = ModelRole.FAST,
+                system = SYSTEM_MAP_CHAIN,
+                user = prompt,
+                maxTokens = TokenBudget.outputLimit(
+                    system = SYSTEM_MAP_CHAIN,
+                    user = prompt,
+                    stageCap = TokenBudget.Stage.CHAIN,
+                ),
+                jsonMode = true,
+                stageLabel = "MAP_PATCH",
+            ),
+            decoder = jsonDecoder(ChainNodesOutput.serializer()),
+        ).getOrElse { error ->
+            // 补节点失败：占位节点留在库里（仍是 PLACEHOLDER，不会被当成已完成），
+            // gap 保持 OPEN，用户可以再点一次
+            return Result.failure(error)
+        }
+
+        val (valid, _) = OutputValidators.validateChainNodes(
+            raw,
+            setOf(nextKey),
+            setOf(title),
+        ).getOrElse { return Result.failure(it) }
+        val dto = valid.firstOrNull { it.definition.isNotBlank() }
+            ?: return Result.failure(ModelError.Invalid("模型没有给出这个知识点的内容，可以再试一次"))
+
+        knowledgeRepository.upsert(
+            placeholder.copy(
+                generateStatus = NodeGenerateStatus.COMPLETED.name,
+                definition = dto.definition,
+                arisesFrom = dto.arisesFrom,
+                leadsTo = dto.leadsTo,
+                prerequisites = dto.prerequisites,
+                related = dto.related,
+                confusions = dto.confusions,
+                examples = dto.examples,
+                sourceRefs = dto.sourceRefs.filter { it in chunkIds }.distinct(),
+            ),
+        )
+        knowledgeRepository.updateGap(gap.copy(status = GapStatus.RESOLVED.name))
+        return Result.success(title)
+    }
+
+    /** 用户点「知道了」：把一条待办移出「别只信AI」 */
+    suspend fun dismissGap(projectId: String, gapId: String): Result<Unit> {
+        val gap = knowledgeRepository.getGaps(projectId).firstOrNull { it.id == gapId }
+            ?: return Result.failure(IllegalStateException("这条提示已经不在了，刷新一下看看"))
+        if (!gap.actionable) {
+            return Result.failure(
+                IllegalStateException("「要多留个心眼」的提醒不能关掉——它们会一直提醒你核实"),
+            )
+        }
+        knowledgeRepository.updateGap(gap.copy(status = GapStatus.DISMISSED.name))
+        return Result.success(Unit)
+    }
+
+    /**
+     * 用户点「知道了」：把一条资料冲突移出「别只信AI」。
+     *
+     * 冲突不是缺口——没有"补上"一说，只有"我已经知道两边说法了，别反复提示"。
+     * 关闭状态按 topic 在下次梳理时继承（[buildConflicts]），不会重新冒出来。
+     * 幂等：重复点击只是把同一行 REPLACE 成同样的值。
+     */
+    suspend fun dismissConflict(projectId: String, conflictId: String): Result<Unit> {
+        val conflict = knowledgeRepository.getConflicts(projectId).firstOrNull { it.id == conflictId }
+            ?: return Result.failure(IllegalStateException("这条提示已经不在了，刷新一下看看"))
+        knowledgeRepository.updateConflict(conflict.copy(status = GapStatus.DISMISSED.name))
+        return Result.success(Unit)
+    }
+
+    /**
+     * 规划第一卷讲述路线（三段式：分卷 → 大纲 → 逐章契约）。
+     *
+     * ## 为什么改成三段
+     *
+     * 旧实现是一次调用产出整卷 4-8 章、每章一份九字段契约：任何一章不合规 →
+     * `ModelError.Invalid`（`retryable=false`）→ **整卷作废、不重试、已生成部分全丢**。
+     * 这是「讲述路线死活生成不出来」的根因。三段式把「全或无」拆成「逐章隔离」：
+     *
+     * - 分卷是**纯程序**（演进链已是天然的讲述分组，再让模型输出一次映射只会打架）；
+     * - 大纲每卷一次调用，只出讲什么、怎么讲，**不含契约**；
+     * - 契约每章一次调用，一章失败只标这一章 FAILED，其余照常落库。
+     *
+     * 断点记在 [RouteBatch] 上：大纲 done 之后重试只补 `contractStatus != DONE` 的章，
+     * 大纲不重建——重试的成本从「整卷」降到「一章」。
+     *
+     * ## 编号只在模型交互层
+     *
+     * 模型看到的是 `#3` 这样的编号（抄不错），落库一律换回节点 ID：
+     * `nodeKey` 是批次内序号，跨批次会重复，不能当全局身份。
+     */
+    suspend fun generateStoryBible(
+        projectId: String,
+        /**
+         * 逐章契约的进度上报。
+         *
+         * 这一步是全流程里最长的一段 Worker：大纲一次调用之后还要**逐章**生成契约，
+         * 十几章就是十几轮。不上报的话，界面上只有一句「正在规划讲述路线」长时间不动，
+         * 前台通知也一直停在进入时的那一条——用户既看不到进展，系统也看不到这个
+         * 任务还在干活（长任务的存活靠的就是持续刷新的前台通知）。
+         */
+        onProgress: suspend (GenerationProgress) -> Unit = {},
+    ): Result<Unit> {
+        val project = projectRepository.get(projectId)
+            ?: return Result.failure(IllegalStateException("项目不存在"))
+        val nodes = ensureNodeKeys(knowledgeRepository.getByProject(projectId))
         if (nodes.isEmpty()) return Result.failure(IllegalStateException("知识地图为空"))
 
         // 已经有可读正文时不允许整本重新规划（第三阶段 3C）。
@@ -474,62 +901,225 @@ class PipelineService(
         }
 
         val bible = storyBibleRepository.get(projectId)
-        // 首次只规划一卷。让模型一次想出整个主题的所有章节，越往后越糊，
-        // 而且用户根本还没读到那儿（3C）
-        val suggested = suggestChapterCount(nodes.size)
+        val chains = storyChains(projectId, bible?.throughLine.orEmpty())
 
-        val prompt = prompts.load(PROMPT_STORY_BIBLE)
-            .replace("{styleInstruction}", StyleInstruction.of(project.genre))
-            .replace("{topic}", project.topic)
-            .replace("{goal}", project.title)
-            .replace("{baseline}", project.baseline)
-            .replace("{chapterHint}", "$suggested 章左右（不要超过 $VOLUME_MAX_CHAPTERS 章）")
-            .replace("{wordHint}", "${project.wordTargetPerChapter}")
-            .replace("{nodes}", formatNodesWithDerivation(nodes))
-            .replace("{chains}", formatChains(bible?.throughLine.orEmpty()))
+        // ===== 1. 分卷（纯程序） =====
+        val volume = VolumePlanner.firstVolume(
+            chains = chains,
+            nodesByTitle = nodes.associateBy { it.title.trim() },
+        )
+        if (volume.nodes.isEmpty()) {
+            return Result.failure(IllegalStateException("本卷没有可用知识点，无法规划讲述路线"))
+        }
+        if (volume.suggestedChapters <= 0) {
+            return Result.failure(IllegalStateException("本卷可用知识点太少，无法规划章节"))
+        }
 
-        val raw = router.generate(
-            role = ModelRole.STORY,
-            request = ModelRequest(
-                role = ModelRole.STORY,
-                system = SYSTEM_BIBLE,
-                user = prompt,
-                jsonMode = true,
-            ),
-            decoder = jsonDecoder(StoryBibleOutput.serializer()),
-        ).getOrElse { return Result.failure(it) }
-
-        val titleToId = nodes.associate { it.title to it.id }
-        // 新 Prompt 版本要求每章带因果契约与章节类型（第二轮 P1-2）：
-        // 老模型输出（无契约字段）解析成默认空契约，这里会明确失败而不是伪造通过
+        // ===== 2. 大纲（每卷一次调用） =====
         //
-        // 批次 B++ n=3：路线被强校验拦截的最大失败模式是「REVIEW 章把新节点填进
-        // introducedNodeTitles」。先校验；命中该模式时做一次**针对性修复重试**（只清空
-        // REVIEW 的 introduced 并检查此前引入），修复失败仍如实拦截，不静默降级。
-        val output = ReviewIntroducedFix.repairIfApplicable(
-            router = router,
-            output = raw,
-            decoder = jsonDecoder(StoryBibleOutput.serializer()),
-            validate = { candidate ->
-                OutputValidators.validateStoryBible(
-                    candidate, titleToId.keys, requireContracts = requireChapterContracts(),
-                )
-            },
-            fixFailure = { err -> Result.failure(err) },
-        ).getOrElse { return Result.failure(it) }
+        // 断点只在「上一次契约没做完」时生效。上一轮已收尾（contractsDone）说明
+        // 用户这次点的是**重新规划**，必须重来：否则复用旧大纲会连章节 ID 都不变，
+        // 「重新生成」看起来什么都没发生。
+        val batch = run {
+            val latest = knowledgeRepository.getLatestRouteBatch(projectId)
+            val resumable = latest != null &&
+                latest.outlineDone &&
+                !latest.failed &&
+                !latest.contractsDone &&
+                latest.contractStatusList().any { it == ContractStatus.FAILED }
+            if (resumable) latest else null
+        } ?: generateOutline(project, nodes, volume, chains).getOrElse { return Result.failure(it) }
+
+        val outline = decodeVolumeOutline(batch.outlineJson)
+            ?: return Result.failure(IllegalStateException("讲述路线大纲数据损坏，请重新规划"))
+
+        // ===== 3. 契约（每章一次调用，逐章隔离） =====
+        val plans = chapterRepository.getPlans(projectId)
+            .filter { it.volumeIndex == FIRST_VOLUME }
+            .sortedBy { it.order }
+        if (plans.isEmpty()) {
+            return Result.failure(IllegalStateException("讲述路线大纲没有落库章节，请重新规划"))
+        }
+        generateContracts(
+            projectId = projectId,
+            project = project,
+            nodes = nodes,
+            outline = outline,
+            plans = plans,
+            batch = batch,
+            onProgress = onProgress,
+        )
 
         // 路线软审计：前置顺序 / 重复引入 / 范围覆盖 / 负荷 / 类型单一化 / 链连续性（第二轮 P1-5）
-        // 演进链（chains）在批次 A 不落库，链连续性检查暂以空链运行，其余审计项完整生效
         routeAuditSink(
             RouteAudit.audit(
-                chapters = output.chapters,
-                nodeTitlesByPrereqs = nodes.associate { it.title to it.prerequisites },
-                allNodeTitles = titleToId.keys,
+                chapters = outline.chapters,
+                nodeTitlesByPrereqs = nodes.associate { it.title.trim() to it.prerequisites },
+                allNodeTitles = nodes.map { it.title.trim() }.toSet(),
+                chains = chains.map { it.nodeTitles.map(String::trim) },
                 dailyMinutes = project.dailyMinutes,
             ),
         )
 
-        val plans = output.chapters.mapIndexed { index, chapter ->
+        // 保存全局设定，同时把滚动记忆清零重新开始（问题5）
+        storyBibleRepository.save(
+            StoryBible(
+                projectId = projectId,
+                world = ContextBudget.clamp(
+                    (bible?.world).orEmpty().ifBlank { "（讲述路线按知识演进编排，未设定故事舞台）" },
+                    ContextBudget.WORLD_LIMIT,
+                ),
+                conflict = bible?.conflict.orEmpty().ifBlank { outline.volumeGoal },
+                style = bible?.style.orEmpty(),
+                approach = bible?.approach.orEmpty(),
+                characters = bible?.characters.orEmpty(),
+                throughLine = (bible?.throughLine).orEmpty().ifEmpty {
+                    chains.map { "${it.theme.ifBlank { "演进链" }}：${it.nodeTitles.joinToString(" → ")}" }
+                },
+                runningState = "",
+                coveredTitles = emptyList(),
+                openThreads = emptyList(),
+                currentVolumeIndex = FIRST_VOLUME,
+                updatedAt = clock(),
+            ),
+        )
+        projectRepository.update(
+            project.copy(
+                status = ProjectStatus.OUTLINE,
+                updatedAt = clock(),
+            ),
+        )
+        return Result.success(Unit)
+    }
+
+    /**
+     * 大纲阶段：一次调用产出本卷所有章的大纲（不含契约）。
+     *
+     * 模型一次看到全卷，所以类型分布由它给全局答案，再由 [VolumePlanner.enforceTypes]
+     * 做确定性兜底——两者都不需要为「某一章违规」重跑整卷。
+     * 校验不通过时函数内重试最多 [OUTLINE_MAX_ATTEMPTS] 次，越权失败才抛给调用方。
+     */
+    private suspend fun generateOutline(
+        project: Project,
+        nodes: List<KnowledgeNode>,
+        volume: VolumePlanner.DraftVolume,
+        chains: List<ChainDto>,
+    ): Result<RouteBatch> {
+        val keyOf = { node: KnowledgeNode -> nodeKeyLabel(node) }
+        val keyByTitle = NodeContext.keyByTitle(volume.nodes, keyOf)
+        val suggested = volume.suggestedChapters
+        val prompt = prompts.load(PROMPT_ROUTE_OUTLINE)
+            .replace("{styleInstruction}", StyleInstruction.of(project.genre))
+            .replace("{learnerProfile}", LearnerProfile.section(project))
+            .replace("{topic}", project.topic)
+            .replace("{chapterHint}", "$suggested")
+            .replace("{wordHint}", "${project.wordTargetPerChapter}")
+            .replace("{nodes}", NodeContext.formatL1(volume.nodes, keyOf, keyByTitle))
+            .replace("{volumeGroups}", formatVolumeGroups(volume, chains, keyByTitle))
+
+        var lastError: Throwable = IllegalStateException("讲述路线大纲生成失败")
+        repeat(OUTLINE_MAX_ATTEMPTS) { attempt ->
+            val raw = router.generate(
+                role = ModelRole.STORY,
+                request = ModelRequest(
+                    role = ModelRole.STORY,
+                    system = SYSTEM_ROUTE_OUTLINE,
+                    user = prompt,
+                    // 大纲不含契约，输出量约为旧整卷的 1/4，8K 绰绰有余
+                    maxTokens = TokenBudget.outputLimit(
+                        system = SYSTEM_ROUTE_OUTLINE,
+                        user = prompt,
+                        stageCap = TokenBudget.Stage.ROUTE_OUTLINE,
+                    ),
+                    jsonMode = true,
+                    stageLabel = "ROUTE_OUTLINE",
+                ),
+                decoder = jsonDecoder(VolumeOutlineOutput.serializer()),
+            ).onFailure { lastError = it }.getOrNull() ?: return@repeat
+
+            val validKeys = volume.nodes.map { keyOf(it) }.toSet()
+            val prepared = prepareOutline(raw, validKeys)
+            if (prepared == null) {
+                lastError = ModelError.Invalid(
+                    "讲述路线大纲第 ${attempt + 1} 次尝试仍不满足要求（章节为空或引用了不存在的知识点编号）",
+                )
+                return@repeat
+            }
+            val (chapters, notes) = prepared
+            val batch = persistOutline(
+                projectId = project.id,
+                volume = volume,
+                chapters = chapters,
+                keyToId = volume.nodes.associate { keyOf(it) to it.id },
+                outline = raw.copy(
+                    volumeTitle = raw.volumeTitle.ifBlank { "第一卷" },
+                    chapters = chapters,
+                ),
+            )
+            // 类型被程序改动过，如实告诉用户而不是假装模型原本就这么给
+            notes.forEach { note ->
+                routeAuditSink(
+                    listOf(
+                        RouteAuditIssue(
+                            level = RouteAuditIssue.Level.INFO,
+                            code = RouteAuditIssue.Code.TYPE_AUTO_ADJUSTED,
+                            message = note,
+                        ),
+                    ),
+                )
+            }
+            return Result.success(batch)
+        }
+        return Result.failure(lastError)
+    }
+
+    /**
+     * 大纲输出的校验与类型兜底。
+     *
+     * 编号有效性是硬校验（引用了清单外的编号 = 模型在凭空造知识点，无从落库）；
+     * 类型分布交给 [VolumePlanner.enforceTypes] 确定性修复——能程序修的绝不烧一次调用。
+     * 返回 null 表示这份输出不可用。
+     */
+    private fun prepareOutline(
+        raw: VolumeOutlineOutput,
+        validKeys: Set<String>,
+    ): Pair<List<ChapterPlanDto>, List<String>>? {
+        val chapters = raw.chapters
+            .filter { it.title.isNotBlank() }
+            .mapIndexed { index, chapter ->
+                if (chapter.order > 0) chapter else chapter.copy(order = index + 1)
+            }
+            .take(VOLUME_MAX_CHAPTERS)
+        if (chapters.isEmpty()) return null
+        val unknown = chapters
+            .flatMap { it.nodeKeys }
+            .map { it.trim() }
+            .filter { it.isNotBlank() && it !in validKeys }
+            .distinct()
+        if (unknown.isNotEmpty()) return null
+        // 章节类型：非空非法值一律失败（与旧路径同一条硬校验）
+        if (chapters.any { chapter ->
+                val typeName = chapter.chapterType.trim()
+                typeName.isNotEmpty() && ChapterType.entries.none { it.name == typeName.uppercase() }
+            }
+        ) return null
+        return VolumePlanner.enforceTypes(chapters)
+    }
+
+    /**
+     * 大纲落库 + 开/续 [RouteBatch]。
+     *
+     * 这里没有已发布章节（入口已经拦过），清理是安全的：
+     * 清掉的只是上一次规划出来、还一个字都没写的章节计划。
+     */
+    private suspend fun persistOutline(
+        projectId: String,
+        volume: VolumePlanner.DraftVolume,
+        chapters: List<ChapterPlanDto>,
+        keyToId: Map<String, String>,
+        outline: VolumeOutlineOutput,
+    ): RouteBatch {
+        val plans = chapters.mapIndexed { index, chapter ->
             ChapterPlan(
                 id = idFactory(),
                 projectId = projectId,
@@ -537,7 +1127,7 @@ class PipelineService(
                 title = chapter.title,
                 plotGoal = chapter.plotGoal,
                 learningGoals = chapter.learningGoals,
-                nodeIds = chapter.nodeTitles.mapNotNull { titleToId[it.trim()] }.distinct(),
+                nodeIds = chapter.nodeKeys.mapNotNull { keyToId[it.trim()] }.distinct(),
                 wordTarget = chapter.wordTarget.coerceIn(MIN_WORDS, MAX_WORDS),
                 status = ChapterStatus.QUEUED,
                 derivationChain = chapter.derivationChain,
@@ -546,18 +1136,15 @@ class PipelineService(
                 coveredTitles = emptyList(),
                 // 首次规划出来的都是第一卷（3C）
                 volumeIndex = FIRST_VOLUME,
-                volumeTitle = "第一卷",
-                volumeGoal = output.conflict,
-                // 章节类型与因果契约落库（第二轮 P1-2）：正文与核验阶段要用
+                volumeTitle = outline.volumeTitle.ifBlank { "第一卷" },
+                volumeGoal = outline.volumeGoal,
                 chapterType = chapter.chapterType,
-                contractJson = ContractCodec.encode(chapter.contract),
+                // 契约还没生成：留空串而不是伪造一份（ContractCodec 按 None 处理）
+                contractJson = "",
+                contractStatus = ContractStatus.PENDING.name,
             )
-            // 卷内章数硬上限：模型多给了也只收前 VOLUME_MAX_CHAPTERS 章，
-            // 剩下的知识点留给续卷，而不是一次摊平
-        }.take(VOLUME_MAX_CHAPTERS)
+        }
 
-        // 这里没有已发布章节（上面已经拦过），清理是安全的：
-        // 清掉的只是上一次规划出来、还一个字都没写的章节计划
         chapterRepository.clearVersionsForProject(projectId)
         // 引用跟着正文块一起清。留着的话它们会指向不存在的块，
         // 「这份资料被哪几段引用了」就会给出点不开的结果（4A）
@@ -568,39 +1155,392 @@ class PipelineService(
         chapterRepository.clearPlansForProject(projectId)
         chapterRepository.upsertPlans(plans)
 
-        // 保存全局设定，同时把滚动记忆清零重新开始（问题5）
-        storyBibleRepository.save(
-            StoryBible(
-                projectId = projectId,
-                world = ContextBudget.clamp(output.world, ContextBudget.WORLD_LIMIT),
-                conflict = output.conflict,
-                style = output.style,
-                approach = output.approach,
-                characters = output.characters.map { "${it.name}｜${it.role}｜${it.description}" },
-                throughLine = output.throughLine.ifEmpty {
-                    plans.map { "第${it.order}章：${it.derivationChain.ifBlank { it.plotGoal }}" }
-                },
-                runningState = "",
-                coveredTitles = emptyList(),
-                openThreads = emptyList(),
-                currentVolumeIndex = FIRST_VOLUME,
-                updatedAt = clock(),
+        val batch = RouteBatch(
+            id = idFactory(),
+            projectId = projectId,
+            volumeIndex = FIRST_VOLUME,
+            outlineJson = json.encodeToString(VolumeOutlineOutput.serializer(), outline),
+            contractStatuses = List(plans.size) { ContractStatus.PENDING }.encodeContractStatuses(),
+            introducedKeysJson = json.encodeToString(
+                ListSerializer(String.serializer()),
+                VolumePlanner.computeIntroducedBy(chapters).map { (key, order) -> "$key:$order" },
             ),
+            outlineDone = true,
+            createdAt = clock(),
+            updatedAt = clock(),
         )
-        // 自由发挥模式下把模型自选的风格回填，UI 与后续章节都以它为准（问题6）
-        projectRepository.update(
-            project.copy(
-                status = ProjectStatus.OUTLINE,
-                resolvedGenre = output.style.take(60),
-                updatedAt = clock(),
+        knowledgeRepository.saveRouteBatch(batch)
+        return batch
+    }
+
+    /**
+     * 逐章生成契约。
+     *
+     * **一章失败不连累整卷**：调用或校验失败 → 函数内重试一次 → 仍失败则该章
+     * 标 FAILED、**continue 继续下一章**。失败的章由 `contractStatus` 拦住正文生成
+     * （`GenerationStage.selectChaptersToGenerate`），保证「有正文必有契约」。
+     *
+     * 编号在这里反解回**标题**再落库：契约是给正文模型与核验模型看的，
+     * 它们按标题工作；编号只是本次交互的短记号。
+     */
+    private suspend fun generateContracts(
+        projectId: String,
+        project: Project,
+        nodes: List<KnowledgeNode>,
+        outline: VolumeOutlineOutput,
+        plans: List<ChapterPlan>,
+        batch: RouteBatch,
+        onProgress: suspend (GenerationProgress) -> Unit,
+        /** 非空时只补这一章（单章重试入口）。其余章节连 DONE 短路都不做 */
+        targetPlanId: String? = null,
+    ) {
+        val keyToNode = nodes.associateBy { nodeKeyLabel(it) }
+        val keyByTitle = NodeContext.keyByTitle(nodes) { nodeKeyLabel(it) }
+        // 「谁在哪章首次引入」由程序推导，不采信模型声明——ContractIntroducedFix 的
+        // 存在恰恰证明模型声明不可信
+        val introducedOrder = decodeIntroducedOrder(batch.introducedKeysJson)
+        val stored = batch.contractStatusList()
+        val statuses = if (stored.size == plans.size) {
+            stored.toMutableList()
+        } else {
+            // 批次里的状态数与当前章节数对不上（大纲重规划过）：全部按待生成处理。
+            // 宁可重跑一遍契约，也不能拿错位的状态去跳过某一章
+            MutableList(plans.size) { ContractStatus.PENDING }
+        }
+
+        val total = 1 + plans.size
+        var failedCount = 0
+        plans.forEachIndexed { index, plan ->
+            if (statuses[index] == ContractStatus.DONE) return@forEachIndexed
+            // 单章重试：不是目标章就整个跳过（包括上面的 DONE 短路，
+            // 那是因为目标章的 DONE 状态由调用方另行判断）
+            if (targetPlanId != null && plan.id != targetPlanId) return@forEachIndexed
+            val chapter = outline.chapters.getOrNull(index) ?: return@forEachIndexed
+            val chapterKeys = chapter.nodeKeys.map { it.trim() }.filter { it.isNotEmpty() }
+            onProgress(GenerationProgress("正在定第 ${plan.order} 章的因果结构", 1 + index, total))
+
+            // 更早章节已引入过的编号：这些不能再算「本章首次引入」
+            val alreadyIntroduced = introducedOrder
+                .filter { (_, order) -> order < index }
+                .keys
+            val learnedKeys = chapterKeys.toSet() + alreadyIntroduced
+            val allowed = chapterKeys.filter { it !in alreadyIntroduced }
+
+            var contract: ChapterContractDto? = null
+            var notes: List<String> = emptyList()
+            // 注意：必须用带标签的 lambda。repeat 是 inline 的，裸 return 会从
+            // 本函数整体返回——那样第一张契约一成功，后面所有章就永远停在 PENDING
+            repeat(CONTRACT_MAX_ATTEMPTS) attempt@{
+                val raw = callContract(project, chapter, chapterKeys, allowed, alreadyIntroduced, keyToNode, keyByTitle)
+                    .getOrNull() ?: return@attempt
+                val withKeys = raw.toContractDto()
+                val fixed = ContractIntroducedFix.fix(
+                    chapter = chapter,
+                    contract = withKeys,
+                    alreadyIntroduced = alreadyIntroduced,
+                    learnedKeys = learnedKeys,
+                )
+                val candidate = chapter.copy(contract = fixed.contract)
+                // 校验白名单 = 本章节点 ∪ 到本章为止已出现的节点。
+                // 只放本章节点会误伤：APPLY / REVIEW 章按定义就要应用先前章节的知识点，
+                // ContractIntroducedFix 补进 applied 的已学节点会被判成「凭空造的编号」。
+                // 白名单本身仍是程序推导的（introducedOrder 来自大纲落库，不是模型声明），
+                // 所以「模型凭空造知识点」照样拦得住。
+                val violation = OutputValidators.contractViolation(
+                    chapter = candidate,
+                    knownNodeTitles = emptySet(),
+                    knownNodeKeys = learnedKeys,
+                )
+                if (violation != null) return@attempt
+                contract = fixed.contract
+                notes = fixed.notes
+                return@attempt
+            }
+
+            if (contract == null) {
+                // 整章契约失败：只标这一章，其余章节照常
+                statuses[index] = ContractStatus.FAILED
+                failedCount += 1
+                chapterRepository.upsertPlans(
+                    listOf(plan.copy(contractStatus = ContractStatus.FAILED.name)),
+                )
+                knowledgeRepository.saveRouteBatch(
+                    batch.copy(
+                        contractStatuses = statuses.encodeContractStatuses(),
+                        failedChapterCount = failedCount,
+                        updatedAt = clock(),
+                    ),
+                )
+                return@forEachIndexed
+            }
+
+            // 落库前把编号反解回标题：契约是给正文/核验模型看的，它们按标题工作
+            val resolved = resolveContractKeys(contract!!, keyToNode)
+            statuses[index] = ContractStatus.DONE
+            chapterRepository.upsertPlans(
+                listOf(
+                    plan.copy(
+                        chapterType = chapter.chapterType,
+                        contractJson = ContractCodec.encode(resolved),
+                        contractStatus = ContractStatus.DONE.name,
+                    ),
+                )
+            )
+            knowledgeRepository.saveRouteBatch(
+                batch.copy(
+                    contractStatuses = statuses.encodeContractStatuses(),
+                    failedChapterCount = failedCount,
+                    contractsDone = statuses.all { it == ContractStatus.DONE },
+                    completed = statuses.all { it == ContractStatus.DONE },
+                    updatedAt = clock(),
+                ),
+            )
+            notes.forEach { note ->
+                routeAuditSink(
+                    listOf(
+                        RouteAuditIssue(
+                            level = RouteAuditIssue.Level.INFO,
+                            code = RouteAuditIssue.Code.CONTRACT_AUTO_ADJUSTED,
+                            chapterOrder = plan.order,
+                            message = note,
+                        ),
+                    ),
+                )
+            }
+        }
+        onProgress(GenerationProgress("讲述路线规划完成", total, total))
+    }
+
+    /**
+     * 单独重试一章的契约（三段式）。
+     *
+     * 存在的理由：`generateContracts` 里一章失败只标 FAILED 并继续，
+     * 但那之后用户要怎么补？没有这个入口，唯一的办法是整卷重新规划——
+     * 那会把已经生成好的其他章契约一起扔掉，等于把「逐章隔离」的成果又赔进去。
+     *
+     * 只补这一章：大纲原文从批次里取（不重新生成），
+     * 成功后把 FAILED 翻成 DONE，失败则保持 FAILED 让用户能再试。
+     *
+     * @return 成功时返回空；章节不存在或状态不是 FAILED 时返回失败
+     */
+    suspend fun retryChapterContract(projectId: String, planId: String): Result<Unit> {
+        val project = projectRepository.get(projectId)
+            ?: return Result.failure(IllegalStateException("项目不存在"))
+        val plan = chapterRepository.getPlan(planId)
+            ?: return Result.failure(IllegalStateException("章节不存在"))
+        if (plan.contractStatus == ContractStatus.DONE.name) {
+            return Result.failure(IllegalStateException("第 ${plan.order} 章的契约已经生成好了，不用重试"))
+        }
+
+        val batch = knowledgeRepository.getLatestRouteBatch(projectId)
+            ?: return Result.failure(IllegalStateException("找不到讲述路线批次，请重新规划这一卷"))
+        val outline = decodeVolumeOutline(batch.outlineJson)
+            ?: return Result.failure(IllegalStateException("讲述路线大纲数据损坏，请重新规划这一卷"))
+        val nodes = ensureNodeKeys(knowledgeRepository.getByProject(projectId))
+
+        // 章序按 order 反查大纲下标：plans 已按 order 排序，而 outline.chapters 同序
+        val plans = chapterRepository.getPlans(projectId)
+            .filter { it.volumeIndex == plan.volumeIndex }
+            .sortedBy { it.order }
+        val index = plans.indexOfFirst { it.id == planId }
+        if (index < 0) return Result.failure(IllegalStateException("这一章不在当前卷里"))
+
+        // 单章重试也要传整卷的 plans：契约要靠「本章在卷内的位置」推算哪些知识点
+        // 是更早章节已经引入过的。只传一章，下标会变成 0，
+        // 「APPLY 必须应用已学节点」这类规则就全算错了。
+        generateContracts(
+            projectId = projectId,
+            project = project,
+            nodes = nodes,
+            outline = outline,
+            plans = plans,
+            batch = batch,
+            onProgress = {},
+            targetPlanId = planId,
+        )
+
+        return if (chapterRepository.getPlan(planId)?.contractStatus == ContractStatus.DONE.name) {
+            Result.success(Unit)
+        } else {
+            Result.failure(
+                IllegalStateException(
+                    "第 ${plan.order} 章的契约这次也没通过，可以再试一次；" +
+                        "一直不通过的话重新规划这一卷会换一批章节安排。",
+                ),
+            )
+        }
+    }
+
+    /** 单章契约的一次模型调用 */
+    private suspend fun callContract(
+        project: Project,
+        chapter: ChapterPlanDto,
+        chapterKeys: List<String>,
+        allowed: List<String>,
+        alreadyIntroduced: Set<String>,
+        keyToNode: Map<String, KnowledgeNode>,
+        keyByTitle: Map<String, String>,
+    ): Result<ChapterContractOutput> {
+        val chapterNodes = chapterKeys.mapNotNull { keyToNode[it] }
+        val outlineText = buildString {
+            appendLine("第 ${chapter.order} 章《${chapter.title}》")
+            appendLine("章节类型：${chapter.chapterType}")
+            if (chapter.derivationChain.isNotBlank()) {
+                appendLine("推演骨架：${chapter.derivationChain}")
+            }
+            if (chapter.plotGoal.isNotBlank()) appendLine("本章要走完：${chapter.plotGoal}")
+            if (chapter.learningGoals.isNotEmpty()) {
+                appendLine("读完应想通：${chapter.learningGoals.joinToString("；")}")
+            }
+            if (chapter.openingHook.isNotBlank()) appendLine("开场处境：${chapter.openingHook}")
+            if (chapter.closingHook.isNotBlank()) appendLine("结尾留口：${chapter.closingHook}")
+            append("本章涉及的知识点：${chapterKeys.joinToString("、")}")
+        }
+        val prompt = prompts.load(PROMPT_CHAPTER_CONTRACT)
+            .replace("{chapterOutline}", outlineText)
+            .replace("{chapterType}", chapter.chapterType)
+            .replace(
+                "{allowedNodeKeys}",
+                allowed.takeIf { it.isNotEmpty() }?.joinToString("、") ?: "（无：本章不引入新知识点）",
+            )
+            .replace(
+                "{alreadyIntroduced}",
+                alreadyIntroduced.takeIf { it.isNotEmpty() }?.joinToString("、") ?: "（无）",
+            )
+            .replace(
+                "{nodeDetails}",
+                NodeContext.formatL2(chapterNodes, { nodeKeyLabel(it) }, keyByTitle)
+                    .ifBlank { "（本章没有关联知识点）" },
+            )
+        return router.generate(
+            role = ModelRole.STORY,
+            request = ModelRequest(
+                role = ModelRole.STORY,
+                system = SYSTEM_CHAPTER_CONTRACT,
+                user = prompt,
+                // 一份契约九个字段，输出很短；给 8K 只为不被截断
+                maxTokens = TokenBudget.outputLimit(
+                    system = SYSTEM_CHAPTER_CONTRACT,
+                    user = prompt,
+                    stageCap = TokenBudget.Stage.CHAPTER_CONTRACT,
+                ),
+                jsonMode = true,
+                stageLabel = "CHAPTER_CONTRACT",
             ),
+            decoder = jsonDecoder(ChapterContractOutput.serializer()),
         )
-        return Result.success(Unit)
+    }
+
+    /** 契约里的编号换回节点标题（落库前唯一一次反解） */
+    private fun resolveContractKeys(
+        contract: ChapterContractDto,
+        keyToNode: Map<String, KnowledgeNode>,
+    ): ChapterContractDto = contract.copy(
+        introducedNodeTitles = contract.introducedNodeTitles.mapNotNull { keyToNode[it.trim()]?.title }.distinct(),
+        appliedNodeTitles = contract.appliedNodeTitles.mapNotNull { keyToNode[it.trim()]?.title }.distinct(),
+    )
+
+    /** 契约输出 DTO → 落库 DTO（节点字段此时还是编号） */
+    private fun ChapterContractOutput.toContractDto(): ChapterContractDto = ChapterContractDto(
+        entryQuestion = entryQuestion,
+        priorIntuition = priorIntuition,
+        obstacle = obstacle,
+        knowledgeGap = knowledgeGap,
+        introducedNodeTitles = introducedNodeKeys.map { it.trim() }.filter { it.isNotEmpty() },
+        appliedNodeTitles = appliedNodeKeys.map { it.trim() }.filter { it.isNotEmpty() },
+        requiredBeats = requiredBeats,
+        resultingChange = resultingChange,
+        bridgeToNext = bridgeToNext,
+    )
+
+    /**
+     * 老项目补号（R2）。
+     *
+     * `nodeKey` 是批次内序号，迁移前的老节点为空。编号只在模型交互层使用，
+     * 所以补号不碰备份格式、不碰节点 ID——只是给它们一个本次可用的短记号。
+     * 已占用的序号跳过，避免同一批次内撞号。
+     */
+    private suspend fun ensureNodeKeys(nodes: List<KnowledgeNode>): List<KnowledgeNode> {
+        val missing = nodes.filter { it.nodeKey.isBlank() }
+        if (missing.isEmpty()) return nodes
+        val used = nodes.map { it.nodeKey }.filter { it.isNotBlank() }.toSet()
+        var next = used.size + 1
+        val patched = mutableListOf<KnowledgeNode>()
+        for (node in missing) {
+            var key = "nk-$next"
+            while (key in used) {
+                next += 1
+                key = "nk-$next"
+            }
+            val updated = node.copy(nodeKey = key)
+            knowledgeRepository.upsert(updated)
+            patched += updated
+            next += 1
+        }
+        val patchedById = patched.associateBy { it.id }
+        return nodes.map { patchedById[it.id] ?: it }
+    }
+
+    /** 节点在 prompt 里的编号写法。`#nk-3` 而不是裸 `nk-3`：模型更容易当成编号抄回来 */
+    private fun nodeKeyLabel(node: KnowledgeNode): String = "#${node.nodeKey}"
+
+    /** 大纲调用里「本卷分组」区块：告诉模型哪些编号属于哪条演进链 */
+    private fun formatVolumeGroups(
+        volume: VolumePlanner.DraftVolume,
+        chains: List<ChainDto>,
+        keyByTitle: Map<String, String>,
+    ): String {
+        if (volume.chains.isEmpty()) {
+            return "（本卷 ${volume.nodes.size} 个知识点，没有链结构，请按编号顺序与前置关系自行组织）"
+        }
+        return volume.chains.mapIndexed { index, chain ->
+            val keys = chain.nodeTitles.mapNotNull { keyByTitle[it.trim()] }
+            val theme = chain.theme.ifBlank { "第 ${index + 1} 组" }
+            "- $theme（${keys.joinToString("、")}）" +
+                chain.opening.takeIf { it.isNotBlank() }?.let { "：${it.take(60)}" }.orEmpty()
+        }.joinToString("\n")
+    }
+
+    private fun decodeVolumeOutline(jsonStr: String): VolumeOutlineOutput? = runCatching {
+        json.decodeFromString(VolumeOutlineOutput.serializer(), jsonStr)
+    }.getOrNull()
+
+    /** `["nk-3:0", "nk-5:2"]` → `Map<编号, 章内序号>` */
+    private fun decodeIntroducedOrder(jsonStr: String): Map<String, Int> =
+        decodeStringList(jsonStr).mapNotNull { entry ->
+            val parts = entry.split(":")
+            if (parts.size != 2) return@mapNotNull null
+            val order = parts[1].toIntOrNull() ?: return@mapNotNull null
+            parts[0].trim() to order
+        }.toMap()
+
+    /**
+     * 路线规划要用的演进链（[ChainDto] 形态）。
+     *
+     * 首选批次里落库的结构（标题精确、可直接匹配节点）；批次行不在了退回解析
+     * `throughLine`（骨架阶段写进去的格式是「主题：A → B → C」，按 " → " 拆回标题序列）。
+     */
+    private suspend fun storyChains(projectId: String, throughLine: List<String>): List<ChainDto> {
+        val fromBatch = knowledgeRepository.getLatestBatch(projectId)
+            ?.let { decodeChains(it.chainsJson) }
+            .orEmpty()
+        if (fromBatch.isNotEmpty()) return fromBatch
+        return throughLine.mapNotNull { line ->
+            val theme = line.substringBefore("：", "").trim()
+            val titles = line.substringAfter("：", line)
+                .split(" → ")
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+            if (titles.size < 2) null else ChainDto(theme = theme, nodeTitles = titles)
+        }
     }
 
     /**
      * 一卷内的章数。一章承载一整条演进链，所以章数远少于知识点数（问题7）；
      * 上限是「一次规划的量」而不是「全书上限」——后续内容由续卷接（3C）。
+     *
+     * 节点数封顶交给 [VolumePlanner.chaptersFor]：这里保留 4~8 的软区间语义
+     * （续卷提示词与章数提示仍在用），但**实际落库的卷**一律按节点数收过。
      */
     internal fun suggestChapterCount(nodeCount: Int): Int =
         (nodeCount / NODES_PER_CHAPTER).coerceIn(VOLUME_MIN_CHAPTERS, VOLUME_MAX_CHAPTERS)
@@ -666,8 +1606,9 @@ class PipelineService(
 
         val suggested = suggestChapterCount(pendingNodes.size.coerceAtLeast(1))
         val prompt = prompts.load(PROMPT_NEXT_VOLUME)
+            .replace("{learnerProfile}", LearnerProfile.section(project))
             .replace("{topic}", project.topic)
-            .replace("{goal}", project.title)
+            .replace("{goal}", LearnerProfile.goal(project))
             .replace("{baseline}", project.baseline)
             .replace("{currentVolume}", "${currentVolume + 1}")
             .replace("{chapterHint}", "$suggested 章（不要超过 $VOLUME_MAX_CHAPTERS 章）")
@@ -684,6 +1625,11 @@ class PipelineService(
                 role = ModelRole.STORY,
                 system = SYSTEM_NEXT_VOLUME,
                 user = prompt,
+                maxTokens = TokenBudget.outputLimit(
+                    system = SYSTEM_NEXT_VOLUME,
+                    user = prompt,
+                    stageCap = TokenBudget.Stage.NEXT_VOLUME,
+                ),
                 jsonMode = true,
             ),
             decoder = jsonDecoder(NextVolumeOutput.serializer()),
@@ -795,6 +1741,19 @@ class PipelineService(
     ): Result<Unit> {
         val plan = chapterRepository.getPlan(planId)
             ?: return Result.failure(IllegalStateException("章节不存在"))
+        // 契约没生成的章不能写正文（三段式）。正文按契约的拍子写、核验也按它逐项查，
+        // 契约缺失会产出没有因果结构且无法核验的正文。
+        //
+        // 这里必须拦：selectChaptersToGenerate 只挡住批量生成，用户从章节列表
+        // 点「重新生成」走的是这个单章入口，不拦就等于留个绕过口子。
+        if (plan.contractStatus == ContractStatus.FAILED.name) {
+            return Result.failure(
+                IllegalStateException(
+                    "第 ${plan.order} 章的因果契约没生成成功，不能写正文。" +
+                        "请在讲述路线里单独重试这一章的契约。",
+                ),
+            )
+        }
         // 取消与失败收尾要知道「进来之前这一章有没有可读正文、这次写的是哪个版本」（第三阶段 3A）
         val attempt = ChapterAttempt(
             originalStatus = plan.status,
@@ -914,6 +1873,11 @@ class PipelineService(
                 role = ModelRole.STORY,
                 system = SYSTEM_CHAPTER,
                 user = prompt,
+                maxTokens = TokenBudget.outputLimit(
+                    system = SYSTEM_CHAPTER,
+                    user = prompt,
+                    stageCap = TokenBudget.Stage.CHAPTER,
+                ),
                 jsonMode = true,
                 temperature = 0.85f,
             ),
@@ -1373,6 +2337,11 @@ class PipelineService(
                 role = ModelRole.STORY,
                 system = SYSTEM_REWRITE,
                 user = prompt,
+                maxTokens = TokenBudget.outputLimit(
+                    system = SYSTEM_REWRITE,
+                    user = prompt,
+                    stageCap = TokenBudget.Stage.REWRITE,
+                ),
                 jsonMode = true,
                 // 比整章生成低：这是修一个具体问题，不是重新创作
                 temperature = 0.5f,
@@ -1570,7 +2539,15 @@ class PipelineService(
                 .replace("{nodes}", formatNodesWithDerivation(nodes))
                 .replace("{blocks}", body)
         } else {
-            val chunks = loadChunksForNodes(projectId, nodes)
+            // 精确加载：核验关心的是「正文引用的那几条片段原文说了什么」。
+            // 原来按节点 sourceRefs 加载且在无引用时退化成「项目前 50 条」——
+            // 发一批不相干片段既烧 token 又核不出真问题
+            val chunkIds = (blocks.flatMap { it.sourceRefs } + nodes.flatMap { it.sourceRefs }).toSet()
+            val chunks = if (chunkIds.isEmpty()) {
+                emptyList()
+            } else {
+                sourceRepository.getChunksByIds(projectId, chunkIds)
+            }
             // 核验也要看到片段的页码、章节、版本、法域（4A）：
             // 「这条规则只在某个法域成立」这类问题，没有元数据是核不出来的
             loadSourceMeta(projectId)
@@ -1578,7 +2555,7 @@ class PipelineService(
                 .replace("{derivationChain}", derivation)
                 .replace("{learningGoals}", plan.learningGoals.joinToString("；"))
                 .replace("{chapterPlan}", planSummary)
-                .replace("{chunks}", formatChunks(chunks))
+                .replace("{chunks}", verifyChunkSection(chunks))
                 .replace("{blocks}", body)
         }
 
@@ -1588,6 +2565,11 @@ class PipelineService(
                 role = ModelRole.VERIFY,
                 system = SYSTEM_VERIFY,
                 user = prompt,
+                maxTokens = TokenBudget.outputLimit(
+                    system = SYSTEM_VERIFY,
+                    user = prompt,
+                    stageCap = TokenBudget.Stage.VERIFY,
+                ),
                 jsonMode = true,
                 temperature = 0f,
             ),
@@ -1629,6 +2611,11 @@ class PipelineService(
                 role = ModelRole.VERIFY,
                 system = "你是测验出题人。",
                 user = prompt,
+                maxTokens = TokenBudget.outputLimit(
+                    system = "你是测验出题人。",
+                    user = prompt,
+                    stageCap = TokenBudget.Stage.QUIZ,
+                ),
                 jsonMode = true,
                 temperature = 0.2f,
             ),
@@ -1762,7 +2749,10 @@ class PipelineService(
                 id = idFactory(),
                 projectId = projectId,
                 title = title,
-                nodeKey = "nk-${idFactory()}",
+                // 短序号标识（批次内唯一）。原来是 nk-<UUID> 40 位随机串，要求模型
+                // 逐字符原样回传——抄错一位节点就被静默丢弃；序号短到抄不错，
+                // 就算真没带，回填还有标题兜底匹配
+                nodeKey = "nk-${index + 1}",
                 generateStatus = NodeGenerateStatus.PLACEHOLDER.name,
                 depth = 1,
                 order = index,
@@ -1772,46 +2762,246 @@ class PipelineService(
     }
 
     /**
+     * 生成知识主干骨架，带一次「精简降级」重试（用户反馈：「第一步 map skeleton 总是生成失败」）。
+     *
+     * 骨架是整条流程的第一步，它一失败就整批中止——没有逐链展开那种「保留已完成、
+     * 只补失败链」的退路。而它最常见的三种失败（输出被截断、截断后 JSON 救不回、
+     * 模型把内容切成一堆单节点「链」）本质都是「一次要得太多」，减少要的量再问一次
+     * 往往就成。所以这里对这三类失败降级重试一次：更小的输出上限 + 一段要求精简、
+     * 强调「每条链至少 2 个节点」的追加指令。
+     *
+     * 配置类错误（没配模型、Key 无效、模型名写错、鉴权失败）降级也没用，直接如实报错，
+     * 不白烧第二次调用。
+     *
+     * 返回的骨架里，被丢弃的单节点链会作为一条软提示写进 gaps（A2.4），
+     * 而不是让整批失败——「骨架漏了几条链」远好过「骨架生成失败、什么都没有了」。
+     */
+    private suspend fun generateSkeleton(project: Project): Result<KnowledgeMapSkeletonOutput> {
+        val basePrompt = prompts.load(PROMPT_KNOWLEDGE_MAP_SKELETON)
+            .replace("{learnerProfile}", LearnerProfile.section(project))
+            .replace("{topic}", project.topic)
+            .replace("{depth}", project.depth)
+            .replace("{goal}", LearnerProfile.goal(project))
+            .replace("{baseline}", project.baseline)
+
+        val firstRaw = requestSkeletonOnce(basePrompt, TokenBudget.Stage.SKELETON, "MAP_SKELETON")
+        val firstValidated = firstRaw.mapCatching { OutputValidators.validateSkeleton(it).getOrThrow() }
+        if (firstValidated.isSuccess) {
+            return Result.success(
+                appendSkeletonNote(firstValidated.getOrThrow(), skeletonDroppedChainNote(firstRaw.getOrNull())),
+            )
+        }
+        // 只有「输出太长 / 格式不完整 / 链太碎」这类失败值得降级重试；其余如实报错
+        if (!isSkeletonShrinkWorthRetry(firstValidated.exceptionOrNull())) return firstValidated
+
+        val fallbackRaw = requestSkeletonOnce(
+            skeletonFallbackPrompt(basePrompt),
+            TokenBudget.Stage.SKELETON_FALLBACK,
+            "MAP_SKELETON#fallback",
+        )
+        val fallbackValidated = fallbackRaw.mapCatching { OutputValidators.validateSkeleton(it).getOrThrow() }
+        return if (fallbackValidated.isSuccess) {
+            Result.success(
+                appendSkeletonNote(fallbackValidated.getOrThrow(), skeletonDroppedChainNote(fallbackRaw.getOrNull())),
+            )
+        } else {
+            // 降级仍失败：报第一次的错误更有信息量（两次多半同一个根因，第一次的文案更贴近用户操作）
+            firstValidated
+        }
+    }
+
+    /** 骨架的一次模型调用：只负责请求 + 解码，校验与降级决策在 [generateSkeleton] */
+    private suspend fun requestSkeletonOnce(
+        prompt: String,
+        stageCap: Int,
+        stageLabel: String,
+    ): Result<KnowledgeMapSkeletonOutput> = router.generate(
+        role = ModelRole.FAST,
+        request = ModelRequest(
+            role = ModelRole.FAST,
+            system = SYSTEM_MAP_SKELETON,
+            user = prompt,
+            maxTokens = TokenBudget.outputLimit(
+                system = SYSTEM_MAP_SKELETON,
+                user = prompt,
+                stageCap = stageCap,
+            ),
+            jsonMode = true,
+            stageLabel = stageLabel,
+        ),
+        decoder = jsonDecoder(KnowledgeMapSkeletonOutput.serializer()),
+    )
+
+    /** 哪些骨架失败值得「少要点、再问一次」——见 [generateSkeleton] 的说明 */
+    private fun isSkeletonShrinkWorthRetry(error: Throwable?): Boolean = when (error) {
+        is ModelError.Truncated, is ModelError.Decode, is ModelError.Invalid -> true
+        else -> false
+    }
+
+    /** 降级重试的追加指令：覆盖原 prompt 的「宁多勿漏」，改为「宁少勿断」 */
+    private fun skeletonFallbackPrompt(base: String): String = base + "\n\n" +
+        "## 重要：上一次输出过长或格式不完整，这次务必精简并保证 JSON 完整闭合\n" +
+        "1. 每条演进链**至少 2 个节点**（只有 1 个节点的不算链，会被程序丢弃）。\n" +
+        "2. 节点总量宁少勿多：入门 10-14 个、考试 16-22 个、专业 20-28 个即可，只列最核心的主干，不要追求穷尽。\n" +
+        "3. 标题尽量短（每个不超过 12 字），theme 与 opening 各一句话。\n" +
+        "4. 宁可少列几个节点，也绝不要输出到一半断掉。"
+
+    /** 被 validateSkeleton 丢弃的单节点链，转成一条给用户的软提示（A2.4） */
+    private fun skeletonDroppedChainNote(raw: KnowledgeMapSkeletonOutput?): String? {
+        if (raw == null) return null
+        val dropped = raw.chains
+            .map { chain -> chain.copy(nodeTitles = chain.nodeTitles.map { it.trim() }.filter { it.isNotBlank() }) }
+            .filter { it.nodeTitles.size < 2 }
+        if (dropped.isEmpty()) return null
+        val titles = dropped.flatMap { it.nodeTitles }.distinct().take(5)
+        return "骨架里有 ${dropped.size} 条链只有 1 个节点，不构成演进链，已忽略" +
+            (if (titles.isNotEmpty()) "（涉及：${titles.joinToString("、")}）" else "") +
+            "。若这些是重要知识点，重新梳理时会被并入合适的链。"
+    }
+
+    private fun appendSkeletonNote(
+        skeleton: KnowledgeMapSkeletonOutput,
+        note: String?,
+    ): KnowledgeMapSkeletonOutput = if (note.isNullOrBlank()) {
+        skeleton
+    } else {
+        skeleton.copy(gaps = skeleton.gaps + note)
+    }
+
+    /**
+     * 一条链失败时给用户看的原因（批次化生成）。
+     *
+     * 分两种：模型调用本身报错（网络/限流/解码），照抄它的消息；调用成功但节点
+     * 没填满——这几乎总是输出被 max_tokens 截断，而截断的下一步动作（调大最大
+     * Token）和网络抖动完全不同，必须说清楚，不能只报一句「失败」。
+     */
+    private fun chainFailureNote(
+        index: Int,
+        chain: ChainDto,
+        leftover: Int,
+        error: Throwable?,
+    ): String {
+        val head = "· 第 ${index + 1} 条链（${chain.theme.ifBlank { "未命名" }}）"
+        val reason = error?.message?.trim()?.takeIf { it.isNotBlank() }
+        return if (reason != null) {
+            "$head：$reason"
+        } else {
+            "$head：连续 ${chainMaxPasses(chain.nodeTitles.size)} 轮仍有 $leftover 个知识点没写出来，" +
+                "多半是模型这几轮都没按清单回传标识。可以再点一次继续补，" +
+                "或把「快速模型」换成指令跟随更稳的普通对话模型。"
+        }
+    }
+
+    /**
      * 逐链资料检索（批次化生成）。
      *
-     * 用链主题 + 节点标题作为关键词匹配片段文本；命中数多者优先，
-     * 最多 [CHAIN_CHUNK_LIMIT] 条。没有匹配时降级为项目前若干片段
-     * （引用仍然只能落在本次提供的片段上——模型拿不到列表之外的 ID）。
+     * 链主题 + 节点标题先按整词匹配，再按中文二元组子词匹配（完整词权重 5、
+     * 子词权重 1），命中总分排序取前若干条。
+     *
+     * 原来只用整词 contains：中文标题（如「要约的构成要件」）几乎不会逐字
+     * 出现在资料原文里，命中率趋近于零，每条链都退化成同一批「前 20 条」——
+     * 与链无关的片段既烧 token 又干扰输出质量。
+     *
+     * [focusTitles] 非空时**只按这几个节点检索**（续轮/重试用）。用户的意思是对的：
+     * 重试时该发的是「还差的那几个节点需要的证据」，不是整条链的全部资料。
+     *
+     * [pass] 控制本轮片段上限：首轮 CHAIN_CHUNK_LIMIT 条，之后逐轮递减
+     * （20/2=10、20/3≈6…，下限 [MIN_CHAIN_CHUNKS]）。一条长链要分好几轮问完，
+     * 第二轮起模型已经在写后半段的节点，需要的证据面更窄——固定 20 条意味着
+     * 同一批片段被反复计费 5 遍，最坏一条链白烧 5 万字符。
+     *
+     * [excludeIds] 是本链已完成节点已经引用过的片段：引用过的证据不必再随
+     * 下一轮重发，模型在 [filledNodes] 区块里已经见过它们的内容。
+     *
+     * 一条都命中不到时返回空列表，由调用方明确告诉模型「没有相关证据」——
+     * 原来这里静默退化成「项目前 20 个片段」，模型于是拿着一批不相干的片段
+     * 硬凑引用，比没有资料更糟。
      */
     private fun selectChunksForChain(
         allChunks: List<SourceChunk>,
         chain: ChainDto,
+        focusTitles: List<String> = emptyList(),
+        pass: Int = 1,
+        excludeIds: Set<String> = emptySet(),
     ): List<SourceChunk> {
         val keywords = buildList {
-            addAll(chain.nodeTitles.map { it.trim() }.filter { it.length >= 2 })
+            if (focusTitles.isNotEmpty()) {
+                addAll(focusTitles.map { it.trim() }.filter { it.length >= 2 })
+            } else {
+                addAll(chain.nodeTitles.map { it.trim() }.filter { it.length >= 2 })
+            }
             chain.theme.trim().takeIf { it.length >= 2 }?.let { add(it) }
             chain.opening.trim().takeIf { it.length >= 2 }?.let { add(it) }
         }.distinct()
-        if (keywords.isEmpty()) return allChunks.take(CHAIN_CHUNK_LIMIT)
-        val scored = allChunks.map { chunk ->
-            chunk to keywords.count { kw -> chunk.text.contains(kw) }
+        if (keywords.isEmpty()) return emptyList()
+        val cap = (CHAIN_CHUNK_LIMIT / pass.coerceAtLeast(1)).coerceAtLeast(MIN_CHAIN_CHUNKS)
+        val subwords = keywords
+            .flatMap { kw -> if (kw.length <= 2) listOf(kw) else kw.windowed(2) }
+            .distinct()
+        return allChunks.map { chunk ->
+            var score = 0
+            for (kw in keywords) if (chunk.text.contains(kw)) score += 5
+            for (sw in subwords) if (chunk.text.contains(sw)) score += 1
+            chunk to score
         }
-            .filter { it.second > 0 }
+            .filter { it.second > 0 && it.first.id !in excludeIds }
             .sortedByDescending { it.second }
             .map { it.first }
-            .take(CHAIN_CHUNK_LIMIT)
-        return if (scored.isEmpty()) allChunks.take(CHAIN_CHUNK_LIMIT) else scored
+            .take(cap)
+    }
+
+    /**
+     * 单链 prompt 的资料区块。
+     *
+     * 命中不到片段时必须**明说**「这一批节点没有找到相关资料」。原来检索不到会静默
+     * 退化成「项目前 20 个片段」，模型于是拿着一批不相干的片段硬凑 sourceRefs——
+     * 那些引用点开来和内容对不上，比没有引用更伤可信度。
+     */
+    private fun chainChunkSection(modelKnowledge: Boolean, chunks: List<SourceChunk>): String = when {
+        modelKnowledge -> "本项目没有用户资料（AI 自备知识模式）：所有节点的 sourceRefs 一律留空数组，不要编造片段 ID。"
+        chunks.isEmpty() ->
+            "没有检索到与本批节点相关的资料片段。请把 sourceRefs 全部留空数组，" +
+                "**不要**编造片段 ID，也不要引用没在这里出现过的 ID。"
+        else -> formatChunks(chunks)
+    }
+
+    /**
+     * 审计用的资料摘要：只给清单，不给原文。
+     *
+     * 审计产出的是缺口/冲突「清单」，判断依据主要是节点内容本身；资料侧只需要
+     * 知道有哪些资料、各覆盖多少片段。带原文的一次审计 2-3 万 token，
+     * 失败重试按次计费，性价比远不如这份几百 token 的清单。
+     */
+    private fun formatSourceDigest(chunks: List<SourceChunk>): String {
+        if (chunks.isEmpty()) return "（AI 自备知识模式，没有用户资料）"
+        val bySource = chunks.groupBy { it.sourceId }
+        val lines = bySource.entries.mapIndexed { index, (sourceId, list) ->
+            val title = sourceMetaCache[sourceId]?.title?.takeIf { it.isNotBlank() }
+                ?: "资料 ${index + 1}"
+            "- $title（${list.size} 个片段）"
+        }
+        return "共 ${bySource.size} 份资料、${chunks.size} 个片段：\n" + lines.joinToString("\n")
+    }
+
+    /**
+     * 核验 prompt 的资料区块。
+     *
+     * 三态必须分开说：无资料模式（没有可核对的对象）、有资料但这一章没有
+     * 可追溯的引用（核验重点变成「有没有编造出处」）、有真实片段（逐条核对）。
+     * 原来「有资料但空命中」会掉进 [formatChunks] 的空列表分支，被说成
+     * 「AI 自备知识模式」——对模型的误导直接体现在核验结论上。
+     */
+    private fun verifyChunkSection(chunks: List<SourceChunk>): String = when {
+        chunks.isEmpty() ->
+            "本项目有资料，但本章正文没有可追溯的片段引用。请重点核对：各段落是否存在编造出处、" +
+                "把常识说成条文、引用对不上内容的问题；unverifiedClaims 相应从宽给出。"
+        else -> formatChunks(chunks, maxChunks = VERIFY_CHUNK_LIMIT)
     }
 
     private fun decodeChains(jsonStr: String): List<ChainDto> = runCatching {
         if (jsonStr.isBlank() || jsonStr == "[]") emptyList()
         else json.decodeFromString(ListSerializer(ChainDto.serializer()), jsonStr)
     }.getOrDefault(emptyList())
-
-    private fun decodeChainStatuses(jsonStr: String): List<KnowledgeMapChainStatus> = runCatching {
-        if (jsonStr.isBlank() || jsonStr == "[]") emptyList()
-        else json.decodeFromString(ListSerializer(String.serializer()), jsonStr).mapNotNull { name ->
-            KnowledgeMapChainStatus.entries.firstOrNull { it.name == name }
-        }
-    }.getOrDefault(emptyList())
-
-    private fun encodeStatuses(statuses: List<KnowledgeMapChainStatus>): String =
-        json.encodeToString(ListSerializer(String.serializer()), statuses.map { it.name })
 
     private fun decodeStringList(jsonStr: String): List<String> = runCatching {
         if (jsonStr.isBlank() || jsonStr == "[]") emptyList()
@@ -1823,57 +3013,26 @@ class PipelineService(
         else json.decodeFromString(ListSerializer(ConflictDto.serializer()), jsonStr)
     }.getOrDefault(emptyList())
 
-    private fun buildKnowledgeNodes(
-        projectId: String,
-        output: KnowledgeMapOutput,
-        validChunkIds: Set<String>,
-    ): List<KnowledgeNode> {
-        val created = mutableListOf<KnowledgeNode>()
-        val titleToId = mutableMapOf<String, String>()
-        for (dto in output.nodes) {
-            val parentId = dto.parentTitle?.trim()?.let { titleToId[it] }
-            val node = KnowledgeNode(
-                id = idFactory(),
-                projectId = projectId,
-                parentId = parentId,
-                title = dto.title.trim(),
-                definition = dto.definition,
-                arisesFrom = dto.arisesFrom,
-                leadsTo = dto.leadsTo,
-                prerequisites = dto.prerequisites,
-                related = dto.related,
-                confusions = dto.confusions,
-                examples = dto.examples,
-                // sourceRefs 保存的是片段 ID，与后续加载口径一致（B1）
-                sourceRefs = dto.sourceRefs.filter { it in validChunkIds }.distinct(),
-                depth = dto.depth.coerceIn(1, 3),
-                order = created.size,
-            )
-            titleToId[node.title] = node.id
-            created += node
-        }
-        return created
-    }
-
     /**
-     * 依据节点 sourceRefs 中保存的片段 ID 精确加载资料片段；
-     * 没有可用引用时退回项目的前若干片段（B1）。
+     * 依据节点 sourceRefs 中保存的片段 ID 精确加载资料片段（B1）。
+     *
+     * 原来「没有可用引用时退回项目的前若干片段」：节点没有 sourceRefs 时
+     * 发过去的是一批与内容无关的片段，模型要么硬凑引用、要么被干扰——
+     * 都比「明说没有相关证据」更糟。退回分支已删：空列表由调用方
+     * 明确告知模型「没有检索到相关资料，sourceRefs 留空，不要编造」。
      */
     private suspend fun loadChunksForNodes(
         projectId: String,
         nodes: List<KnowledgeNode>,
     ): List<SourceChunk> {
         val chunkIds = nodes.flatMap { it.sourceRefs }.toSet()
-        if (chunkIds.isNotEmpty()) {
-            val resolved = sourceRepository.getChunksByIds(projectId, chunkIds)
-            if (resolved.isNotEmpty()) return resolved
-        }
-        return sourceRepository.getChunksByProject(projectId).take(FALLBACK_CHUNK_LIMIT)
+        if (chunkIds.isEmpty()) return emptyList()
+        return sourceRepository.getChunksByIds(projectId, chunkIds)
     }
 
-    private fun formatChunks(chunks: List<SourceChunk>): String {
+    private fun formatChunks(chunks: List<SourceChunk>, maxChunks: Int = MAX_CHUNKS): String {
         if (chunks.isEmpty()) return "（本项目采用 AI 自备知识模式，没有用户资料）"
-        return chunks.take(MAX_CHUNKS).joinToString("\n\n") { chunk ->
+        return chunks.take(maxChunks).joinToString("\n\n") { chunk ->
             "[片段ID: ${chunk.id}]${sourceIdentity(chunk)}\n${chunk.text.take(CHUNK_EXCERPT)}"
         }
     }
@@ -1936,30 +3095,62 @@ class PipelineService(
         chains.take(CONTEXT_CHAIN_LIMIT).mapIndexed { i, s -> "${i + 1}. $s" }
             .joinToString("\n").ifBlank { "（未识别到明确的演进链，请自行按节点的来处/去处组织）" }
 
-    /** 有资料时给出片段区块；无资料时明确告知，避免模型伪造引用（问题3） */
-    private fun sourceSection(modelKnowledge: Boolean, chunks: List<SourceChunk>): String =
-        if (modelKnowledge) {
+    /**
+     * 路线软审计要用的演进链（每条链一个标题序列）。
+     *
+     * 首选批次里落库的 [ChainDto]——那是骨架阶段的原始结构，标题精确、可直接匹配节点。
+     * 批次行不在了（老项目、或批次已被清理）时退回解析 `throughLine`：
+     * 骨架阶段往那里写的格式是「主题：A → B → C」，按 " → " 拆回标题序列。
+     *
+     * 拿不到链就返回空列表——链连续性这一项跳过，其余审计项照常，不伪造链结构。
+     */
+    private suspend fun auditChains(projectId: String, throughLine: List<String>): List<List<String>> {
+        val fromBatch = knowledgeRepository.getLatestBatch(projectId)
+            ?.let { decodeChains(it.chainsJson) }
+            ?.map { chain -> chain.nodeTitles.map { it.trim() }.filter { it.isNotEmpty() } }
+            ?.filter { it.size >= 2 }
+            .orEmpty()
+        if (fromBatch.isNotEmpty()) return fromBatch
+        return throughLine.mapNotNull { line ->
+            val titles = line.substringAfter("：", line)
+                .split(" → ")
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+            titles.takeIf { it.size >= 2 }
+        }
+    }
+
+    /** 有资料时给出片段区块；无资料/无命中时明确告知，避免模型伪造引用（问题3） */
+    private fun sourceSection(modelKnowledge: Boolean, chunks: List<SourceChunk>): String = when {
+        modelKnowledge -> {
             """
             资料：本项目没有用户资料，知识由你自己提供。
             因此：所有 block 的 sourceRefs 一律留空数组；不要编造条文编号、判例名称、统计数字、人名年份。
             规则内容本身可以讲清楚，但不要伪造出处。
             """.trimIndent()
-        } else {
-            // 「编一个 ID 会被记成未确认」这句话必须写明（4A）。
-            // 不写的话模型没有任何理由不去凑一个看起来像的 ID——它以前那么做的时候，
-            // 那条引用被静默丢掉，正文里那句话就成了没有出处的断言。
-            buildString {
-                appendLine("资料片段。引用时把**上面出现过的**片段ID原样填进对应 block 的 sourceRefs：")
-                appendLine()
-                appendLine(formatChunks(chunks))
-                appendLine()
-                appendLine("关于引用（4A，必须遵守）：")
-                appendLine("- 只能填上面列出的片段ID，原样复制，不要改写、拼接或缩短。")
-                appendLine("- 不要编造片段ID。编出来的 ID 会被记成「未确认引用」直接展示给读者，不会变成来源。")
-                appendLine("- 每个 FACT 段落至少引一个真实片段；讲解性段落引用它实际依据的片段。")
-                append("- 引用不到资料、只能靠常识说的内容，宁可不引，也不要引一个不相干的片段充数。")
-            }
         }
+        // 「编一个 ID 会被记成未确认」这句话必须写明（4A）。
+        // 不写的话模型没有任何理由不去凑一个看起来像的 ID——它以前那么做的时候，
+        // 那条引用被静默丢掉，正文里那句话就成了没有出处的断言。
+        else -> buildString {
+            appendLine("资料片段。引用时把**上面出现过的**片段ID原样填进对应 block 的 sourceRefs：")
+            appendLine()
+            appendLine(
+                if (chunks.isEmpty()) {
+                    "没有检索到与本批知识点相关的资料片段。请把 sourceRefs 全部留空数组，" +
+                        "**不要**编造片段 ID，也不要引用没在这里出现过的 ID。"
+                } else {
+                    formatChunks(chunks)
+                },
+            )
+            appendLine()
+            appendLine("关于引用（4A，必须遵守）：")
+            appendLine("- 只能填上面列出的片段ID，原样复制，不要改写、拼接或缩短。")
+            appendLine("- 不要编造片段ID。编出来的 ID 会被记成「未确认引用」直接展示给读者，不会变成来源。")
+            appendLine("- 每个 FACT 段落至少引一个真实片段；讲解性段落引用它实际依据的片段。")
+            append("- 引用不到资料、只能靠常识说的内容，宁可不引，也不要引一个不相干的片段充数。")
+        }
+    }
 
     private fun unverifiedSection(modelKnowledge: Boolean): String =
         if (modelKnowledge) {
@@ -1976,13 +3167,15 @@ class PipelineService(
             ChapterStatus.DRAFT,
         )
 
-        const val PROMPT_KNOWLEDGE_MAP = "knowledge_map"
-        const val PROMPT_KNOWLEDGE_MAP_MODEL = "knowledge_map_model"
-        // 批次化生成的三阶段 prompt（骨架 → 逐链 → 审计）
+        // 批次化生成的三阶段 prompt（骨架 → 逐链 → 审计）。
+        // 旧的一次性地图 prompt（knowledge_map / knowledge_map_model）已随批次化改造废弃。
         const val PROMPT_KNOWLEDGE_MAP_SKELETON = "knowledge_map_skeleton"
         const val PROMPT_KNOWLEDGE_MAP_CHAIN = "knowledge_map_chain"
         const val PROMPT_KNOWLEDGE_MAP_AUDIT = "knowledge_map_audit"
         const val PROMPT_STORY_BIBLE = "story_bible"
+        // 三段式讲述路线：大纲（每卷一次） / 契约（每章一次）
+        const val PROMPT_ROUTE_OUTLINE = "route_outline"
+        const val PROMPT_CHAPTER_CONTRACT = "chapter_contract"
         const val PROMPT_NEXT_VOLUME = "next_volume"
         const val PROMPT_CHAPTER = "chapter"
         const val PROMPT_VERIFY = "verify"
@@ -1990,13 +3183,16 @@ class PipelineService(
         const val PROMPT_QUIZ = "quiz"
         const val PROMPT_REWRITE_BLOCK = "rewrite_block"
 
-        const val SYSTEM_MAP = "你在整理一门学科的演进主干，不是在做目录。"
-        const val SYSTEM_MAP_MODEL =
-            "你在整理一门学科的演进主干，知识由你自己提供。宁可承认不确定，也不要编造具体出处。"
         const val SYSTEM_MAP_SKELETON = "你在规划一门学科知识主干的骨架：只列演进链与节点清单，不写节点内容。"
         const val SYSTEM_MAP_CHAIN = "你在展开知识主干里的一条演进链：把链上每个知识点写完整，不新增节点、不改标题、不动别的链已写好的内容。"
         const val SYSTEM_MAP_AUDIT = "你是知识地图的全局审计员：通读全部节点，给出最终的「知识缺口」与「资料冲突」清单。"
         const val SYSTEM_BIBLE = "你在设计一条讲述路线，让学科沿着它自己长出来。"
+        const val SYSTEM_ROUTE_OUTLINE =
+            "你在设计一卷讲述路线的大纲：定这一卷讲哪几章、每章讲哪些知识点、" +
+                "每章属于什么类型。只出大纲，不出因果契约。"
+        const val SYSTEM_CHAPTER_CONTRACT =
+            "你在给讲述路线里的某一章定因果契约。大纲已经定好讲什么，你只负责把" +
+                "这一章的因果结构写清楚，不要改动大纲里已经定下的东西。"
         const val SYSTEM_NEXT_VOLUME =
             "你在给一条已经开讲的讲述路线接下一卷。已经写出来的部分不能改，只能往后接。"
         const val SYSTEM_CHAPTER = "你在写一段推演：让读者跟着走，制度自己出现，而不是被告知名词。"
@@ -2006,24 +3202,24 @@ class PipelineService(
 
         const val MIN_QUIZ_QUESTIONS = 3
         const val MAX_QUIZ_QUESTIONS = 5
-        const val FALLBACK_CHUNK_LIMIT = 20
         const val FIRST_REVIEW_DELAY_MILLIS = 86_400_000L
-
-        // 一章承载一整条演进链，所以章数远少于知识点数（问题7）
-        const val NODES_PER_CHAPTER = 4
 
         /** 第一卷的索引。0 而不是 1，这样旧数据靠默认值就落在第一卷（3C） */
         const val FIRST_VOLUME = 0
 
         /**
-         * 一卷 4~8 章（3C）。
+         * 大纲 / 契约的函数内重试次数（三段式）。
          *
-         * 这不是全书上限：读完一卷可以继续规划下一卷，总章数没有硬顶。
-         * 之所以不把上限直接改成 100，是因为「一次规划多少」和「总共能讲多少」
-         * 是两件事——让模型一次想出 100 章，越往后越糊，而用户根本还没读到那儿。
+         * 在**函数内**重试而不是扩张 `isRetryableFailure` 语义：`ModelError.Invalid`
+         * 是 `retryable=false`，那是给「输出结构不对、重发也没用」的场景准备的；
+         * 而这里模型只是随机地漏填一个字段，重发一次大概率就好了。
+         * 改全局重试语义会把「真的坏了」的请求也拉进来无限重发。
          */
-        const val VOLUME_MIN_CHAPTERS = 4
-        const val VOLUME_MAX_CHAPTERS = 8
+        const val OUTLINE_MAX_ATTEMPTS = 3
+
+        /** 契约重试比大纲少一次：单章契约很短，一次不成再试一次即可，多了只是拖慢整卷 */
+        const val CONTRACT_MAX_ATTEMPTS = 2
+
         const val MIN_WORDS = 1200
         const val MAX_WORDS = 4000
 
@@ -2037,6 +3233,38 @@ class PipelineService(
 
         /** 逐链展开时每条链最多携带的资料片段数（批次化生成） */
         const val CHAIN_CHUNK_LIMIT = 20
+
+        /** 续轮递减后的片段数下限：再少就不够支撑后半段节点的证据了 */
+        const val MIN_CHAIN_CHUNKS = 6
+
+        /** 核验 prompt 最多携带的片段数：核验关心的是正文实际引用的那几条 */
+        const val VERIFY_CHUNK_LIMIT = 20
+
+        /**
+         * 一条链最多追问几轮（批次化生成）。
+         *
+         * 一轮只问 [CHAIN_NODES_PER_PASS] 个节点，所以轮数至少要够把整条链问完：
+         * 节点数 ÷ 每轮个数，再加 2 轮容错（某轮模型少给几个、或被截断只救回一半）。
+         * 上限 [CHAIN_MAX_PASSES_CAP] 兜住「模型怎么都填不出来」的情况，不无限烧钱。
+         */
+        fun chainMaxPasses(nodeCount: Int): Int =
+            ((nodeCount + CHAIN_NODES_PER_PASS - 1) / CHAIN_NODES_PER_PASS + 2)
+                .coerceIn(3, CHAIN_MAX_PASSES_CAP)
+
+        /** 追问轮数的硬上限 */
+        const val CHAIN_MAX_PASSES_CAP = 8
+
+        /**
+         * 一轮最多问几个节点（批次化生成）。
+         *
+         * 骨架对长链不设上限（20+ 节点常见），一次性要求全部写完，输出必然
+         * 超过任何合理的长度上限——而超长那一轮是整轮白费。6 个节点 ×
+         * 每节点各字段的字数上限 ≈ 2000 token 输出，稳稳落在安全区。
+         */
+        const val CHAIN_NODES_PER_PASS = 6
+
+        /** 失败原因最多列几条，避免整屏错误信息 */
+        const val CHAIN_FAILURE_DETAIL_LIMIT = 3
 
         /** 批次化生成的 JSON 编解码 */
         private val json = Json { ignoreUnknownKeys = true }

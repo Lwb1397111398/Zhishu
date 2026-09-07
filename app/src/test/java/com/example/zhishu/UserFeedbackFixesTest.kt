@@ -1,7 +1,7 @@
 package com.example.zhishu
 
 import com.example.zhishu.ai.pipeline.ChapterPhase
-import com.example.zhishu.domain.model.ModelConfig
+import com.example.zhishu.domain.model.ApiProfile
 import com.example.zhishu.ui.viewmodel.GenerationUiState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -21,18 +21,18 @@ class UserFeedbackFixesTest {
     /** 4096 会让两三千字的正文必然被截断，默认必须给足 */
     @Test
     fun maxTokens_defaultsToFiftyThousand() {
-        assertEquals(50_000, ModelConfig.DEFAULT_MAX_TOKENS)
-        assertEquals(50_000, ModelConfig(role = "STORY").maxTokens)
+        assertEquals(50_000, ApiProfile.DEFAULT_MAX_TOKENS)
+        assertEquals(50_000, ApiProfile().maxTokens)
     }
 
     /** 上限必须容纳默认值，否则保存时会被 coerce 砍掉（原来上限是 32768） */
     @Test
     fun maxTokens_rangeContainsDefault() {
-        assertTrue(ModelConfig.MAX_MAX_TOKENS >= ModelConfig.DEFAULT_MAX_TOKENS)
+        assertTrue(ApiProfile.MAX_MAX_TOKENS >= ApiProfile.DEFAULT_MAX_TOKENS)
         assertEquals(
-            ModelConfig.DEFAULT_MAX_TOKENS,
-            ModelConfig.DEFAULT_MAX_TOKENS
-                .coerceIn(ModelConfig.MIN_MAX_TOKENS, ModelConfig.MAX_MAX_TOKENS),
+            ApiProfile.DEFAULT_MAX_TOKENS,
+            ApiProfile.DEFAULT_MAX_TOKENS
+                .coerceIn(ApiProfile.MIN_MAX_TOKENS, ApiProfile.MAX_MAX_TOKENS),
         )
     }
 

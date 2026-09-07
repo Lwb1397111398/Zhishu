@@ -77,16 +77,21 @@ import androidx.compose.ui.unit.dp
 import com.example.zhishu.ai.pipeline.NextVolumeAvailability
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
+import com.example.zhishu.ai.pipeline.KnowledgeMapMode
 import com.example.zhishu.domain.model.ChapterStatus
+import com.example.zhishu.domain.model.ContractStatus
 import com.example.zhishu.domain.model.GENRE_AUTO
+import com.example.zhishu.domain.model.GapStatus
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
+import com.example.zhishu.domain.model.KnowledgeMapChainStatus
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.NodeGenerateStatus
 import com.example.zhishu.domain.model.ParseStatus
 import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.SourceMode
+import com.example.zhishu.domain.model.chainStatusList
 import com.example.zhishu.domain.model.StoryBible
 import com.example.zhishu.domain.model.VerificationIssue
 import com.example.zhishu.ui.common.ChapterStatusChip
@@ -287,6 +292,9 @@ private fun SourcesTab(
     var showUrl by remember { mutableStateOf(false) }
     // 正在编辑来源信息的那份资料（4A）
     var editingSource by remember { mutableStateOf<SourceDocument?>(null) }
+    /** 待确认的知识来源模式：已有内容时先问一句再切 */
+    var pendingSourceMode by remember { mutableStateOf<SourceMode?>(null) }
+    val scope = rememberCoroutineScope()
     val modelKnowledge = project?.usesModelKnowledge == true
     val unconfirmed by vm.unconfirmedCitationCount.collectAsState()
     val issues by vm.issues.collectAsState()
@@ -301,7 +309,15 @@ private fun SourcesTab(
         item {
             SourceModeCard(
                 modelKnowledge = modelKnowledge,
-                onSelect = { vm.setSourceMode(it) },
+                onSelect = { mode ->
+                    scope.launch {
+                        if (vm.needsSourceModeConfirm(mode)) {
+                            pendingSourceMode = mode
+                        } else {
+                            vm.setSourceMode(mode)
+                        }
+                    }
+                },
             )
         }
 
@@ -369,6 +385,19 @@ private fun SourcesTab(
             }
         }
         item { Spacer(Modifier.height(16.dp)) }
+    }
+
+    // 切换确认：已经有内容时才问一句，说明「不会改写已有内容」，
+    // 免得有人以为点一下就能重来一遍
+    pendingSourceMode?.let { pending ->
+        ConfirmDialog(
+            title = "切换知识来源",
+            message = "已经生成的内容不会被改写，也不删除；切换只影响以后怎么生成。" +
+                "想按新设置重做，切换后重新梳理知识主干即可。",
+            confirmLabel = "确认切换",
+            onConfirm = { vm.setSourceMode(pending); pendingSourceMode = null },
+            onDismiss = { pendingSourceMode = null },
+        )
     }
 
     editingSource?.let { source ->
@@ -442,7 +471,12 @@ private fun TrustEntryCard(
     }
 }
 
-/** 知识来源模式二选一（问题3） */
+/**
+ * 知识来源模式二选一（问题3）。
+ *
+ * [onSelect] 由调用方决定是否先确认——本卡片不假设「切换要问」还是「切换即生效」，
+ * 那是「项目里有没有内容」才回答得了的问题。
+ */
 @Composable
 private fun SourceModeCard(
     modelKnowledge: Boolean,
@@ -465,6 +499,12 @@ private fun SourceModeCard(
                 title = "以我的资料为准",
                 subtitle = "适合有指定教材、内部讲义或必须严格对齐的考试范围。每句知识都能追溯到你给的资料。",
                 onClick = { onSelect(SourceMode.DOCUMENTS) },
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "切换只影响以后怎么生成，已生成的内容不会被改写。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
@@ -735,10 +775,17 @@ private fun MapTab(
     val expanded = remember { mutableStateMapOf<String, Boolean>() }
     val modelKnowledge = project?.usesModelKnowledge == true
 
-    // 从正文跳回来时自动展开对应知识点的详情
+    // 从正文跳回来时自动展开对应知识点的详情。
+    // 一次性闸门（focusHandled）：nodes 是 Room Flow，生成完成/掌握度更新都会再发射，
+    // 不加闸门的话每次发射都会把这个底部弹窗强行重开，打断用户当前操作。
+    var focusHandled by remember(focusNodeId) { mutableStateOf(false) }
     LaunchedEffect(focusNodeId, nodes) {
         val target = focusNodeId ?: return@LaunchedEffect
-        nodes.firstOrNull { it.id == target }?.let { selectedNode = it }
+        if (focusHandled) return@LaunchedEffect
+        nodes.firstOrNull { it.id == target }?.let {
+            selectedNode = it
+            focusHandled = true
+        }
     }
     // 只渲染根节点，子节点由 TreeNodeRow 递归展开，避免同一节点重复出现（B8）
     val nodeIds = remember(nodes) { nodes.map { it.id }.toSet() }
@@ -760,10 +807,28 @@ private fun MapTab(
                     else -> "将从资料中提取知识点，整理成一条能走通的演进主干。需要联网并已配置模型。"
                 },
                 actionLabel = if (!modelKnowledge && sources.isEmpty()) null else "开始梳理知识主干",
-                onAction = { vm.enqueueKnowledgeMap() },
+                // 骨架先行：先花一次小调用看清链结构，用户再决定逐条展开还是全部展开
+                onAction = { vm.enqueueKnowledgeMap(KnowledgeMapMode.SKELETON) },
                 modifier = Modifier.weight(1f),
             )
         } else {
+            // 分步生成：批次未完成时给「继续」入口，和「重新梳理」（开新批次）分开——
+            // 部分链失败后点继续只补没做完的链，不把已经花钱展开的内容作废重来
+            val batch = vm.mapBatch.collectAsState().value
+            val busy = vm.generation.collectAsState().value.busy
+            val unfinished = batch?.takeIf { it.skeletonDone && !it.completed }
+            if (unfinished != null) {
+                val statuses = remember(unfinished) { unfinished.chainStatusList() }
+                MapProgressCard(
+                    done = statuses.count { it == KnowledgeMapChainStatus.DONE },
+                    failed = statuses.count { it == KnowledgeMapChainStatus.FAILED },
+                    total = statuses.size,
+                    busy = busy,
+                    onExpandNext = { vm.enqueueKnowledgeMap(KnowledgeMapMode.NEXT_CHAIN) },
+                    onExpandAll = { vm.enqueueKnowledgeMap(KnowledgeMapMode.FULL) },
+                )
+                Spacer(Modifier.height(8.dp))
+            }
             Row(
                 Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -776,20 +841,48 @@ private fun MapTab(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                OutlinedButton(onClick = { vm.enqueueKnowledgeMap() }) {
+                OutlinedButton(
+                    onClick = { vm.enqueueKnowledgeMap(KnowledgeMapMode.FULL) },
+                    enabled = !busy,
+                ) {
                     Icon(Icons.Default.Refresh, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
                     Text("重新梳理")
                 }
+                // 批次没完成时，「重新梳理」只续跑没做完的链；想换模型/改资料后彻底重来，
+                // 得先作废旧批次再开新骨架（B1）。放在「重新梳理」旁边，避免用户以为
+                // 点「重新梳理」就是重来一遍。
+                if (unfinished != null) {
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(
+                        onClick = { vm.restartKnowledgeMap() },
+                        enabled = !busy,
+                    ) {
+                        Text("放弃重来")
+                    }
+                }
             }
             Spacer(Modifier.height(8.dp))
+            // gaps 闭环：待处理的（OPEN）按类型给按钮，已处理的折叠收起，
+            // 让「还剩几条没看」一眼可读，又不抹掉处理记录
+            val openGaps = remember(gaps) { gaps.filter { it.gapStatus == GapStatus.OPEN } }
+            val handledGaps = remember(gaps) { gaps.filter { it.gapStatus != GapStatus.OPEN } }
+            val openConflicts = remember(conflicts) { conflicts.filter { it.conflictStatus == GapStatus.OPEN } }
+            val handledConflicts = remember(conflicts) { conflicts.filter { it.conflictStatus != GapStatus.OPEN } }
+            val patchingGaps by vm.patchingGaps.collectAsState()
             LazyColumn {
-                if (gaps.isNotEmpty() || conflicts.isNotEmpty()) {
+                if (openGaps.isNotEmpty() || handledGaps.isNotEmpty() || openConflicts.isNotEmpty() || handledConflicts.isNotEmpty()) {
                     item {
                         KnowledgeInsightCard(
-                            gaps = gaps,
-                            conflicts = conflicts,
+                            gaps = openGaps,
+                            handledGaps = handledGaps,
+                            conflicts = openConflicts,
+                            handledConflicts = handledConflicts,
                             modelKnowledge = modelKnowledge,
+                            patching = patchingGaps,
+                            onPatchGap = { vm.patchKnowledgeGap(it) },
+                            onDismissGap = { vm.dismissKnowledgeGap(it) },
+                            onDismissConflict = { vm.dismissKnowledgeConflict(it) },
                         )
                         Spacer(Modifier.height(8.dp))
                     }
@@ -821,13 +914,110 @@ private fun MapTab(
     }
 }
 
-/** 展示资料缺口与冲突（B12）。无资料模式下它们变成"需要你自己核对"的提醒（问题3） */
+/**
+ * 知识主干分步展开的进度卡（分步生成）。
+ *
+ * 显示几条链已展开、几条失败；用户自己选节奏——「展开下一条链」单步推进，
+ * 「全部展开」一口气跑完剩余链与审计。链全部完成时只剩「完成审计」一步。
+ * 失败链不会作废已展开的内容，重试只补失败的部分。
+ */
+@Composable
+private fun MapProgressCard(
+    done: Int,
+    failed: Int,
+    total: Int,
+    busy: Boolean,
+    onExpandNext: () -> Unit,
+    onExpandAll: () -> Unit,
+) {
+    val allDone = total > 0 && done >= total
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            val summary = if (allDone) {
+                "演进链已全部展开，还差最后一步全局审计"
+            } else {
+                buildString {
+                    append("知识主干分步展开：$done/$total 条演进链已完成")
+                    if (failed > 0) append("，$failed 条失败（继续展开会自动重试，已完成的不受影响）")
+                }
+            }
+            Text(summary, style = MaterialTheme.typography.bodyMedium)
+            if (!allDone) {
+                LinearProgressIndicator(
+                    progress = { if (total > 0) done.toFloat() / total else 0f },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                )
+            } else {
+                Spacer(Modifier.height(8.dp))
+            }
+            Row {
+                Button(onClick = onExpandNext, enabled = !busy) {
+                    Text(
+                        when {
+                            allDone -> "完成审计"
+                            failed > 0 -> "重试失败链并继续"
+                            else -> "展开下一条链"
+                        },
+                    )
+                }
+                if (!allDone) {
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(onClick = onExpandAll, enabled = !busy) {
+                        Text("全部展开")
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 展示资料缺口与冲突（B12；gaps 闭环的分类型 UI）。
+ *
+ * 三类内容分开摆、给的按钮也不一样——把「漏了东西」和「要多留个心眼」混在一起，
+ * 用户会以为每条都能点掉：
+ *
+ * - **漏掉的知识点**（[com.example.zhishu.domain.model.GapType.MISSING_NODE]）：
+ *   可行动的，给「补上」——只补这一个节点、一次调用，不重跑整张地图；
+ *   暂时不想补给「知道了」移出待办。
+ * - **要多留个心眼的地方**（过时 / 地区差异 / 各家说法不一 / 无法核实）：
+ *   这是免责提示而不是待办，**不给关闭按钮**，它会一直提醒你核对权威出处。
+ * - **资料冲突**：给「知道了」——冲突没有"补上"一说，只有"我已经知道两边
+ *   说法了，别反复提示"。
+ *
+ * 已处理（补上 / 知道了，含关闭的冲突）默认折叠：既让「还剩几条没看」一眼可读，
+ * 又保留处理记录——下一次梳理会按建议标题 / topic 继承这些状态，这里能看到继承的来源。
+ */
 @Composable
 private fun KnowledgeInsightCard(
     gaps: List<KnowledgeGap>,
+    handledGaps: List<KnowledgeGap>,
     conflicts: List<KnowledgeConflict>,
+    handledConflicts: List<KnowledgeConflict>,
     modelKnowledge: Boolean,
+    patching: Set<String>,
+    onPatchGap: (String) -> Unit,
+    onDismissGap: (String) -> Unit,
+    onDismissConflict: (String) -> Unit,
 ) {
+    // actionable 即 MISSING_NODE：只有它能补、能关，其余一律当免责提示
+    val actionable = remember(gaps) { gaps.filter { it.actionable } }
+    val notices = remember(gaps) { gaps.filter { !it.actionable } }
+    // 已处理（补上的知识点 + 关闭的冲突）合并成一条折叠，文本带上来源标签
+    val handledItems = remember(handledGaps, handledConflicts) {
+        buildList {
+            handledGaps.forEach { gap ->
+                val label = if (gap.gapStatus == GapStatus.RESOLVED) "已补上" else "知道了"
+                add(gap.description to label)
+            }
+            handledConflicts.forEach { conflict ->
+                add("${conflict.topic}：${conflict.description}" to "知道了")
+            }
+        }
+    }
+    var showHandled by remember { mutableStateOf(false) }
     Card(
         colors = androidx.compose.material3.CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.tertiaryContainer,
@@ -840,18 +1030,30 @@ private fun KnowledgeInsightCard(
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onTertiaryContainer,
             )
-            if (gaps.isNotEmpty()) {
+            if (actionable.isNotEmpty()) {
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    if (modelKnowledge) {
-                        "有地区/版本差异或可能已过时，建议核对权威出处"
-                    } else {
-                        "资料缺口（建议补充相关资料）"
-                    },
+                    "漏掉的知识点（可以补进知识主干）",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onTertiaryContainer,
                 )
-                gaps.forEach { gap ->
+                actionable.forEach { gap ->
+                    GapActionRow(
+                        gap = gap,
+                        patching = gap.id in patching,
+                        onPatchGap = onPatchGap,
+                        onDismissGap = onDismissGap,
+                    )
+                }
+            }
+            if (notices.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "这些地方要多留个心眼（建议核对权威出处）",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                )
+                notices.forEach { gap ->
                     Text(
                         "· ${gap.description}",
                         style = MaterialTheme.typography.bodySmall,
@@ -867,12 +1069,84 @@ private fun KnowledgeInsightCard(
                     color = MaterialTheme.colorScheme.onTertiaryContainer,
                 )
                 conflicts.forEach { conflict ->
+                    ConflictActionRow(conflict, onDismissConflict)
+                }
+            }
+            if (handledItems.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                TextButton(onClick = { showHandled = !showHandled }) {
                     Text(
-                        "· ${conflict.topic}：${conflict.description}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        if (showHandled) "收起已处理的 ${handledItems.size} 条" else "已处理 ${handledItems.size} 条",
                     )
                 }
+                if (showHandled) {
+                    handledItems.forEach { (description, label) ->
+                        Text(
+                            "· $description（$label）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 一条「漏掉的知识点」：给「补上」和「知道了」两个出口。
+ *
+ * 模型没给出建议标题时不给「补上」按钮——硬点只会拿到一句「没给出要补的知识点名称」，
+ * 不如直接不给这个按钮。
+ */
+@Composable
+private fun GapActionRow(
+    gap: KnowledgeGap,
+    patching: Boolean,
+    onPatchGap: (String) -> Unit,
+    onDismissGap: (String) -> Unit,
+) {
+    val canPatch = gap.suggestedTitle.isNotBlank()
+    Column(Modifier.padding(vertical = 4.dp)) {
+        Text(
+            "· ${gap.description}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onTertiaryContainer,
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (canPatch) {
+                Button(onClick = { onPatchGap(gap.id) }, enabled = !patching) {
+                    Text(if (patching) "正在补上…" else "补上「${gap.suggestedTitle}」")
+                }
+                Spacer(Modifier.width(8.dp))
+            }
+            OutlinedButton(onClick = { onDismissGap(gap.id) }, enabled = !patching) {
+                Text("知道了")
+            }
+        }
+    }
+}
+
+/**
+ * 一条资料冲突：给「知道了」。
+ *
+ * 冲突没有「补上」——它不是缺一个知识点，而是同一件事有两套说法，需要用户自己判断。
+ * 「知道了」只是把这条提示移出待办（关闭状态按 topic 继承，不会反复冒出来）。
+ */
+@Composable
+private fun ConflictActionRow(
+    conflict: KnowledgeConflict,
+    onDismissConflict: (String) -> Unit,
+) {
+    Column(Modifier.padding(vertical = 4.dp)) {
+        Text(
+            "· ${conflict.topic}：${conflict.description}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onTertiaryContainer,
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = { onDismissConflict(conflict.id) }) {
+                Text("知道了")
             }
         }
     }
@@ -1051,6 +1325,7 @@ private fun OutlineTab(
     val issues by vm.issues.collectAsState()
     val issueBlocks by vm.issueBlocks.collectAsState()
     val rewriting by vm.rewriting.collectAsState()
+    val retryingContracts by vm.retryingContracts.collectAsState()
     // 「继续下一卷」的入口状态（3C）
     val nextVolume by vm.nextVolume.collectAsState()
     // 统计只数当前版本正文（3D）
@@ -1171,6 +1446,8 @@ private fun OutlineTab(
                             issuePlan = plan
                         },
                         rewriting = plan.id in rewriting,
+                        onRetryContract = { vm.retryChapterContract(plan.id) },
+                        retryingContract = plan.id in retryingContracts,
                     )
                 }
             }
@@ -1439,6 +1716,10 @@ private fun ChapterPlanCard(
     onOpenIssues: () -> Unit = {},
     /** 正在局部重写 */
     rewriting: Boolean = false,
+    /** 单独补这一章的因果契约（三段式）。契约没生成的章禁止写正文 */
+    onRetryContract: () -> Unit = {},
+    /** 契约正在补 */
+    retryingContract: Boolean = false,
 ) {
     // 可读性只看正文状态。QUIZ_FAILED 是旧库里的值，正文其实是通过核验的
     val canRead = plan.isReadable ||
@@ -1449,6 +1730,13 @@ private fun ChapterPlanCard(
     val quizMissing = plan.isReadable && plan.quizState == QuizState.FAILED
     val needsRetry = plan.status == ChapterStatus.NEEDS_REVIEW ||
         plan.status == ChapterStatus.FAILED
+    /**
+     * 契约没生成：这一章还不能写正文。
+     *
+     * 三段式之后契约是逐章生成的，一章失败只影响一章。这里必须如实标出来，
+     * 否则用户点「生成」会撞上一句看不懂的报错，而且不知道有单独重试这条路。
+     */
+    val contractFailed = plan.contractStatus == ContractStatus.FAILED.name
     // 还没处理的问题。已接受和已修的不再计数——那两种都已经有结论了（4B）
     val openIssues = issues.filter { it.resolution.isOpen }
     Card(modifier = Modifier.padding(vertical = 6.dp)) {
@@ -1513,6 +1801,25 @@ private fun ChapterPlanCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            // 契约没生成就说清楚：这一章暂时写不了正文，而且可以只补这一章。
+            // 不标出来的话，用户只会看到「生成」按钮点了报错，
+            // 却不知道整卷其他章都好着呢、也不用重新规划整卷
+            if (contractFailed) {
+                Spacer(Modifier.height(6.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.tertiaryContainer,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        "这一章的因果契约没生成成功，暂时不能写正文。" +
+                            "可以只补这一章，不影响其他章节。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        modifier = Modifier.padding(8.dp),
+                    )
+                }
             }
             // 展示核验说明，用户才知道为什么待复核（B3）
             // 核验说明只讲正文的问题。出题失败的原因单独放在 quizNote 里，
@@ -1581,7 +1888,19 @@ private fun ChapterPlanCard(
                         Text(if (rewriting) "修改中…" else "逐条处理")
                     }
                 }
-                TextButton(onClick = onGenerate, enabled = !rewriting) {
+                // 补契约排在最前面：它是「生成正文」的前置条件，
+                // 不先解决它，后面几个按钮点了也是报错
+                if (contractFailed) {
+                    TextButton(onClick = onRetryContract, enabled = !retryingContract) {
+                        Text(if (retryingContract) "补契约中…" else "补契约")
+                    }
+                }
+                TextButton(
+                    onClick = onGenerate,
+                    // 契约没生成的章禁止写正文——点击后会在 pipeline 里被拦下，
+                    // 这里直接禁用，省得用户白点一次再读一句报错
+                    enabled = !rewriting && !contractFailed,
+                ) {
                     Text(if (needsRetry) "重新生成" else "生成")
                 }
             }

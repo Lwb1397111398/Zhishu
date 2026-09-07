@@ -59,6 +59,7 @@ class GenerationTest {
             ApplicationProvider.getApplicationContext(),
             AppDatabase::class.java,
         ).allowMainThreadQueries().build()
+        RouteStubs.reset()
         fakeRouter = FakeRouter()
         idCounter = 0
         spacedReview = false
@@ -73,6 +74,7 @@ class GenerationTest {
                 db = db,
                 conflictDao = db.knowledgeConflictDao(),
                 batchDao = db.knowledgeMapBatchDao(),
+                routeBatchDao = db.routeBatchDao(),
             ),
             chapterRepository = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao(), db.chapterVersionDao()),
             citationRepository = DefaultCitationRepository(db.citationDao()),
@@ -151,28 +153,140 @@ class GenerationTest {
         val result = pipeline.generateStoryBible("p-1")
         assertTrue(result.isSuccess)
         val plans = db.chapterPlanDao().getByProject("p-1")
-        assertEquals(1, plans.size)
-        assertEquals("第一章 遗嘱风波", plans[0].title)
-        assertEquals(1, plans[0].nodeIds.size)
-        assertEquals("意思表示", db.knowledgeNodeDao().getById(plans[0].nodeIds.first())?.title)
+        assertTrue(plans.isNotEmpty())
+        // 知识点只有 2 个，卷内章数必须被节点数封顶——不能摊成 4 章每章半个知识点
+        assertTrue("章数 ${plans.size} 超过了 2 个知识点能撑起的上限", plans.size <= 2)
+        // 每一章都要真的挂到一个知识点上
+        assertTrue(plans.all { it.nodeIds.isNotEmpty() })
+        val nodeTitles = db.knowledgeNodeDao().getByProject("p-1").map { it.title }.toSet()
+        plans.flatMap { it.nodeIds }.forEach { id ->
+            assertTrue(db.knowledgeNodeDao().getById(id)?.title in nodeTitles)
+        }
         assertEquals(ProjectStatus.OUTLINE, db.projectDao().getById("p-1")?.status)
     }
 
-    /** 章节规划完全不关联已有知识点时必须失败（N14） */
+    /**
+     * 三段式下每一章都要有通过校验的契约（改前断言的是「一次成型 + REVIEW 修复」）。
+     *
+     * REVIEW 章节的 introduced 必须为空这条规则没有消失，只是挪到了
+     * [com.example.zhishu.ai.pipeline.ContractIntroducedFix]——那里按章节类型逐条处理，
+     * 这条集成测试改为验证「全卷每章契约都落库且合规」这个更强的性质。
+     */
     @Test
-    fun generateStoryBible_unmappedNodes_fails() = runBlocking {
+    fun generateStoryBible_everyChapter_hasValidContract() = runBlocking {
         seedProjectWithChunk()
         pipeline.generateKnowledgeMap("p-1")
-        fakeRouter.storyBibleJson =
-            """{"world":"x","characters":[],"conflict":"c","style":"s","chapters":[{"order":1,"title":"章","nodeTitles":["不存在的知识点"],"wordTarget":1000}]}"""
         val result = pipeline.generateStoryBible("p-1")
-        assertTrue(result.exceptionOrNull() is ModelError.Invalid)
+        assertTrue(result.isSuccess)
+        val plans = db.chapterPlanDao().getByProject("p-1").sortedBy { it.order }
+        assertTrue(plans.isNotEmpty())
+        plans.forEach { plan ->
+            // 契约没生成 = 不允许写正文，这条底线由 contractStatus 把守
+            assertEquals(
+                com.example.zhishu.domain.model.ContractStatus.DONE.name,
+                plan.contractStatus,
+            )
+            assertTrue(plan.chapterType.isNotBlank())
+            val state = com.example.zhishu.ai.outputs.ContractCodec.decode(
+                plan.contractJson,
+                plan.chapterType,
+            )
+            assertTrue("第 ${plan.order} 章契约不可用：$state", state is com.example.zhishu.ai.outputs.ContractCodec.State.Valid)
+            val contract = (state as com.example.zhishu.ai.outputs.ContractCodec.State.Valid).contract
+            // REVIEW 章不能把任何节点算作「首次引入」——原测试的意图保留在这里
+            if (plan.chapterType == "REVIEW") {
+                assertTrue(contract.introducedNodeTitles.isEmpty())
+            }
+            // 契约引用的节点必须真的存在（编号反解后是标题）
+            val known = db.knowledgeNodeDao().getByProject("p-1").map { it.title }.toSet()
+            assertTrue(
+                (contract.introducedNodeTitles + contract.appliedNodeTitles).all { it in known },
+            )
+        }
+    }
+
+    /**
+     * 大纲引用了清单外的编号 → 整卷失败（改前断言的是标题匹配失败）。
+     *
+     * 三段式把「引用不存在的东西」从标题匹配换成编号匹配，性质不变：
+     * 引用一个不存在于本卷的知识点编号，等于凭空讲知识，必须拦下而不是静默丢弃。
+     */
+    @Test
+    fun generateStoryBible_unknownNodeKey_fails() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        // 让大纲桩返回一个不在清单里的编号
+        com.example.zhishu.RouteStubs.outlineForcesUnknownKey = true
+        val result = pipeline.generateStoryBible("p-1")
+        assertFalse(result.isSuccess)
+        // 失败不留半成品：章节计划一个都不落库
+        assertTrue(db.chapterPlanDao().getByProject("p-1").isEmpty())
+    }
+
+    /**
+     * 一章契约失败只影响这一章（计划验收项 10）。
+     *
+     * 这是三段式改造的全部意义所在：改之前一章不合规 → `ModelError.Invalid`
+     * （不可重试）→ 整卷作废、已生成的部分全丢。改之后失败的章单独标
+     * [ContractStatus.FAILED]，其余章照常落库可用。
+     */
+    @Test
+    fun generateStoryBible_oneChapterContractFails_othersStillDone() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        RouteStubs.outlineChapterCount = 4
+        // 只让第 3 章的契约违规
+        RouteStubs.contractViolationAtChapter = 3
+
+        val result = pipeline.generateStoryBible("p-1")
+        assertTrue(result.isSuccess)
+
+        val plans = db.chapterPlanDao().getByProject("p-1").sortedBy { it.order }
+        assertEquals(4, plans.size)
+        val statuses = plans.map { it.contractStatus }
+        assertEquals(
+            listOf("DONE", "DONE", "FAILED", "DONE"),
+            statuses,
+        )
+        // 失败章没有契约，成功章契约完整
+        assertTrue(plans[2].contractJson.isBlank())
+        assertTrue(plans[0].contractJson.isNotBlank())
+        // 路线整体算成功（不再因一章而整卷作废），项目进入 OUTLINE
+        assertEquals(ProjectStatus.OUTLINE, db.projectDao().getById("p-1")?.status)
+    }
+
+    /**
+     * 契约失败的章禁止写正文（计划验收项 11 的下半段）。
+     *
+     * 「有正文必有契约」是一条硬约束：正文按契约的拍子写，核验也按它逐项查。
+     * 契约缺失的章若允许生成，会产出没有因果结构的正文，而且无法核验。
+     */
+    @Test
+    fun chapterWithFailedContract_isExcludedFromGeneration() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        RouteStubs.outlineChapterCount = 3
+        RouteStubs.contractViolationAtChapter = 2
+        pipeline.generateStoryBible("p-1").getOrThrow()
+
+        val plans = db.chapterPlanDao().getByProject("p-1").sortedBy { it.order }
+        val failed = plans.first { it.contractStatus == "FAILED" }
+
+        // 直接点生成也要被拦：不能绕过 selectChaptersToGenerate 从单章入口溜进去
+        val result = pipeline.generateChapter("p-1", failed.id)
+        assertTrue(result.isFailure)
+        assertTrue(
+            result.exceptionOrNull()?.message.orEmpty().contains("契约"),
+        )
+        assertTrue(db.chapterBlockDao().getAllVersionsByChapter(failed.id).isEmpty())
     }
 
     @Test
     fun generateChapter_publishesBlocksAndQuiz() = runBlocking {
         seedProjectWithChunk()
         pipeline.generateKnowledgeMap("p-1")
+        // 同上：末尾断言项目 READY，本卷必须只有这一章
+        RouteStubs.outlineChapterCount = 1
         pipeline.generateStoryBible("p-1")
         val plan = db.chapterPlanDao().getByProject("p-1").first()
         val result = pipeline.generateChapter("p-1", plan.id)
@@ -345,6 +459,8 @@ class GenerationTest {
     fun refreshProjectStatus_readyOnlyWhenAllPublished() = runBlocking {
         seedProjectWithChunk()
         pipeline.generateKnowledgeMap("p-1")
+        // 这条断言「一章发布完项目就 READY」，所以本卷只能有这一章（测试前置条件）
+        RouteStubs.outlineChapterCount = 1
         pipeline.generateStoryBible("p-1")
         pipeline.refreshProjectStatus("p-1")
         assertEquals(ProjectStatus.GENERATING, db.projectDao().getById("p-1")?.status)
@@ -404,6 +520,8 @@ class GenerationTest {
             "knowledge_map" to "[[MAP]]",
             "knowledge_map_model" to "[[MAP]]",
             "story_bible" to "[[BIBLE]]",
+            "route_outline" to RouteStubs.OUTLINE_TEMPLATE,
+            "chapter_contract" to RouteStubs.CONTRACT_TEMPLATE,
             "chapter" to "[[CHAPTER]]",
             "verify" to "[[VERIFY]]",
             "verify_model" to "[[VERIFY]]",
@@ -435,6 +553,7 @@ class GenerationTest {
         var chapterRole: ModelRole? = null
         var verifyRole: ModelRole? = null
         var quizRole: ModelRole? = null
+        var storyBibleCalls: Int = 0
 
         override suspend fun <T> generate(
             role: ModelRole,
@@ -454,7 +573,12 @@ class GenerationTest {
                 request.user.contains("[[MAP]]") -> {
                     knowledgeMapRole = role; knowledgeMapJson()
                 }
-                request.user.contains("[[BIBLE]]") -> storyBibleJson
+                request.user.contains("[[OUTLINE]]") -> RouteStubs.outlineJson(request.user)
+                request.user.contains("[[CONTRACT]]") -> RouteStubs.contractJson(request.user)
+                request.user.contains("[[BIBLE]]") -> {
+                    storyBibleCalls += 1
+                    storyBibleJson
+                }
                 request.user.contains("[[CHAPTER]]") -> {
                     chapterRole = role; chapterJson
                 }

@@ -93,6 +93,7 @@ fun CreateProjectScreen(
     val sources by vm.sources.collectAsState()
     val creating by vm.creating.collectAsState()
     val topic by vm.topic.collectAsState()
+    val learningGoal by vm.learningGoal.collectAsState()
     val sourceMode by vm.sourceMode.collectAsState()
 
     var showMore by remember { mutableStateOf(false) }
@@ -162,6 +163,20 @@ fun CreateProjectScreen(
                 placeholder = { Text("例如：民法、宏观经济学、机器学习入门") },
                 modifier = Modifier.fillMaxWidth(),
             )
+            Spacer(Modifier.height(12.dp))
+
+            // 只填学科名太笼统：同样是「民法」，研究生深化、非专业自学、法考备考
+            // 要的知识主干切法完全不同。这一项不强制，但填了效果差别很大
+            OutlinedTextField(
+                value = learningGoal,
+                onValueChange = { vm.learningGoal.value = it },
+                label = { Text("学完想做到什么？（选填，很影响效果）") },
+                placeholder = { Text("例如：能独立分析简单合同纠纷案例") },
+                supportingText = {
+                    Text("不填就按「先建立整体理解」安排。填了 AI 才知道该讲多深、按什么框架切。")
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
             Spacer(Modifier.height(16.dp))
 
             // 知识来源模式（问题3）
@@ -219,7 +234,7 @@ fun CreateProjectScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "更多设置（讲法、基础、时长）",
+                    "更多设置（我的背景、讲法、基础、时长）",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f),
@@ -318,8 +333,28 @@ private fun MoreSettings(vm: CreateProjectViewModel) {
     val depth by vm.depth.collectAsState()
     val genre by vm.genre.collectAsState()
     val dailyMinutes by vm.dailyMinutes.collectAsState()
+    val learnerIdentity by vm.learnerIdentity.collectAsState()
+    val learningPurpose by vm.learningPurpose.collectAsState()
 
     Column(Modifier.padding(top = 8.dp)) {
+        // 身份与目的决定知识主干怎么切：同样学民法，研究生深化 / 非专业自学 /
+        // 法考备考是三种完全不同的切法。都是选填，填了效果差别很大
+        OutlinedTextField(
+            value = learnerIdentity,
+            onValueChange = { vm.learnerIdentity.value = it },
+            label = { Text("我是谁 / 我的背景（选填）") },
+            placeholder = { Text("例如：民商法研究生，本科民法基础不牢") },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(
+            value = learningPurpose,
+            onValueChange = { vm.learningPurpose.value = it },
+            label = { Text("为什么学 / 用在哪（选填）") },
+            placeholder = { Text("例如：准备法考、写论文、工作要用、纯兴趣") },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(16.dp))
         // 讲法：第一项就是 AI 自由发挥（问题6）
         ChipGroup(
             label = "讲法",

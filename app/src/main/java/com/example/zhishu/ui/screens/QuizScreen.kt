@@ -210,6 +210,12 @@ private fun QuizCard(
 
             if (answered) {
                 Spacer(Modifier.height(12.dp))
+                Text(
+                    "本题已作答，答案锁定不能修改（同一题只计分一次）。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = MaterialTheme.shapes.medium,

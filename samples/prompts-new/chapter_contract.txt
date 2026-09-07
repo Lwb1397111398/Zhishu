@@ -1,0 +1,54 @@
+你要为讲述路线里的**一章**写出它的因果契约。
+
+大纲已经定好了这一章讲什么、讲几个知识点、属于什么类型。你的任务不是重写大纲，
+而是把这一章的**因果结构**定下来：读者从什么处境进来、先想到什么、撞上什么、
+因此缺一块什么解释、知识用上之后发生什么变化、最后把什么问题交给下一章。
+
+## 本章大纲
+
+{chapterOutline}
+
+## 本章类型与它的最低要求
+
+`chapterType` = `{chapterType}`
+
+- `INTRODUCE`：必须写清「读者先感到缺一块」（knowledgeGap），并且新概念带来可观察的变化（resultingChange），`introducedNodeKeys` 至少一个。
+- `APPLY`：`appliedNodeKeys` 至少一个，且**不能全是本章新引入的节点**——应用的必须是已经学过的东西；还要给出行动的结果（resultingChange）。
+- `CONTRAST`：必须摆出容易混的地方（obstacle），至少涉及两个知识点，并给出区分后的结果（resultingChange）。
+- `REVIEW`：`introducedNodeKeys` **必须是空数组**。回顾的对象一律放 `appliedNodeKeys`。
+- `ASSESS`：`appliedNodeKeys` 至少一个（声明被检验的知识点），`requiredBeats` 至少一个（案例的判断步骤），并给出判断结果（resultingChange）。
+
+## 知识点用**编号**引用
+
+`introducedNodeKeys` / `appliedNodeKeys` 只能填**编号**（形如 `#3`），不要填标题。
+
+**白名单约束（程序会逐条校验，越界即整章作废）：**
+
+允许标为「首次引入」的编号：{allowedNodeKeys}
+已经在更早章节引入过、不能再算首次的编号：{alreadyIntroduced}
+
+## 本章涉及的知识点详情
+
+{nodeDetails}
+
+## 输出
+
+一个 JSON 对象，只有下面九个字段：
+
+- `entryQuestion`：本章开头读者/人物面对的具体问题或目标
+- `priorIntuition`：人物/读者原本就有的直觉、旧方法或初步方案
+- `obstacle`：旧方法遇到的阻碍或矛盾
+- `knowledgeGap`：因此读者明确感到需要一个新解释
+- `introducedNodeKeys`：本章**新引入**的知识点编号（必须在白名单内；REVIEW 必须是 `[]`）
+- `appliedNodeKeys`：本章**应用**的知识点编号（可含已学节点）
+- `requiredBeats`：本章必须走到的叙事拍子（3-6 条短句，不要求每拍独立成段）
+- `resultingChange`：知识被用起来之后的可观察变化
+- `bridgeToNext`：结尾留下、交给下一章的问题
+
+## 硬性要求
+
+1. 九个字段全部要写，一个都不能漏；确实不适用时写空数组而不是省略字段。
+2. 编号必须原样抄写（`{allowedNodeKeys}` 里长什么样就填什么样）。
+3. 不要把同一个编号同时放进 introduced 和 applied。
+4. `requiredBeats` 写**动作**，不写知识点名称（"双方各执一词"是对的，"讲行为能力"是错的）。
+5. 只输出 JSON 对象，不要输出任何其他文字。

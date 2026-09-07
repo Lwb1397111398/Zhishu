@@ -5,6 +5,7 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import com.example.zhishu.domain.model.KnowledgeMapBatch
+import kotlinx.coroutines.flow.Flow
 
 /**
  * 知识地图批次生成的状态（批次化生成）。
@@ -22,6 +23,10 @@ interface KnowledgeMapBatchDao {
     /** 取该项目最新的批次。没有批次时返回 null（从未生成 / 全部完成清理） */
     @Query("SELECT * FROM knowledge_map_batches WHERE projectId = :projectId ORDER BY createdAt DESC LIMIT 1")
     suspend fun getLatest(projectId: String): KnowledgeMapBatch?
+
+    /** 响应式版本：知识地图页靠它实时显示「几条链已展开 / 几条失败」与继续展开入口 */
+    @Query("SELECT * FROM knowledge_map_batches WHERE projectId = :projectId ORDER BY createdAt DESC LIMIT 1")
+    fun observeLatest(projectId: String): Flow<KnowledgeMapBatch?>
 
     @Query("SELECT * FROM knowledge_map_batches WHERE id = :id")
     suspend fun getById(id: String): KnowledgeMapBatch?

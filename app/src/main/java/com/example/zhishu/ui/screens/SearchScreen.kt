@@ -34,6 +34,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -62,8 +63,15 @@ fun SearchScreen(
     onOpenReader: (String, String?) -> Unit,
 ) {
     val app = LocalContext.current.applicationContext as Application
-    val vm: SearchViewModel = rememberZhishuViewModel(key = "search_${initialProjectId.orEmpty()}") {
+    // key 固定为 "search"：原来带 initialProjectId，从「知识」页进入是 "search_"、
+    // 从项目页进入带 ID，两个实例并存、各自缓存上一次的 query/results，
+    // 来回切换会看到不相关的旧结果。固定 key 后复用同一个 VM，入口项目靠
+    // applyInitialProject 同步。
+    val vm: SearchViewModel = rememberZhishuViewModel(key = "search") {
         SearchViewModel(app, initialProjectId)
+    }
+    LaunchedEffect(initialProjectId) {
+        vm.applyInitialProject(initialProjectId)
     }
     val projects by vm.projects.collectAsState()
     val selectedProjectId by vm.selectedProjectId.collectAsState()
@@ -248,7 +256,9 @@ private fun SearchResultCard(
                 Spacer(Modifier.height(2.dp))
                 Text(
                     projectTitle + when {
-                        hit.chapterId == null -> " · 资料原文"
+                        // 资料片段没有对应的正文位置，点不动是设计如此——但得说清楚，
+                        // 否则用户点了没反应会以为卡住（D2）
+                        hit.chapterId == null -> " · 资料原文（在资料页查看，不能跳到正文）"
                         hit.blockId != null -> " · 点击跳到正文这一段"
                         else -> " · 点击跳转阅读"
                     },

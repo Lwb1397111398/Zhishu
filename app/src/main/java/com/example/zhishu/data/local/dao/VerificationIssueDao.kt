@@ -121,7 +121,4 @@ interface VerificationIssueDao {
 
     @Query("DELETE FROM verification_issues WHERE projectId = :projectId")
     suspend fun deleteByProject(projectId: String)
-
-    @Query("SELECT COUNT(*) FROM verification_issues WHERE projectId = :projectId")
-    suspend fun countAllVersionsByProject(projectId: String): Int
 }

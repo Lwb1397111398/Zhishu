@@ -1,6 +1,7 @@
 package com.example.zhishu.domain.repository
 
 import com.example.zhishu.domain.model.AnswerRecord
+import com.example.zhishu.domain.model.ApiProfile
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
@@ -11,13 +12,13 @@ import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeMapBatch
 import com.example.zhishu.domain.model.KnowledgeNode
-import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.Quiz
 import com.example.zhishu.domain.model.QuizState
 import com.example.zhishu.domain.model.ReadingProgress
 import com.example.zhishu.domain.model.ReviewItem
+import com.example.zhishu.domain.model.RouteBatch
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.StoryBible
@@ -35,6 +36,8 @@ interface ProjectRepository {
 interface SourceRepository {
     fun observeByProject(projectId: String): Flow<List<SourceDocument>>
     suspend fun getByProject(projectId: String): List<SourceDocument>
+    /** 按资料 ID 直查（资料详情页用：不依赖片段是否存在，避免「0 片段」被误报成「资料已删除」） */
+    suspend fun getById(sourceId: String): SourceDocument?
     suspend fun addSource(source: SourceDocument, chunks: List<SourceChunk>)
     suspend fun getChunks(sourceId: String): List<SourceChunk>
     /** 按项目取全部片段（B1） */
@@ -159,7 +162,20 @@ interface KnowledgeRepository {
 
     // 知识缺口与冲突（B12）
     fun observeGaps(projectId: String): Flow<List<KnowledgeGap>>
+
+    /**
+     * 挂起版缺口查询（gaps 闭环）。
+     *
+     * 生成流水线在重建缺口前要读出旧状态来继承（RESOLVED / DISMISSED），
+     * 而 Flow 版是为 UI 观察设计的——在生成这种一次性流程里取它的第一个值
+     * 既别扭又容易取到过期快照。
+     */
+    suspend fun getGaps(projectId: String): List<KnowledgeGap>
+
     fun observeConflicts(projectId: String): Flow<List<KnowledgeConflict>>
+
+    /** 挂起版冲突查询（与 [getGaps] 同一原因：重建前要读旧状态继承 DISMISSED） */
+    suspend fun getConflicts(projectId: String): List<KnowledgeConflict>
     suspend fun replaceInsights(
         projectId: String,
         gaps: List<KnowledgeGap>,
@@ -169,6 +185,9 @@ interface KnowledgeRepository {
     // --- 批次化生成状态（骨架 → 逐链 → 审计）---
     /** 取该项目最新的生成批次；没有批次 = 从未开始或已完成清理 */
     suspend fun getLatestBatch(projectId: String): KnowledgeMapBatch?
+
+    /** 响应式版本：知识地图页实时显示链展开进度与继续展开入口 */
+    fun observeLatestBatch(projectId: String): Flow<KnowledgeMapBatch?>
     suspend fun saveBatch(batch: KnowledgeMapBatch)
     /** 重新生成前清掉旧批次，避免旧状态被误认成当前批次（重新生成隔离） */
     suspend fun clearBatch(projectId: String)
@@ -182,6 +201,20 @@ interface KnowledgeRepository {
 
     /** 批次化生成：只更新节点的生成状态（占位/失败），不覆盖用户字段 */
     suspend fun updateGenerateStatus(id: String, status: String)
+
+    // --- 单条 gap/conflict 的处理（gaps 闭环）---
+    /** 只更新一条缺口的状态与结构化字段，不覆盖描述与排序 */
+    suspend fun updateGap(gap: KnowledgeGap)
+
+    /** 只更新一条冲突的状态（「知道了」关闭） */
+    suspend fun updateConflict(conflict: KnowledgeConflict)
+
+    // --- 讲述路线批次（分卷 → 大纲 → 契约）---
+    suspend fun getLatestRouteBatch(projectId: String): RouteBatch?
+    fun observeLatestRouteBatch(projectId: String): Flow<RouteBatch?>
+    suspend fun saveRouteBatch(batch: RouteBatch)
+    /** 重新规划路线前清掉旧批次，避免旧断点被误认成当前进度 */
+    suspend fun clearRouteBatch(projectId: String)
 }
 
 interface ChapterRepository {
@@ -381,9 +414,25 @@ interface ProgressRepository {
     suspend fun clearForProject(projectId: String)
 }
 
+/**
+ * API 配置方案库与三档分配。
+ *
+ * 配置（[ApiProfile]，含地址/模型/Key）与「谁在用」（[assignRole]）分离：
+ * 方案库可保存任意多套，FAST/STORY/VERIFY 各自指向其中一套。
+ */
 interface SettingsRepository {
-    suspend fun getAllConfigs(): List<ModelConfig>
-    suspend fun getConfig(role: ModelRole): ModelConfig?
-    suspend fun saveConfig(config: ModelConfig)
-    suspend fun clearConfigs()
+    suspend fun getProfiles(): List<ApiProfile>
+    suspend fun getProfile(id: Long): ApiProfile?
+    /** 新增（id=0）或更新方案，返回带最终 id 的实体 */
+    suspend fun saveProfile(profile: ApiProfile): ApiProfile
+
+    /** 删除方案，并清空指向它的三档分配（悬空引用会让「未配置」状态无法显示） */
+    suspend fun deleteProfile(id: Long)
+
+    /** 三档各自指向的方案 id；没选过/被清空的档为 null */
+    suspend fun getAssignments(): Map<ModelRole, Long?>
+    suspend fun assignRole(role: ModelRole, profileId: Long?)
+
+    /** 一站式取用：该档当前生效的方案，未配置或方案已被删时为 null */
+    suspend fun getAssignedProfile(role: ModelRole): ApiProfile?
 }

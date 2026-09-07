@@ -12,6 +12,11 @@ data class ChatMessage(
 /**
  * 模型请求。[maxTokens] 与 [temperature] 为 null 时表示「沿用用户在设置页配置的值」，
  * 只有调用方显式给出时才覆盖配置（B6：不使用 sentinel 值判断是否覆盖）。
+ *
+ * [stageLabel] 只用于诊断日志：同一个角色（FAST）会跑骨架、逐链、审计三种步骤，
+ * 只按角色记日志时三者都叫 `FAST#1`，卡住时根本分不清是哪一步。给个短标签
+ * （`MAP_SKELETON` / `MAP_CHAIN` / `STORY_BIBLE`…）就能一眼看出停在哪。为空时
+ * 退回角色名，兼容不关心诊断的调用方。
  */
 data class ModelRequest(
     val role: ModelRole,
@@ -20,6 +25,7 @@ data class ModelRequest(
     val maxTokens: Int? = null,
     val temperature: Float? = null,
     val jsonMode: Boolean = true,
+    val stageLabel: String? = null,
 ) {
     fun messages(): List<ChatMessage> = listOf(
         ChatMessage(role = "system", content = system),
@@ -146,6 +152,8 @@ data class CallAttempt(
     val outcome: AttemptOutcome,
     /** ModelError 类名（Auth/RateLimited/Server/Network/Decode/...），成功为 null */
     val errorCategory: String? = null,
+    /** 安全错误摘要的原始来源；普通诊断写入前还会统一脱敏、压平与截断 */
+    val errorSummary: String? = null,
     /** 原始响应体（含 usage/finish_reason）。样本运行器写入 artifacts，不写进普通日志 */
     val rawResponse: String? = null,
 )
@@ -203,6 +211,16 @@ sealed class ModelError(
 
     /** 模型返回空内容。可重试一次。 */
     class Empty(message: String) : ModelError(message, retryable = true)
+
+    /**
+     * 输出被长度上限切断（finish_reason=length）。
+     *
+     * 单列一类而不是塞进 [InvalidRequest]，是为了让上层能分清「换个更小的请求没用、
+     * 得少要点内容」和「请求参数本身不合法」。降 max_tokens 对截断只会更糟，
+     * 所以这里 [retryable] 为 false——不在路由层退避重发同一请求，
+     * 而是交给调用方（知识主干骨架）用「减少本轮要生成的量」的方式自救。
+     */
+    class Truncated(message: String) : ModelError(message, retryable = false)
 
     /** 本次业务请求的调用预算已用尽。不可重试。 */
     class BudgetExhausted(message: String) : ModelError(message, retryable = false)

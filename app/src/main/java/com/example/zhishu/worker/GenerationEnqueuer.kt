@@ -13,6 +13,7 @@ import androidx.work.WorkContinuation
 import androidx.work.WorkManager
 import androidx.work.workDataOf
 import com.example.zhishu.ai.pipeline.ChapterPhase
+import com.example.zhishu.ai.pipeline.KnowledgeMapMode
 import com.example.zhishu.domain.model.ChapterPlan
 import com.google.common.util.concurrent.ListenableFuture
 import java.util.UUID
@@ -70,11 +71,26 @@ object GenerationEnqueuer {
         GenerationNotifier.clearProgress(context)
     }
 
-    /** 只梳理知识主干 */
-    suspend fun knowledgeMap(context: Context, projectId: String): EnqueueResult =
-        enqueueChain(context, projectId, modelStages = 1) { session ->
-            listOf(simpleRequest(projectId, GenerationStage.KNOWLEDGE_MAP, session, 0, UNITS_SIMPLE_STAGE))
-        }
+    /**
+     * 梳理知识主干。[mode] 决定推进节奏：一口气跑完（FULL，默认/一键开讲）、
+     * 只出骨架（SKELETON，用户看完结构自己选逐条还是全部）、单步推一条链
+     * （NEXT_CHAIN，链全部完成时该步直接做全局审计收尾）
+     */
+    suspend fun knowledgeMap(
+        context: Context,
+        projectId: String,
+        mode: KnowledgeMapMode = KnowledgeMapMode.FULL,
+    ): EnqueueResult = enqueueChain(context, projectId, modelStages = 1) { session ->
+        listOf(
+            request(
+                session = session,
+                data = Data.Builder()
+                    .putAll(baseData(projectId, GenerationStage.KNOWLEDGE_MAP, session, 0, UNITS_SIMPLE_STAGE))
+                    .putString(GenerationWorker.KEY_MAP_MODE, mode.name)
+                    .build(),
+            ),
+        )
+    }
 
     /** 只规划讲述路线 */
     suspend fun storyBible(context: Context, projectId: String): EnqueueResult =

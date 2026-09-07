@@ -140,12 +140,19 @@ fun ReaderScreen(
         blocks.filter { it.blockType == BlockType.STORY || it.blockType == BlockType.KEY_POINT }
     }
 
-    // 搜索命中的块若是安静模式下折叠掉的旁注，自动切到密集模式，否则跳过去看不到东西
+    // 搜索命中的块若是安静模式下折叠掉的旁注，自动切到密集模式，否则跳过去看不到东西。
+    // 一次性闸门（按 targetBlockId）：blocks 是 Flow，重生成/进度更新都会再发射，
+    // 不加闸门的话用户手动关掉密集模式后、下一次 blocks 变化又会被强行打开。
+    var denseAutoApplied by remember(targetBlockId) { mutableStateOf(false) }
     LaunchedEffect(targetBlockId, blocks) {
         val target = targetBlockId ?: return@LaunchedEffect
+        if (denseAutoApplied) return@LaunchedEffect
         val block = blocks.firstOrNull { it.id == target } ?: return@LaunchedEffect
         val hidden = block.blockType != BlockType.STORY && block.blockType != BlockType.KEY_POINT
-        if (hidden && !vm.denseMode.value) vm.denseMode.value = true
+        if (hidden && !vm.denseMode.value) {
+            vm.denseMode.value = true
+            denseAutoApplied = true
+        }
     }
 
     // 恢复位置：优先跳到指定块（搜索/知识地图跳转），否则回到上次读到的块
@@ -261,7 +268,7 @@ fun ReaderScreen(
                 TextButton(
                     onClick = { prevChapterId?.let(onOpenChapter) },
                     enabled = prevChapterId != null,
-                ) { Text("上一章") }
+                ) { Text(if (prevChapterId != null) "上一章" else "已是第一章") }
                 TextButton(onClick = { showOutline = true }) { Text("本章导览") }
                 Button(
                     onClick = { nextChapterId?.let(onOpenChapter) },

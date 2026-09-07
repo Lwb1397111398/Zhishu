@@ -22,9 +22,6 @@ interface ReviewItemDao {
     @Query("SELECT * FROM review_items WHERE projectId = :projectId ORDER BY dueAt")
     suspend fun getByProject(projectId: String): List<ReviewItem>
 
-    @Query("SELECT * FROM review_items WHERE projectId = :projectId AND nodeId = :nodeId LIMIT 1")
-    suspend fun getByNode(projectId: String, nodeId: String): ReviewItem?
-
     @Query("SELECT * FROM review_items WHERE dueAt <= :now AND status = :status ORDER BY dueAt LIMIT 100")
     suspend fun getDue(now: Long, status: ReviewStatus): List<ReviewItem>
 

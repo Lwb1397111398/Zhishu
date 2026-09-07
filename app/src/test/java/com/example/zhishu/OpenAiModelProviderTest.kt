@@ -4,7 +4,7 @@ import com.example.zhishu.ai.ModelError
 import com.example.zhishu.ai.ModelRequest
 import com.example.zhishu.ai.OpenAiModelProvider
 import com.example.zhishu.ai.UsageInfo
-import com.example.zhishu.domain.model.ModelConfig
+import com.example.zhishu.domain.model.ApiProfile
 import com.example.zhishu.domain.model.ModelRole
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
@@ -39,15 +39,15 @@ class OpenAiModelProviderTest {
         maxTokens: Int = 4096,
         temperature: Float = 0.7f,
     ): OpenAiModelProvider {
-        val config = ModelConfig(
-            role = ModelRole.STORY.name,
+        val profile = ApiProfile(
+            name = "test",
             baseUrl = server.url("/v1").toString().trimEnd('/'),
             modelName = "test-model",
             maxTokens = maxTokens,
             temperature = temperature,
         )
         // MockWebServer 是 http，测试关掉 HTTPS 强制
-        return OpenAiModelProvider(config = config, apiKey = "test-key", requireHttps = false)
+        return OpenAiModelProvider(profile = profile, apiKey = "test-key", requireHttps = false)
     }
 
     private fun request(): ModelRequest = ModelRequest(
@@ -112,6 +112,57 @@ class OpenAiModelProviderTest {
         assertEquals(true, (error as ModelError).retryable)
     }
 
+    /**
+     * content 为空且 finish_reason=length → 归类为 Truncated（此前是 InvalidRequest）。
+     *
+     * 单列一类是为了让上层分清「换个更小请求没用、得少要点内容」和「参数本身不合法」。
+     * 这是骨架失败的高频路径之一，此前零覆盖（生产读 finish_reason，测试从不写）。
+     */
+    @Test
+    fun complete_finishReasonLength_failsWithTruncated() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"choices":[{"message":{"content":""},"finish_reason":"length"}]}""",
+            ),
+        )
+        val error = provider().complete(request()).exceptionOrNull()
+        assertTrue("应为 Truncated，实际：${error?.let { it::class.simpleName }}", error is ModelError.Truncated)
+        assertEquals(false, (error as ModelError).retryable)
+    }
+
+    /**
+     * 推理模型只吐 reasoning_content、正式 content 为空 → InvalidRequest（不可重试）。
+     * 此前零覆盖。这是「快速模型配成推理模型 → 骨架总是失败」的直接来源。
+     */
+    @Test
+    fun complete_reasoningOnly_failsWithInvalidRequest() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"choices":[{"message":{"content":"","reasoning_content":"让我想想……"}}]}""",
+            ),
+        )
+        val error = provider().complete(request()).exceptionOrNull()
+        assertTrue(error is ModelError.InvalidRequest)
+        assertEquals(false, (error as ModelError).retryable)
+    }
+
+    /**
+     * 400 的包装文案不得含「上下文/长度/token」——否则降档判定会把模型名写错
+     * 这类错误误判成 token 超限、白白降档重发。锁死这条不变量。
+     */
+    @Test
+    fun complete_badRequest400_messageDoesNotTriggerDowngrade() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(400).setBody("{\"error\":{\"message\":\"The model does not exist\"}}"),
+        )
+        val message = provider().complete(request()).exceptionOrNull()?.message.orEmpty()
+        assertTrue(
+            "400 包装文案不应含降档触发词，实际：$message",
+            listOf("上下文", "最大长度", "长度超", "max_tokens", "context length", "token limit")
+                .none { message.contains(it, ignoreCase = true) },
+        )
+    }
+
     @Test
     fun complete_emptyContent_failsWithEmpty() = runBlocking {
         server.enqueue(MockResponse().setResponseCode(200).setBody("{\"choices\":[]}"))
@@ -121,12 +172,12 @@ class OpenAiModelProviderTest {
 
     @Test
     fun httpBaseUrl_rejectedWhenHttpsRequired() = runBlocking {
-        val config = ModelConfig(
-            role = ModelRole.STORY.name,
+        val profile = ApiProfile(
+            name = "test",
             baseUrl = "http://insecure.example.com/v1",
             modelName = "test-model",
         )
-        val error = OpenAiModelProvider(config = config, apiKey = "k")
+        val error = OpenAiModelProvider(profile = profile, apiKey = "k")
             .complete(request()).exceptionOrNull()
         assertTrue(error is ModelError.InvalidRequest)
     }

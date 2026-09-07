@@ -12,6 +12,8 @@ import com.example.zhishu.domain.model.ChapterVersion
 import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.Citation
 import com.example.zhishu.domain.model.CitationStatus
+import com.example.zhishu.domain.model.KnowledgeConflict
+import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.Quiz
@@ -51,6 +53,8 @@ class TransferManager(private val container: AppContainer) {
             val progress = mutableListOf<ReadingProgress>()
             val answers = mutableListOf<AnswerRecord>()
             val bibles = mutableListOf<StoryBible>()
+            val gaps = mutableListOf<KnowledgeGap>()
+            val conflicts = mutableListOf<KnowledgeConflict>()
 
             projects.forEach { project ->
                 sources += container.sourceRepository.getByProject(project.id)
@@ -78,6 +82,10 @@ class TransferManager(private val container: AppContainer) {
                 container.progressRepository.get(project.id)?.let { progress += it }
                 // 故事总纲与滚动记忆，否则恢复后讲法与进度全丢（问题5）
                 container.storyBibleRepository.get(project.id)?.let { bibles += it }
+                // 审计结论（gaps 闭环）：这两张表是全局审计的产出，重跑一次地图要几十万 token。
+                // 早先漏掉它们，导入后「别只信 AI」区域会整片消失——而用户无从得知丢过。
+                gaps += container.knowledgeRepository.getGaps(project.id)
+                conflicts += container.knowledgeRepository.getConflicts(project.id)
             }
 
             val entries = linkedMapOf<String, String>()
@@ -103,6 +111,9 @@ class TransferManager(private val container: AppContainer) {
             entries["reviews.json"] = json.encodeToString(reviews)
             entries["progress.json"] = json.encodeToString(progress)
             entries["story_bibles.json"] = json.encodeToString(bibles)
+            // 审计结论：缺了它们，导入后待补知识点与资料冲突会全部消失（旧备份无此文件，向后兼容）
+            entries["gaps.json"] = json.encodeToString(gaps)
+            entries["conflicts.json"] = json.encodeToString(conflicts)
 
             val resolver = context.contentResolver
             resolver.openOutputStream(uri)?.use { output ->
@@ -210,8 +221,15 @@ class TransferManager(private val container: AppContainer) {
                 }
             }
 
+        // batchId 归零（v14 批次化）：批次表**刻意不随备份导出**（它是过程状态），
+        // 所以这里必须把节点从旧批次里摘出来。否则读路径（KnowledgeNodeDao 按
+        // `batchId = '' OR batchId = 当前 active 批次` 过滤）两边都不成立——
+        // 旧批次 ID 非空、active 批次查不到，结果是导入后知识主干整片看不见，
+        // 而章节和正文都好好的，用户只会以为是地图没生成。
+        // 空串在 v14 迁移里的定义正是「视为当前有效地图」，这是语义正确的归零。
         val knowledge = decodeList<KnowledgeNode>(files, "knowledge.json")
             .filter { it.projectId in projectIds }
+            .map { it.copy(batchId = "") }
         val plans = decodeList<ChapterPlan>(files, "chapters.json")
             .filter { it.projectId in projectIds }
         val planProject = plans.associate { it.id to it.projectId }
@@ -283,6 +301,12 @@ class TransferManager(private val container: AppContainer) {
             blocks = citations.blocks,
             versionIds = versioned.versionIds,
         )
+        // 审计结论（gaps 闭环）。与 knowledge 同理按项目过滤；旧备份没有这两个文件，
+        // decodeList 返回空即向后兼容。
+        val gaps = decodeList<KnowledgeGap>(files, "gaps.json")
+            .filter { it.projectId in projectIds }
+        val conflicts = decodeList<KnowledgeConflict>(files, "conflicts.json")
+            .filter { it.projectId in projectIds }
 
         return ImportPayload(
             projects = projects,
@@ -301,6 +325,8 @@ class TransferManager(private val container: AppContainer) {
             reviews = reviews,
             progress = progress,
             bibles = bibles,
+            gaps = gaps,
+            conflicts = conflicts,
         )
     }
 
@@ -588,6 +614,10 @@ class TransferManager(private val container: AppContainer) {
                 container.reviewRepository.clearForProject(project.id)
                 container.progressRepository.clearForProject(project.id)
                 container.storyBibleRepository.clearForProject(project.id)
+                // 过程状态表不随备份导出，但导入同 ID 项目时旧断点会残留——
+                // 旧批次的 chainsJson/outlineJson 引用的节点此刻已不存在，续跑必然错乱
+                container.knowledgeRepository.clearBatch(project.id)
+                container.knowledgeRepository.clearRouteBatch(project.id)
                 container.projectRepository.create(project)
             }
 
@@ -611,6 +641,13 @@ class TransferManager(private val container: AppContainer) {
             if (payload.reviews.isNotEmpty()) container.reviewRepository.upsertAll(payload.reviews)
             payload.progress.forEach { container.progressRepository.save(it) }
             payload.bibles.forEach { container.storyBibleRepository.save(it) }
+            // 审计结论最后写入：它们锚定到节点（anchorNodeId），此刻节点已在库里。
+            // 注意不能用 replaceInsights（那是 clear + 重建），会把同项目其它批次
+            // 的条目一起清掉；这里是追加式恢复，用 upsert 语义。
+            if (payload.gaps.isNotEmpty()) payload.gaps.forEach { container.knowledgeRepository.updateGap(it) }
+            if (payload.conflicts.isNotEmpty()) {
+                payload.conflicts.forEach { container.knowledgeRepository.updateConflict(it) }
+            }
         }
     }
 
@@ -632,6 +669,8 @@ class TransferManager(private val container: AppContainer) {
         val reviews: List<ReviewItem>,
         val progress: List<ReadingProgress>,
         val bibles: List<StoryBible>,
+        val gaps: List<KnowledgeGap> = emptyList(),
+        val conflicts: List<KnowledgeConflict> = emptyList(),
     )
 
     companion object {

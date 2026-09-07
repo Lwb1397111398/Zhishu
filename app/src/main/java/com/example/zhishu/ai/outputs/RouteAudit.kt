@@ -40,6 +40,10 @@ data class RouteAuditIssue(
         CHAIN_DISCONTINUITY,
         /** 前置节点是本章自己首次引入的节点——新概念不可能同时是本章的前置 */
         PREREQUISITE_SELF_REF,
+        /** 章节类型被程序按配额规则改动过（三段式：模型给的分布不合规） */
+        TYPE_AUTO_ADJUSTED,
+        /** 契约里的「引入/应用」归属被程序修正过（REVIEW 引入新节点、跨章重复引入等） */
+        CONTRACT_AUTO_ADJUSTED,
     }
 }
 

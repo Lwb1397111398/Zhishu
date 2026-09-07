@@ -95,16 +95,26 @@ private val topTabs = listOf(
 fun ZhishuRoot(
     /** 点通知进来时要直接打开的项目（第二阶段）。为空就走正常首页。 */
     initialProjectId: String? = null,
+    /**
+     * 通知点击序号。同一项目的通知点第二次时 [initialProjectId] 不变，
+     * 光靠它做 key 的 LaunchedEffect 不会重跑——用户已经导航去别处就跳不回来。
+     * 每次点击自增，保证「点通知 → 打开项目」每次都生效。
+     */
+    projectNavToken: Int = 0,
 ) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
     val showBottomBar = topTabs.any { it.route == currentRoute }
 
-    // 只在这一次进入时跳一次，之后用户自己怎么导航就不再干预
-    LaunchedEffect(initialProjectId) {
+    // 只在这一次进入时跳一次，之后用户自己怎么导航就不再干预。
+    // launchSingleTop：配置变更（旋转等）会重建组合、LaunchedEffect 重跑，
+    // 不加这道锁会把同一个项目页重复压进返回栈。
+    LaunchedEffect(initialProjectId, projectNavToken) {
         if (!initialProjectId.isNullOrBlank()) {
-            navController.navigate(Routes.project(initialProjectId))
+            navController.navigate(Routes.project(initialProjectId)) {
+                launchSingleTop = true
+            }
         }
     }
 

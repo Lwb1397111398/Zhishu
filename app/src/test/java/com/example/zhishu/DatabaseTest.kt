@@ -4,12 +4,12 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.zhishu.data.local.AppDatabase
 import com.example.zhishu.domain.model.AnswerRecord
+import com.example.zhishu.domain.model.ApiProfile
 import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.KnowledgeNode
-import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ParseStatus
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.ProjectStatus
@@ -53,8 +53,8 @@ class DatabaseTest {
     }
 
     @Test
-    fun databaseVersion_isTwelve() {
-        assertEquals(15, db.openHelper.readableDatabase.version)
+    fun databaseVersion_matchesCurrentSchema() {
+        assertEquals(18, db.openHelper.readableDatabase.version)
     }
 
     @Test
@@ -301,11 +301,14 @@ class DatabaseTest {
     }
 
     @Test
-    fun modelConfig_upsertAndClear() = runBlocking {
-        db.modelConfigDao().upsert(ModelConfig(role = "STORY", modelName = "gpt-4o", baseUrl = "https://x"))
-        assertEquals("gpt-4o", db.modelConfigDao().getByRole("STORY")?.modelName)
-        db.modelConfigDao().clearAll()
-        assertTrue(db.modelConfigDao().getAll().isEmpty())
+    fun apiProfile_upsertAndDelete() = runBlocking {
+        val saved = db.apiProfileDao().insert(ApiProfile(name = "方案A", modelName = "gpt-4o", baseUrl = "https://x"))
+        assertEquals("gpt-4o", db.apiProfileDao().getById(saved)?.modelName)
+        db.roleAssignmentDao().upsert(com.example.zhishu.domain.model.RoleAssignment(role = "STORY", profileId = saved))
+        db.apiProfileDao().deleteById(saved)
+        assertTrue(db.apiProfileDao().getAll().isEmpty())
+        // 方案删除后分配要能被清空，避免悬空引用
+        assertNull(db.roleAssignmentDao().getByRole("STORY")?.profileId?.let { db.apiProfileDao().getById(it) })
     }
 
     private fun project(now: Long): Project = Project(

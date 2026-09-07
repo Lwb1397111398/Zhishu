@@ -93,6 +93,21 @@ val runQualitySamples by tasks.registering(Test::class) {
     outputs.upToDateWhen { false }
 }
 
+/**
+ * 端到端全流程验证（真实 API）：知识主干→圣经→章节→核验，走生产默认开关。
+ * 用法与 runQualitySamples 相同（ZHISHU_SAMPLE_* 环境变量），只跑 E2eFullFlowRunner。
+ */
+val runE2eFullFlow by tasks.registering(Test::class) {
+    description = "端到端全流程验证：知识主干→圣经→章节→核验（需 ZHISHU_SAMPLE_* 环境变量）"
+    group = "verification"
+    testClassesDirs = tasks.named("testDebugUnitTest", Test::class).get().testClassesDirs
+    classpath = tasks.named("testDebugUnitTest", Test::class).get().classpath
+    maxHeapSize = "2048m"
+    filter { includeTestsMatching("com.example.zhishu.samples.E2eFullFlowRunner") }
+    systemProperty("ZHISHU_RUN_SAMPLES", "true")
+    outputs.upToDateWhen { false }
+}
+
 dependencies {
     implementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(platform(libs.androidx.compose.bom))

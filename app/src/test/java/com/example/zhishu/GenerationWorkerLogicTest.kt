@@ -6,6 +6,7 @@ import com.example.zhishu.domain.model.ChapterStatus
 import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.worker.GenerationStage
 import com.example.zhishu.worker.isPermanentConfigFailure
+import com.example.zhishu.worker.failureReason
 import com.example.zhishu.worker.isRetryableFailure
 import com.example.zhishu.worker.selectChaptersToGenerate
 import java.io.IOException
@@ -119,7 +120,9 @@ class GenerationWorkerLogicTest {
         assertFalse(isRetryableFailure(ModelError.InvalidRequest("bad model")))
         assertFalse(isRetryableFailure(ModelError.Decode("bad json")))
         assertFalse(isRetryableFailure(ModelError.Invalid("no nodes")))
-        assertTrue(isRetryableFailure(ModelError.RateLimited("429")))
+        // Router 已在单次业务调用内处理过 429；Worker 再重跑整阶段会形成双层重试，
+        // 对服务商的并发限流尤其无效，还会重做已成功的骨架/路线。
+        assertFalse(isRetryableFailure(ModelError.RateLimited("429")))
         assertTrue(isRetryableFailure(ModelError.Server("500")))
         assertTrue(isRetryableFailure(ModelError.Network("timeout")))
     }
@@ -131,7 +134,34 @@ class GenerationWorkerLogicTest {
     }
 
     @Test
+    fun deterministicRuntimeFailures_areNotRetryable() {
+        assertFalse(isRetryableFailure(IndexOutOfBoundsException("bug")))
+        assertFalse(isRetryableFailure(NullPointerException("bug")))
+    }
+
+    @Test
     fun ioErrors_areRetryable() {
         assertTrue(isRetryableFailure(IOException("disk busy")))
+    }
+
+    @Test
+    fun failureReason_keepsTheOriginalMessage() {
+        assertEquals("接口地址没有填", failureReason(IllegalStateException("接口地址没有填")))
+    }
+
+    /**
+     * 没有 message 的异常（超时、被系统收走）不能退化成「请检查网络与模型配置后重试」。
+     *
+     * 那句话会让人去改配置，而真实原因多半是长任务在后台被系统掐断——
+     * 配置一点问题都没有，越改越远。没原因就如实说没原因，并指到能查到原因的地方。
+     */
+    @Test
+    fun failureReason_withoutMessageExplainsTheInterruption() {
+        val reason = failureReason(Throwable())
+        assertTrue(reason.contains("被中断"))
+        assertTrue(reason.contains("诊断日志"))
+        assertFalse(reason.contains("请检查网络与模型配置"))
+        // Error 也要能给出一句话，不能因为不是 Exception 就留下空白
+        assertTrue(failureReason(StackOverflowError()).contains("被中断"))
     }
 }

@@ -20,8 +20,8 @@ internal class VolumeRouter : ModelRouter {
     /** 首次规划返回几章。用来验证「模型多给了也只收前 8 章」 */
     var bibleChapterCount: Int = 5
 
-    /** 续卷章节要讲的知识点标题。默认讲还没讲过的那两个 */
-    var nextVolumeNodeTitles: List<String> = listOf("遗嘱继承", "法定继承")
+    /** 续卷章节要讲的知识点标题。默认从提示词的「待讲」清单取（见 [nextVolumeJson]） */
+    var nextVolumeNodeTitles: List<String> = DEFAULT_NEXT_TITLES
 
     var failNextVolume: Boolean = false
 
@@ -39,11 +39,13 @@ internal class VolumeRouter : ModelRouter {
             request.user.contains("[[MAP_CHAIN]]") -> chainNodesJson(request.user)
             request.user.contains("[[MAP_AUDIT]]") -> AUDIT_JSON
             request.user.contains("[[MAP]]") -> SKELETON_JSON
+            request.user.contains("[[OUTLINE]]") -> RouteStubs.outlineJson(request.user)
+            request.user.contains("[[CONTRACT]]") -> RouteStubs.contractJson(request.user)
             request.user.contains("[[BIBLE]]") -> bibleJson()
             request.user.contains("[[VOLUME]]") -> {
                 lastNextVolumePrompt = request.user
                 if (failNextVolume) return Result.failure(ModelError.Server("500"))
-                nextVolumeJson()
+                nextVolumeJson(request.user)
             }
             request.user.contains("[[CHAPTER]]") -> chapterJson(request.user)
             request.user.contains("[[VERIFY]]") -> """{"issues":[]}"""
@@ -70,8 +72,29 @@ internal class VolumeRouter : ModelRouter {
             """"conflict":"遗产纠纷","style":"悬疑","chapters":[$chapters]}"""
     }
 
-    private fun nextVolumeJson(): String {
-        val chapters = nextVolumeNodeTitles.mapIndexed { index, title ->
+    /**
+     * 续卷产出。
+     *
+     * 默认讲 [nextVolumeNodeTitles]（显式指定的一组）；没显式指定时，从提示词的
+     * 「待讲」清单里取——三段式之后第一卷会吃掉全部种子节点，续卷讲什么必须看
+     * 实际还剩什么，写死两个标题会让「待讲节点被清空」这类用例永远对不上。
+     */
+    private fun nextVolumeJson(prompt: String = ""): String {
+        // 「待讲」走的是 formatNodesWithDerivation，格式是逐行的「- 标题：定义」，
+        // 不是逗号分隔的清单——按行取标题，否则解析出来永远是空
+        // 「待讲=」后面第一段就是第一行（没有换行前缀），所以整段都要扫，
+        // 不能 drop(1)——那会吃掉第一个待讲节点
+        val pending = prompt.substringAfter("待讲=", "")
+            .lineSequence()
+            .mapNotNull { NODE_IN_PROMPT.find(it)?.groupValues?.get(1)?.trim() }
+            .filter { it.isNotBlank() }
+            .toList()
+        val titles = if (nextVolumeNodeTitles !== DEFAULT_NEXT_TITLES) {
+            nextVolumeNodeTitles
+        } else {
+            pending.ifEmpty { nextVolumeNodeTitles }
+        }
+        val chapters = titles.mapIndexed { index, title ->
             """{"order":${index + 1},"title":"新卷第${index + 1}章","plotGoal":"讲$title",""" +
                 """"learningGoals":["$title"],"nodeTitles":["$title"],"wordTarget":1200,""" +
                 """"openingHook":"新卷第${index + 1}章的开场","closingHook":"新卷第${index + 1}章的口子","chapterType":"INTRODUCE",""" +
@@ -106,6 +129,9 @@ internal class VolumeRouter : ModelRouter {
     private companion object {
         /** 从章节提示词里取出本章第一个知识点标题（formatNodesWithDerivation 的「- 标题：定义」格式） */
         val NODE_IN_PROMPT = Regex("- ([^：\\n]+)：")
+
+        /** 续卷默认标题。用 identity 比较来区分「用户显式指定」与「跟随待讲清单」 */
+        val DEFAULT_NEXT_TITLES = listOf("遗嘱继承", "法定继承")
 
         const val MAP_JSON =
             """{"nodes":[""" +
@@ -143,6 +169,8 @@ internal class VolumePromptProvider : PromptProvider {
         "knowledge_map" to "[[MAP]]",
         "knowledge_map_model" to "[[MAP]]",
         "story_bible" to "[[BIBLE]]",
+        "route_outline" to RouteStubs.OUTLINE_TEMPLATE,
+        "chapter_contract" to RouteStubs.CONTRACT_TEMPLATE,
         // 续卷提示词保留几个关键字段，用来断言喂进去的到底是什么
         "next_volume" to "[[VOLUME]] 累积状态={runningState} 上一章结束时的处境={lastEndingState} " +
             "已讲={coveredTitles} 待讲={pendingNodes}",

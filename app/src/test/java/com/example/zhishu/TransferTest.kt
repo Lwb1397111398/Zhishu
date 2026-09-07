@@ -12,7 +12,7 @@ import com.example.zhishu.domain.model.Citation
 import com.example.zhishu.domain.model.CitationStatus
 import com.example.zhishu.domain.model.IssueResolution
 import com.example.zhishu.domain.model.IssueType
-import com.example.zhishu.domain.model.ModelConfig
+import com.example.zhishu.domain.model.ApiProfile
 import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.domain.model.NodeGenerateStatus
 import com.example.zhishu.domain.model.VerificationIssue
@@ -333,9 +333,9 @@ class TransferTest {
     @Test
     fun export_neverContainsApiKey() = runBlocking {
         DemoSeeder.seed(container)
-        container.settingsRepository.saveConfig(
-            ModelConfig(
-                role = ModelRole.STORY.name,
+        container.settingsRepository.saveProfile(
+            ApiProfile(
+                name = "含密钥方案",
                 baseUrl = "https://example.com/v1",
                 modelName = "test-model",
                 keyRef = "enc:super-secret-key",

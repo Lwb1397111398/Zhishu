@@ -43,7 +43,7 @@ internal class ScriptedRouter : ModelRouter {
      */
     var onPhase: (suspend (Phase) -> Unit)? = null
 
-    enum class Phase { MAP, BIBLE, CHAPTER, VERIFY, QUIZ, REWRITE }
+    enum class Phase { MAP, OUTLINE, CONTRACT, BIBLE, CHAPTER, VERIFY, QUIZ, REWRITE }
 
     var chapterJson: String =
         """{"title":"第一章","summary":"老人立下遗嘱","endingState":"遗嘱真伪待查",""" +
@@ -104,6 +104,8 @@ internal class ScriptedRouter : ModelRouter {
             request.user.contains("[[MAP_SKELETON]]") ||
                 request.user.contains("[[MAP_CHAIN]]") ||
                 request.user.contains("[[MAP_AUDIT]]") -> Phase.MAP
+            request.user.contains("[[OUTLINE]]") -> Phase.OUTLINE
+            request.user.contains("[[CONTRACT]]") -> Phase.CONTRACT
             request.user.contains("[[BIBLE]]") -> Phase.BIBLE
             request.user.contains("[[CHAPTER]]") -> Phase.CHAPTER
             request.user.contains("[[VERIFY]]") -> Phase.VERIFY
@@ -121,10 +123,12 @@ internal class ScriptedRouter : ModelRouter {
             request.user.contains("[[MAP_SKELETON]]") -> skeletonJson
             request.user.contains("[[MAP_CHAIN]]") -> chainNodesJson(request.user)
             request.user.contains("[[MAP_AUDIT]]") -> auditJson
+            request.user.contains("[[OUTLINE]]") -> RouteStubs.outlineJson(request.user)
+            request.user.contains("[[CONTRACT]]") -> RouteStubs.contractJson(request.user)
             Phase.BIBLE == phase -> BIBLE_JSON
-            Phase.CHAPTER == phase -> chapterJson
+            Phase.CHAPTER == phase -> chapterJsonWithPromptNodes(request.user)
             Phase.VERIFY == phase -> verifyQueue.removeFirstOrNull() ?: verifyJson
-            Phase.QUIZ == phase -> quizJson
+            Phase.QUIZ == phase -> quizJsonWithPromptNodes(request.user)
             Phase.REWRITE == phase -> rewriteQueue.removeFirstOrNull() ?: rewriteJson
             else -> error("没有匹配的测试数据: ${request.user.take(40)}")
         }
@@ -135,7 +139,32 @@ internal class ScriptedRouter : ModelRouter {
         }
     }
 
+    /**
+     * 把正文/测验桩里的知识点替换成**本章实际关联的知识点**。
+     *
+     * 三段式之后章节关联哪些节点由大纲桩分配（轮转取），不再固定是「意思表示」。
+     * 核验器要求正文标注的知识点属于本章，写死了就会报
+     * 「知识讲解段落没有关联到任何既有知识点」——那是校验在正常工作，
+     * 不该靠写死一个恰好存在的标题去绕过。
+     */
+    private fun chapterJsonWithPromptNodes(user: String): String {
+        val node = NODE_IN_PROMPT.find(user)?.groupValues?.get(1)?.trim() ?: return chapterJson
+        val fallback = FALLBACK_NODE.find(chapterJson)?.groupValues?.get(1) ?: return chapterJson
+        return chapterJson.replace(fallback, node)
+    }
+
+    private fun quizJsonWithPromptNodes(user: String): String {
+        val node = NODE_IN_PROMPT.find(user)?.groupValues?.get(1)?.trim() ?: return quizJson
+        val fallback = NODE_IN_PROMPT.find(quizJson)?.groupValues?.get(1) ?: return quizJson
+        return quizJson.replace(fallback, node)
+    }
+
     private companion object {
+        /** 从章节提示词里取出本章第一个知识点标题（formatNodesWithDerivation 的「- 标题：定义」格式） */
+        val NODE_IN_PROMPT = Regex("- ([^：\\n]+)：")
+
+        /** 正文桩里写死的知识点标题（"knowledgeNodeTitles":["X"] 的第一处） */
+        val FALLBACK_NODE = Regex(""""knowledgeNodeTitles":\["([^"]+)"""")
         /** 批次化骨架：一条链、两个节点（演进链最小结构），与旧 MAP_JSON 语义一致 */
         const val SKELETON_JSON =
             """{"chains":[{"theme":"民法演进","opening":"从合同纠纷开始","nodeTitles":["意思表示","民事法律行为"]}],"gaps":[],"conflicts":[]}"""
@@ -179,6 +208,9 @@ internal class TaggedPromptProvider(
         "knowledge_map" to "[[MAP_SKELETON]]",
         "knowledge_map_model" to "[[MAP_SKELETON]]",
         "story_bible" to "[[BIBLE]]",
+        "route_outline" to RouteStubs.OUTLINE_TEMPLATE,
+        "chapter_contract" to RouteStubs.CONTRACT_TEMPLATE,
+        "next_volume" to "[[BIBLE]]",
         "chapter" to chapterTemplate,
         "verify" to verifyTemplate,
         "verify_model" to verifyTemplate,
@@ -186,5 +218,13 @@ internal class TaggedPromptProvider(
         "rewrite_block" to rewriteTemplate,
     )
 
-    override fun load(name: String): String = map[name] ?: name
+    /**
+     * 缺模板一律抛错，不静默返回模板名。
+     *
+     * 之前是 `map[name] ?: name`：漏配一个模板，模型收到的就是 "route_outline"
+     * 这串名字本身，失败点表现为「模型返回乱码/解析失败」，和真正的模板缺失隔了
+     * 三层调用栈，查起来非常费劲。缺模板是测试桩的bug，必须当场炸出来。
+     */
+    override fun load(name: String): String =
+        map[name] ?: error("TaggedPromptProvider 缺模板: $name（新增 stage 时请在这里补映射）")
 }

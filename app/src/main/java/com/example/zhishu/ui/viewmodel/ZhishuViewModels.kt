@@ -1,13 +1,16 @@
 package com.example.zhishu.ui.viewmodel
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.work.WorkManager
 import com.example.zhishu.ZhishuApp
+import com.example.zhishu.ai.pipeline.KnowledgeMapMode
 import com.example.zhishu.ai.pipeline.NextVolumeAvailability
 import com.example.zhishu.di.AppContainer
 import com.example.zhishu.domain.model.AnswerRecord
+import com.example.zhishu.domain.model.ApiProfile
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
@@ -15,8 +18,8 @@ import com.example.zhishu.domain.model.ChapterVersionStatus
 import com.example.zhishu.domain.model.GENRE_AUTO
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.KnowledgeGap
+import com.example.zhishu.domain.model.KnowledgeMapBatch
 import com.example.zhishu.domain.model.KnowledgeNode
-import com.example.zhishu.domain.model.ModelConfig
 import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.ProjectStatus
@@ -38,12 +41,18 @@ import com.example.zhishu.worker.EnqueueResult
 import com.example.zhishu.worker.GenerationEnqueuer
 import com.example.zhishu.worker.GenerationWorker
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.retryWhen
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -51,6 +60,39 @@ import kotlinx.coroutines.launch
 abstract class ZhishuViewModel(app: Application) : AndroidViewModel(app) {
     protected val container: AppContainer
         get() = (getApplication<Application>() as ZhishuApp).container
+
+    /**
+     * 带兜底的后台任务：失败先等一小会儿重试一次（覆盖数据库预热尚未完成的窗口），
+     * 仍失败只记日志。没有这层时，Room 抛出的任何异常都会顺着 viewModelScope
+     * 冒成未捕获异常，直接杀死进程——用户看到的就是「一打开就闪退」。
+     * CancellationException 必须原样抛出，否则页面销毁后协程取消会被吞掉。
+     */
+    protected fun launchSafely(tag: String, block: suspend () -> Unit): Job =
+        viewModelScope.launch {
+            runWithRetry(tag, block)
+        }
+
+    private suspend fun runWithRetry(tag: String, block: suspend () -> Unit) {
+        try {
+            block()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(tag, "后台任务失败，${RETRY_DELAY_MS}ms 后重试一次", e)
+            delay(RETRY_DELAY_MS)
+            try {
+                block()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(tag, "重试仍失败，放弃本次操作", e)
+            }
+        }
+    }
+
+    private companion object {
+        const val RETRY_DELAY_MS = 1500L
+    }
 }
 
 private fun now(): Long = System.currentTimeMillis()
@@ -88,6 +130,23 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
 
     val projects: StateFlow<List<Project>> =
         container.projectRepository.observeAll()
+            .retryWhen { cause, attempt ->
+                // 数据库可能还在预热或自愈：稍等重订一次，别让异常炸掉 Compose 组合
+                if (cause is CancellationException) {
+                    false
+                } else if (attempt < SUBSCRIBE_RETRIES) {
+                    delay(SUBSCRIBE_RETRY_DELAY_MS)
+                    true
+                } else {
+                    false
+                }
+            }
+            .catch { cause ->
+                // 取消要照常传播，否则页面退出后 Flow 还挂着
+                if (cause is CancellationException) throw cause
+                // 持续失败（理论上只在故障时发生）：先给空列表，页面保持可用
+                emit(emptyList())
+            }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _dueCount = MutableStateFlow(0)
@@ -104,7 +163,7 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
     }
 
     fun refresh() {
-        viewModelScope.launch {
+        launchSafely("HomeViewModel") {
             _dueCount.value = if (spacedReviewEnabled.value) {
                 container.reviewRepository.getDue(now()).size
             } else {
@@ -122,17 +181,23 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
     }
 
     fun deleteProject(projectId: String) {
-        viewModelScope.launch {
+        launchSafely("HomeViewModel") {
             deleteProjectCompletely(container, projectId)
             refresh()
         }
     }
 
     fun seedDemo() {
-        viewModelScope.launch {
+        launchSafely("HomeViewModel") {
             DemoSeeder.seed(container)
             refresh()
         }
+    }
+
+    private companion object {
+        /** Room Flow 订阅失败的重订次数与间隔；给数据库预热/自愈留出时间窗口 */
+        const val SUBSCRIBE_RETRIES = 3
+        const val SUBSCRIBE_RETRY_DELAY_MS = 800L
     }
 }
 
@@ -151,6 +216,14 @@ class CreateProjectViewModel(app: Application) : ZhishuViewModel(app) {
     val topic = MutableStateFlow("")
     val baseline = MutableStateFlow("完全不了解")
     val depth = MutableStateFlow("入门")
+    /**
+     * 学习画像三项。「想学什么」太笼统——同样填「民法」，民商法研究生、
+     * 非法学自学者、法考考生要的知识主干切法完全不同（见 LearnerProfile）。
+     * 三项都不是必填：不填就按「完全陌生、想建立整体理解」处理，行为与改造前一致。
+     */
+    val learningGoal = MutableStateFlow("")
+    val learningPurpose = MutableStateFlow("")
+    val learnerIdentity = MutableStateFlow("")
     // 默认让 AI 自选讲法：用户往往不知道一门学科适合什么风格（问题6）
     val genre = MutableStateFlow(GENRE_AUTO)
     // 默认无需资料：像民法这类学科用户很难找到合适资料（问题3）
@@ -228,6 +301,9 @@ class CreateProjectViewModel(app: Application) : ZhishuViewModel(app) {
                 createdAt = now(),
                 updatedAt = now(),
                 sourceMode = sourceMode.value,
+                learningGoal = learningGoal.value.trim(),
+                learningPurpose = learningPurpose.value.trim(),
+                learnerIdentity = learnerIdentity.value.trim(),
             )
 
             // 阶段一：只解析，不落库
@@ -285,6 +361,14 @@ class ProjectDetailViewModel(
         container.knowledgeRepository.observeByProject(projectId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    /**
+     * 知识主干生成批次（分步生成）：知识地图页靠它显示「几条链已展开 / 几条失败」，
+     * 并把「继续展开」与「重新梳理」区分开——批次没完成时点继续只补没做完的部分。
+     */
+    val mapBatch: StateFlow<KnowledgeMapBatch?> =
+        container.knowledgeRepository.observeLatestBatch(projectId)
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
     val gaps: StateFlow<List<KnowledgeGap>> =
         container.knowledgeRepository.observeGaps(projectId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -317,6 +401,14 @@ class ProjectDetailViewModel(
     /** 正在局部重写的章节 ID。防连点，也让卡片能显示「正在修改」 */
     private val _rewriting = MutableStateFlow<Set<String>>(emptySet())
     val rewriting: StateFlow<Set<String>> = _rewriting
+
+    /** 正在补契约的章节 ID。同样是防连点（契约是一次模型调用，重复点会重复扣额度） */
+    private val _retryingContracts = MutableStateFlow<Set<String>>(emptySet())
+    val retryingContracts: StateFlow<Set<String>> = _retryingContracts
+
+    /** 正在补知识点的缺口 ID。防连点：补一个节点也是一次模型调用，重复点会重复扣额度 */
+    private val _patchingGaps = MutableStateFlow<Set<String>>(emptySet())
+    val patchingGaps: StateFlow<Set<String>> = _patchingGaps
 
     /**
      * 当前正文里出处没对上的引用条数（4C）：未确认 + 来源已删除。
@@ -625,16 +717,61 @@ class ProjectDetailViewModel(
         }
     }
 
-    fun deleteSource(sourceId: String) {        viewModelScope.launch {
+    fun deleteSource(sourceId: String) {
+        viewModelScope.launch {
             // 引用这份资料的正文块不动，只把引用降级成「未确认」（4A）。
             // 正文里那段话还在，它当初确实有依据；删掉引用会让它看起来
             // 从来没打算给出处，读者也就不会想到去核对
             container.inTransaction {
+                val removedChunkIds = container.sourceRepository.getChunks(sourceId)
+                    .map { it.id }
+                    .toSet()
                 container.citationRepository.unconfirmForSource(sourceId)
+                if (removedChunkIds.isNotEmpty()) {
+                    dropChunkRefsFromNodes(projectId, removedChunkIds)
+                    dropChunkRefsFromIssues(projectId, removedChunkIds)
+                }
                 container.sourceRepository.delete(sourceId)
             }
             _message.value = "已删除资料。引用过它的正文段落会标为「需要核对」，正文不受影响。"
         }
+    }
+
+    /**
+     * 把已删片段的 ID 从知识节点的引用里摘掉。
+     *
+     * 只改 sourceRefs 一个字段，其余照抄——节点上还有掌握度、确认位、章节回写
+     * 等用户与流程各自维护的状态，用整行覆盖会把它们一起冲掉（N13 定过的口径）。
+     */
+    private suspend fun dropChunkRefsFromNodes(projectId: String, removedChunkIds: Set<String>) {
+        val affected = container.knowledgeRepository.getByProjectAll(projectId)
+            .filter { node -> node.sourceRefs.any { it in removedChunkIds } }
+        if (affected.isEmpty()) return
+        container.knowledgeRepository.upsertAll(
+            affected.map { node ->
+                node.copy(sourceRefs = node.sourceRefs.filter { it !in removedChunkIds })
+            },
+        )
+    }
+
+    /**
+     * 同 [dropChunkRefsFromNodes]，作用在核验问题上（4B）。
+     *
+     * **只清当前版本**：历史版本的问题说的是已经被替换掉的那版文字，
+     * 界面上一律不展示（`VersionHardeningTest` 的 `historyReads_areConfinedToBackupExport`
+     * 就是拦这件事的——业务层读 AllVersions 会让用户看到一堆说的是不存在文字的问题）。
+     * 这里要修的是「点开是空白」的可见坏链接，当前版本清干净就达到目的；
+     * 历史版本那条记录连同它的引用一起留在库里，本来就是刻意保留的现场。
+     */
+    private suspend fun dropChunkRefsFromIssues(projectId: String, removedChunkIds: Set<String>) {
+        val affected = container.issueRepository.getActiveByProject(projectId)
+            .filter { issue -> issue.sourceRefs.any { it in removedChunkIds } }
+        if (affected.isEmpty()) return
+        container.issueRepository.upsertAll(
+            affected.map { issue ->
+                issue.copy(sourceRefs = issue.sourceRefs.filter { it !in removedChunkIds })
+            },
+        )
     }
 
     /** 只写确认位，避免整行 upsert 覆盖掌握度或章节回写结果（N13） */
@@ -664,9 +801,47 @@ class ProjectDetailViewModel(
         }
     }
 
-    fun enqueueKnowledgeMap() {
-        launchEnqueue("已开始梳理知识主干（需要网络）") {
-            GenerationEnqueuer.knowledgeMap(getApplication(), projectId)
+    /**
+     * 梳理知识主干。[mode] 决定节奏：默认 FULL 一口气跑完（重新梳理走这个）；
+     * SKELETON 只出骨架（首次生成先看结构再决定）；NEXT_CHAIN 单步推一条链。
+     */
+    fun enqueueKnowledgeMap(mode: KnowledgeMapMode = KnowledgeMapMode.FULL) {
+        val message = when (mode) {
+            KnowledgeMapMode.FULL -> "已开始梳理知识主干（需要网络）"
+            KnowledgeMapMode.SKELETON -> "已开始梳理骨架，完成后可逐条或全部展开（需要网络）"
+            KnowledgeMapMode.NEXT_CHAIN -> "已开始展开下一条演进链（需要网络）"
+        }
+        launchEnqueue(message) {
+            GenerationEnqueuer.knowledgeMap(getApplication(), projectId, mode)
+        }
+    }
+
+    /**
+     * 放弃当前批次，从头重新梳理知识主干（B1）。
+     *
+     * 批次没完成时「重新梳理」走的是续跑（`enqueueKnowledgeMap(FULL)`）：只补没做完的
+     * 链/审计，节点数和结构都是旧骨架的。换模型、改资料后想彻底重来，旧批次必须
+     * 显式作废，否则生成流程永远把旧骨架当断点续接。
+     */
+    fun restartKnowledgeMap() {
+        viewModelScope.launch {
+            val latest = container.knowledgeRepository.getLatestBatch(projectId)
+            if (latest != null && !latest.completed && !latest.failed) {
+                // 未完成批次先作废，保证下一步生成开新批次、重新出骨架
+                val ok = runCatching {
+                    container.knowledgeRepository.saveBatch(
+                        latest.copy(failed = true, updatedAt = System.currentTimeMillis()),
+                    )
+                }.isSuccess
+                if (!ok) {
+                    _message.value = "丢弃失败，请重试。旧批次仍在，重试不会重复扣费。"
+                    return@launch
+                }
+                _message.value = "已丢弃当前进度，将从新骨架重头开始。"
+            }
+            launchEnqueue("已开始从头梳理知识主干（需要网络）") {
+                GenerationEnqueuer.knowledgeMap(getApplication(), projectId, KnowledgeMapMode.SKELETON)
+            }
         }
     }
 
@@ -686,13 +861,17 @@ class ProjectDetailViewModel(
         }
     }
 
-    /** 一键开讲：知识地图 → 讲述路线 → 首章，一次点完（问题4） */
+    /** 一键开讲：知识地图 → 讲述路线 → 首章，一次点完（问题4）。知识地图走 FULL 全自动展开 */
     fun enqueueOneTap() {
         launchEnqueue("已开始，将依次完成知识梳理、路线规划和第一章") {
+            // needsMap 不只看节点是否为空：分步生成可能停在「骨架完成、链未展开」，
+            // 那些占位节点没有内容，讲述路线等不了——批次没完成就得把地图跑完
+            val mapIncomplete = container.knowledgeRepository.getLatestBatch(projectId)
+                ?.let { !it.completed } == true
             GenerationEnqueuer.oneTap(
                 context = getApplication(),
                 projectId = projectId,
-                needsMap = container.knowledgeRepository.getByProject(projectId).isEmpty(),
+                needsMap = mapIncomplete || container.knowledgeRepository.getByProject(projectId).isEmpty(),
                 needsBible = container.chapterRepository.getPlans(projectId).isEmpty(),
             )
         }
@@ -704,17 +883,38 @@ class ProjectDetailViewModel(
         _message.value = "已取消生成。已经写好的章节不受影响。"
     }
 
-    /** 切换知识来源模式（问题3）。切换后既有知识地图与章节都失效，需重新生成。 */
+    /**
+     * 切换知识来源模式（问题3）。
+     *
+     * 只改变**以后**怎么生成：已生成的知识主干与已发布的章节一个字不动，
+     * 引用关系也原样保留。（早先这里写着「既有知识地图与章节都失效」，与实现
+     * 不符——实现从没删过任何东西，那条注释把用户吓退了又没兑现。）
+     * 想让新设置真的生效，重新梳理知识主干即可。
+     */
     fun setSourceMode(mode: SourceMode) {
         viewModelScope.launch {
             val current = container.projectRepository.get(projectId) ?: return@launch
             if (current.sourceMode == mode) return@launch
             container.projectRepository.update(current.copy(sourceMode = mode, updatedAt = now()))
             _message.value = when (mode) {
-                SourceMode.MODEL -> "已切换到 AI 自备知识模式，可直接开始梳理知识主干"
-                SourceMode.DOCUMENTS -> "已切换到以资料为准模式，请先添加学习资料"
+                SourceMode.MODEL -> "已切换到 AI 自备知识模式。已生成的内容不受影响；重新梳理知识主干后按新设置生成。"
+                SourceMode.DOCUMENTS -> "已切换到以资料为准模式。已生成的内容不受影响；重新梳理知识主干后按新设置生成。"
             }
         }
+    }
+
+    /**
+     * 切换知识来源模式前，是否需要先让用户确认。
+     *
+     * 已经生成过内容时才问：那说明用户可能没意识到「切换不会改写已有内容」——
+     * 有人是冲着「重来一遍」点它的，也有人只是想看看。空项目切换没有任何代价，
+     * 多一次弹窗反而把最顺的那条路堵住。
+     */
+    suspend fun needsSourceModeConfirm(mode: SourceMode): Boolean {
+        val current = container.projectRepository.get(projectId) ?: return false
+        if (current.sourceMode == mode) return false
+        return container.knowledgeRepository.getByProject(projectId).isNotEmpty() ||
+            container.chapterRepository.getPlans(projectId).isNotEmpty()
     }
 
     /** 修改风格（含「AI 自由发挥」）。改完需重新规划讲述路线才生效（问题6） */
@@ -769,6 +969,88 @@ class ProjectDetailViewModel(
                 "自测题已生成"
             } else {
                 "自测题仍未生成：${result.exceptionOrNull()?.message ?: "未知原因"}。正文不受影响。"
+            }
+        }
+    }
+
+    /**
+     * 单独重试一章的因果契约（三段式）。
+     *
+     * 走同步调用而不是 Worker：契约是一次短调用，用户是在章节卡片上主动点的。
+     * 更重要的是它绝不碰正文——重试契约只会让这一章从「不能写」变成「能写」，
+     * 已经写好的正文一个字都不会动。
+     */
+    fun retryChapterContract(planId: String) {
+        viewModelScope.launch {
+            if (planId in _retryingContracts.value) return@launch
+            _retryingContracts.value = _retryingContracts.value + planId
+            _message.value = "正在补这一章的因果契约…"
+            val result = runCatching { container.pipeline.retryChapterContract(projectId, planId) }
+                .getOrElse { Result.failure(it) }
+            _message.value = if (result.isSuccess) {
+                "契约已生成，这一章可以写正文了"
+            } else {
+                "契约仍未生成：${result.exceptionOrNull()?.message ?: "未知原因"}"
+            }
+            _retryingContracts.value = _retryingContracts.value - planId
+        }
+    }
+
+    /**
+     * 按一条「漏掉的知识点」把它补进知识主干（gaps 闭环）。
+     *
+     * 只补**一个**节点、只发**一次**调用——为一条缺口重跑整张地图（几万 token、
+     * 几分钟）是纯粹的浪费。补完这条提示自动变成「已补上」，移出待办区。
+     */
+    fun patchKnowledgeGap(gapId: String) {
+        viewModelScope.launch {
+            if (gapId in _patchingGaps.value) return@launch
+            _patchingGaps.value = _patchingGaps.value + gapId
+            _message.value = "正在补上这个知识点…"
+            val result = runCatching { container.pipeline.generateKnowledgeMapPatch(projectId, gapId) }
+                .getOrElse { Result.failure(it) }
+            val title = result.getOrNull().orEmpty()
+            _message.value = if (result.isSuccess) {
+                "已补上「$title」，写下一卷时它会讲进去"
+            } else {
+                "没补上：${result.exceptionOrNull()?.message ?: "未知原因"}"
+            }
+            _patchingGaps.value = _patchingGaps.value - gapId
+        }
+    }
+
+    /**
+     * 点「知道了」：把一条可补的缺口移出待办。
+     *
+     * 只有「漏掉的知识点」能关。过时 / 地区差异 / 各家说法不一这类是免责提示，
+     * 不是待办，后端也会拒绝关闭——它们要一直提醒用户核对权威出处。
+     */
+    fun dismissKnowledgeGap(gapId: String) {
+        viewModelScope.launch {
+            val result = runCatching { container.pipeline.dismissGap(projectId, gapId) }
+                .getOrElse { Result.failure(it) }
+            _message.value = if (result.isSuccess) {
+                "已移出待办"
+            } else {
+                "没能移出：${result.exceptionOrNull()?.message ?: "未知原因"}"
+            }
+        }
+    }
+
+    /**
+     * 点「知道了」：把一条资料冲突移出「别只信AI」。
+     *
+     * 冲突没有「补上」一说，只有「我知道了，别再提示」。关闭状态按 topic 继承，
+     * 重新梳理后不会复活。
+     */
+    fun dismissKnowledgeConflict(conflictId: String) {
+        viewModelScope.launch {
+            val result = runCatching { container.pipeline.dismissConflict(projectId, conflictId) }
+                .getOrElse { Result.failure(it) }
+            _message.value = if (result.isSuccess) {
+                "已移出待办"
+            } else {
+                "没能移出：${result.exceptionOrNull()?.message ?: "未知原因"}"
             }
         }
     }
@@ -1126,6 +1408,7 @@ class ReviewViewModel(app: Application) : ZhishuViewModel(app) {
     }
 }
 
+@OptIn(kotlinx.coroutines.FlowPreview::class)
 class SearchViewModel(
     app: Application,
     initialProjectId: String?,
@@ -1155,6 +1438,26 @@ class SearchViewModel(
                 else -> ""
             }
         }
+        // 输入停顿后自动搜索（用户反馈：改了词没点搜索，页面还挂着上一次的结果，
+        // 看起来「内容与输入不匹配」）。手动 search()（键盘搜索键/放大镜）保留，
+        // 两者并存：debounce 只是把「等用户点」变成「等用户停」。
+        // query 是 StateFlow，天然只在值变化时发射，无需再 distinctUntilChanged
+        viewModelScope.launch {
+            query.debounce(SEARCH_DEBOUNCE_MILLIS)
+                .collectLatest { search() }
+        }
+    }
+
+    /**
+     * 页面复用同一个 ViewModel 时（key 固定为 "search"），把新入口带来的项目
+     * 应用到已有实例上——否则从项目页进入搜索时选中的还是上一个项目。
+     */
+    fun applyInitialProject(projectId: String?) {
+        if (projectId.isNullOrBlank()) return
+        if (selectedProjectId.value == projectId) return
+        selectedProjectId.value = projectId
+        // selectedProjectId 不在 debounce 流里，切项目后立刻按当前词重搜
+        search()
     }
 
     fun search() {
@@ -1171,13 +1474,15 @@ class SearchViewModel(
         }
     }
 
-    fun openResult(hit: SearchHit): Pair<String, String?>? =
-        hit.chapterId?.let { it to hit.blockId }
+    private companion object {
+        /** 输入停顿多久后自动搜索。太短会边打字边打库，太长显得迟钝 */
+        const val SEARCH_DEBOUNCE_MILLIS = 400L
+    }
 }
 
 class SettingsViewModel(app: Application) : ZhishuViewModel(app) {
 
-    /** 某个角色的可选模型列表状态（问题1） */
+    /** 某个配置方案的模型列表搜索状态（问题1）。key 为方案 id，新增草稿用 [NEW_PROFILE_KEY] */
     sealed interface ModelListState {
         data object Idle : ModelListState
         data object Loading : ModelListState
@@ -1185,19 +1490,47 @@ class SettingsViewModel(app: Application) : ZhishuViewModel(app) {
         data class Failed(val reason: String) : ModelListState
     }
 
-    private val _configs = MutableStateFlow<List<ModelConfig>>(emptyList())
-    val configs: StateFlow<List<ModelConfig>> = _configs
+    /** 方案库：所有已保存的 API 配置方案 */
+    private val _profiles = MutableStateFlow<List<ApiProfile>>(emptyList())
+    val profiles: StateFlow<List<ApiProfile>> = _profiles
+
+    /** 三档分工各自指向的方案 id（null = 未配置） */
+    private val _assignments = MutableStateFlow<Map<ModelRole, Long?>>(emptyMap())
+    val assignments: StateFlow<Map<ModelRole, Long?>> = _assignments
+
+    /**
+     * 正在编辑的方案：null = 没有在编辑；[NEW_PROFILE_KEY] = 新增草稿；其余 = 方案 id。
+     * 方案库一次只允许编辑一张卡，避免多张卡同时处于半保存状态。
+     */
+    private val _editingProfileId = MutableStateFlow<Long?>(null)
+    val editingProfileId: StateFlow<Long?> = _editingProfileId
 
     private val _busy = MutableStateFlow(false)
     val busy: StateFlow<Boolean> = _busy
 
-    /** 各角色的连通性测试结果（B18） */
-    private val _testResults = MutableStateFlow<Map<ModelRole, String>>(emptyMap())
-    val testResults: StateFlow<Map<ModelRole, String>> = _testResults
+    /** 各方案的连通性测试结果（B18）。key 同 [ModelListState] */
+    private val _testResults = MutableStateFlow<Map<Long, String>>(emptyMap())
+    val testResults: StateFlow<Map<Long, String>> = _testResults
 
-    /** 各角色搜索到的可用模型（问题1）。用户从列表里挑，不用手打模型名。 */
-    private val _modelLists = MutableStateFlow<Map<ModelRole, ModelListState>>(emptyMap())
-    val modelLists: StateFlow<Map<ModelRole, ModelListState>> = _modelLists
+    /** 各方案搜索到的可用模型（问题1）。用户从列表里挑，不用手打模型名。 */
+    private val _modelLists = MutableStateFlow<Map<Long, ModelListState>>(emptyMap())
+    val modelLists: StateFlow<Map<Long, ModelListState>> = _modelLists
+
+    /**
+     * 当前打开着「选择模型」弹窗的方案 key。
+     *
+     * **必须放在 ViewModel 里**，不能是界面的局部状态。原来弹窗开关是
+     * 组合里的 `remember { mutableStateOf(false) }`，而触发它的
+     * [modelLists] 却存活在 ViewModel 中——设置页卡片都很高，滑出屏幕后
+     * 局部状态被回收、滑回来又重新组合，于是「搜到列表就自动弹窗」被反复重演。
+     * 放在这里之后，弹窗开没开是唯一的事实来源，滚动与重组都不影响它。
+     */
+    private val _pickerProfiles = MutableStateFlow<Set<Long>>(emptySet())
+    val pickerProfiles: StateFlow<Set<Long>> = _pickerProfiles
+
+    fun openPicker(profileKey: Long) = _pickerProfiles.update { it + profileKey }
+
+    fun closePicker(profileKey: Long) = _pickerProfiles.update { it - profileKey }
 
     /** 间隔复习开关（默认关）。关掉时读完章节不会自动生出复习任务 */
     val spacedReviewEnabled: StateFlow<Boolean> = container.learningPrefs.spacedReviewEnabled
@@ -1210,71 +1543,156 @@ class SettingsViewModel(app: Application) : ZhishuViewModel(app) {
 
     fun load() {
         viewModelScope.launch {
-            _configs.value = container.settingsRepository.getAllConfigs()
+            val repo = container.settingsRepository
+            _profiles.value = repo.getProfiles()
+            _assignments.value = repo.getAssignments()
         }
+    }
+
+    /** 进入编辑态：传 null 表示新增（草稿用 [NEW_PROFILE_KEY] 占位） */
+    fun startEdit(profileId: Long?) {
+        _editingProfileId.value = profileId ?: NEW_PROFILE_KEY
+    }
+
+    fun cancelEdit() {
+        _editingProfileId.value = null
     }
 
     /**
      * 用页面上当前填写的地址与 Key 搜索可用模型（问题1）。
      * 不要求先保存——否则用户得先盲填模型名才能保存，顺序正好是反的。
+     *
+     * 搜到列表时顺手打开选择弹窗（省一次点击）。注意这是**事件驱动**的：
+     * 只在搜索真正完成的那一刻开一次。
      */
-    fun fetchModels(role: ModelRole, baseUrl: String, apiKey: String) {
+    fun fetchModels(profileKey: Long, baseUrl: String, apiKey: String) {
         viewModelScope.launch {
-            _modelLists.update { it + (role to ModelListState.Loading) }
-            val result = container.router.listModelsWith(role, baseUrl, apiKey)
+            _modelLists.update { it + (profileKey to ModelListState.Loading) }
+            // 编辑已有方案且没重输 Key 时，沿用该方案已保存的 Key 密文
+            val savedKeyRef = if (profileKey == NEW_PROFILE_KEY) {
+                null
+            } else {
+                _profiles.value.firstOrNull { it.id == profileKey }?.keyRef
+            }
+            val result = container.router.listModelsWith(baseUrl, apiKey, savedKeyRef)
+            val loaded = result.getOrNull()?.let { models ->
+                models.filter { it.isNotBlank() }.distinct().sorted()
+            }
             _modelLists.update { current ->
                 current + (
-                    role to result.fold(
-                        onSuccess = { models ->
-                            val cleaned = models.filter { it.isNotBlank() }.distinct().sorted()
-                            if (cleaned.isEmpty()) {
-                                ModelListState.Failed("这个接口没有返回任何模型，可手动填写模型名")
-                            } else {
-                                ModelListState.Loaded(cleaned)
-                            }
-                        },
-                        onFailure = { ModelListState.Failed(it.message ?: "搜索失败") },
-                    )
+                    profileKey to if (loaded == null) {
+                        ModelListState.Failed(result.exceptionOrNull()?.message ?: "搜索失败")
+                    } else if (loaded.isEmpty()) {
+                        ModelListState.Failed("这个接口没有返回任何模型，可手动填写模型名")
+                    } else {
+                        ModelListState.Loaded(loaded)
+                    }
                     )
             }
+            if (loaded != null && loaded.isNotEmpty()) openPicker(profileKey)
         }
     }
 
-    fun saveConfig(config: ModelConfig, plainApiKey: String, onDone: (String) -> Unit) {
+    fun saveProfile(profile: ApiProfile, plainApiKey: String, onDone: (String) -> Unit) {
         viewModelScope.launch {
             _busy.value = true
             runCatching {
                 val keyRef = if (plainApiKey.isNotBlank()) {
                     container.encryptApiKey(plainApiKey)
                 } else {
-                    config.keyRef
+                    profile.keyRef
                 }
-                container.settingsRepository.saveConfig(config.copy(keyRef = keyRef))
-            }.onSuccess { onDone("已保存") }
-                .onFailure { onDone("保存失败：${it.message}") }
+                // 名字留空就自动编号，保证方案列表里每套都能认出来
+                val named = profile.copy(
+                    name = profile.name.ifBlank { "配置方案 ${_profiles.value.size + 1}" },
+                    keyRef = keyRef,
+                )
+                container.settingsRepository.saveProfile(named)
+            }.onSuccess {
+                onDone("已保存")
+                // 只有保存成功才退出编辑态并刷新：失败时输入得以保留，用户改完能直接重试
+                cancelEdit()
+                load()
+            }.onFailure { onDone("保存失败：${it.message}") }
             _busy.value = false
+        }
+    }
+
+    fun deleteProfile(profile: ApiProfile, onDone: (String) -> Unit) {
+        viewModelScope.launch {
+            container.settingsRepository.deleteProfile(profile.id)
+            onDone("已删除「${profile.name}」")
             load()
         }
     }
 
-    /** 拉取模型列表验证地址与 Key 是否可用（B18） */
-    fun testConnection(role: ModelRole) {
+    /** 复制一套方案（含已保存的 Key）：想用同一个服务商只改温度/模型时最快 */
+    fun duplicateProfile(profile: ApiProfile) {
+        viewModelScope.launch {
+            container.settingsRepository.saveProfile(
+                profile.copy(id = 0, name = "${profile.name}（副本）"),
+            )
+            load()
+        }
+    }
+
+    fun assignRole(role: ModelRole, profileId: Long?) {
+        viewModelScope.launch {
+            container.settingsRepository.assignRole(role, profileId)
+            load()
+        }
+    }
+
+    /** 一键把三个环节都指到同一套方案：整站试一个新 LLM 用 */
+    fun assignAll(profileId: Long?) {
+        viewModelScope.launch {
+            val repo = container.settingsRepository
+            ModelRole.entries.forEach { repo.assignRole(it, profileId) }
+            load()
+        }
+    }
+
+    /**
+     * 拉取模型列表验证地址与 Key 是否可用（B18），并追加一次**真实的最小生成调用**。
+     *
+     * 只拉 /models 测不出「模型名有效但没额度」「推理模型当普通模型用」这类失败：
+     * 列表照样返回成功，用户到生成时才炸（用户反馈：「测试连接说成功，一生成就失败」）。
+     * 现在两步都跑：列表失败就报列表问题；列表成功再做一次极小生成（几分钱以内），
+     * 把真实生成才会暴露的问题提前到配置页。
+     */
+    fun testProfile(profileKey: Long) {
         viewModelScope.launch {
             _busy.value = true
-            _testResults.update { it + (role to "正在测试…") }
-            val result = container.router.listModels(role)
-            val text = result.fold(
+            _testResults.update { it + (profileKey to "正在测试…") }
+            val listResult = container.router.listModels(profileKey)
+            val text = listResult.fold(
                 onSuccess = { models ->
-                    if (models.isEmpty()) "连接成功，但未返回模型列表" else "连接成功，可用模型 ${models.size} 个"
+                    // 列表通了，再做一次真实小生成
+                    container.router.probe(profileKey).fold(
+                        onSuccess = {
+                            if (models.isEmpty()) {
+                                "连接成功（该接口不提供模型列表，可手动填写模型名）"
+                            } else {
+                                "连接成功，可用模型 ${models.size} 个"
+                            }
+                        },
+                        // 生成失败时把原因原样带出来——多半就是「为什么生成时炸」的答案
+                        onFailure = { "接口能连通，但实际生成失败：${it.message}" },
+                    )
                 },
                 onFailure = { "连接失败：${it.message}" },
             )
-            _testResults.update { it + (role to text) }
+            _testResults.update { it + (profileKey to text) }
             _busy.value = false
         }
     }
 
     fun setBusy(value: Boolean) {
         _busy.value = value
+    }
+
+    companion object {
+        /** 新增方案的草稿 key（方案自增 id 从 1 开始，不会撞上） */
+        const val NEW_PROFILE_KEY = -1L
     }
 }

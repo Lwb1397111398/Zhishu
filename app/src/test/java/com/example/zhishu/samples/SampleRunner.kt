@@ -116,8 +116,8 @@ class SampleRunner {
         val stamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(LocalDateTime.now())
 
         val provider = com.example.zhishu.ai.OpenAiModelProvider(
-            config = com.example.zhishu.domain.model.ModelConfig(
-                role = ModelRole.STORY.name,
+            profile = com.example.zhishu.domain.model.ApiProfile(
+                name = "sample-probe",
                 baseUrl = config.baseUrl,
                 modelName = config.model,
                 maxTokens = config.maxTokens,
@@ -377,9 +377,9 @@ class SampleRunner {
         val router = ConfiguredModelRouter(
             settingsRepository = FixedSettingsRepository(config),
             keyCipherProvider = { FakeCipher(config.apiKey) },
-            providerFactory = { cfg, key ->
+            providerFactory = { profile, key ->
                 com.example.zhishu.ai.OpenAiModelProvider(
-                    config = cfg,
+                    profile = profile,
                     apiKey = key,
                     // 测试环境允许 http（本地网关）；真实服务商都是 https，由 requireSecureUrl 兜底
                     requireHttps = false,
@@ -396,7 +396,7 @@ class SampleRunner {
             prompts = FilePromptProvider(promptDir),
             projectRepository = DefaultProjectRepository(db.projectDao()),
             sourceRepository = DefaultSourceRepository(db.sourceDocumentDao(), db.sourceChunkDao()),
-            knowledgeRepository = DefaultKnowledgeRepository(db, db.knowledgeNodeDao(), db.knowledgeGapDao(), db.knowledgeConflictDao(), db.knowledgeMapBatchDao()),
+            knowledgeRepository = DefaultKnowledgeRepository(db, db.knowledgeNodeDao(), db.knowledgeGapDao(), db.knowledgeConflictDao(), db.knowledgeMapBatchDao(), db.routeBatchDao()),
             chapterRepository = DefaultChapterRepository(db.chapterPlanDao(), db.chapterBlockDao(), db.chapterVersionDao()),
             citationRepository = DefaultCitationRepository(db.citationDao()),
             issueRepository = DefaultVerificationIssueRepository(db.verificationIssueDao()),
@@ -729,21 +729,10 @@ internal class FilePromptProvider(private val dir: File) : PromptProvider {
 
 internal class FixedSettingsRepository(private val config: SampleRunner.RunConfig) :
     SettingsRepository {
-    override suspend fun getAllConfigs(): List<com.example.zhishu.domain.model.ModelConfig> =
-        com.example.zhishu.domain.model.ModelRole.entries.map { role ->
-            com.example.zhishu.domain.model.ModelConfig(
-                role = role.name,
-                baseUrl = config.baseUrl,
-                modelName = config.model,
-                maxTokens = config.maxTokens,
-                temperature = config.temperature,
-                supportsJson = true,
-                keyRef = "stub",
-            )
-        }
-    override suspend fun getConfig(role: ModelRole): com.example.zhishu.domain.model.ModelConfig? =
-        com.example.zhishu.domain.model.ModelConfig(
-            role = role.name,
+    private fun profile(): com.example.zhishu.domain.model.ApiProfile =
+        com.example.zhishu.domain.model.ApiProfile(
+            id = 1L,
+            name = "sample",
             baseUrl = config.baseUrl,
             modelName = config.model,
             maxTokens = config.maxTokens,
@@ -751,8 +740,28 @@ internal class FixedSettingsRepository(private val config: SampleRunner.RunConfi
             supportsJson = true,
             keyRef = "stub",
         )
-    override suspend fun saveConfig(config: com.example.zhishu.domain.model.ModelConfig) {}
-    override suspend fun clearConfigs() {}
+
+    override suspend fun getProfiles(): List<com.example.zhishu.domain.model.ApiProfile> =
+        listOf(profile())
+
+    override suspend fun getProfile(id: Long): com.example.zhishu.domain.model.ApiProfile? =
+        profile()
+
+    override suspend fun saveProfile(profile: com.example.zhishu.domain.model.ApiProfile): com.example.zhishu.domain.model.ApiProfile =
+        profile
+
+    override suspend fun deleteProfile(id: Long) {}
+
+    override suspend fun getAssignments(): Map<com.example.zhishu.domain.model.ModelRole, Long?> =
+        com.example.zhishu.domain.model.ModelRole.entries.associateWith { 1L }
+
+    override suspend fun assignRole(
+        role: com.example.zhishu.domain.model.ModelRole,
+        profileId: Long?,
+    ) {}
+
+    override suspend fun getAssignedProfile(role: com.example.zhishu.domain.model.ModelRole): com.example.zhishu.domain.model.ApiProfile? =
+        profile()
 }
 
 internal class FakeCipher(private val apiKey: String) : KeyCipher {
