@@ -65,7 +65,7 @@ data class ChapterPlan(
     val plotGoal: String = "",
     val learningGoals: List<String> = emptyList(),
     val nodeIds: List<String> = emptyList(),
-    val wordTarget: Int = 1200,
+    val wordTarget: Int = 1800,
     val status: ChapterStatus = ChapterStatus.QUEUED,
     val summary: String = "",
     val verificationNote: String = "",

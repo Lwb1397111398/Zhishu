@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -328,12 +329,14 @@ fun ReaderScreen(
             // ================= 翻页模式（默认）：像小说软件一样左右翻页 =================
             BoxWithConstraints(Modifier.fillMaxSize()) {
                 val density = LocalDensity.current
-                // 页内容左右各 24dp；页高扣除上下留白 16dp、页码区 20dp、防裁切余量 10dp
+                // 页内容左右各 24dp；页高扣除上下留白（上 20 下 16）、页码区 20dp、防裁切余量 10dp
                 val pageWidthPx = with(density) { (maxWidth - 48.dp).roundToPx().coerceAtLeast(200) }
                 val pageHeightPx = with(density) {
-                    (maxHeight - 16.dp - 16.dp - 20.dp - 10.dp).roundToPx().coerceAtLeast(200)
+                    (maxHeight - 20.dp - 16.dp - 20.dp - 10.dp).roundToPx().coerceAtLeast(200)
                 }
                 val gapPx = with(density) { 16.dp.roundToPx() }
+                val paraGapPx = with(density) { 6.dp.roundToPx() }
+                val keyPointGapPx = with(density) { 20.dp.roundToPx() }
                 val textMeasurer = rememberTextMeasurer(cacheSize = 512)
                 val headerTitle = chapter?.title ?: "阅读"
                 val headerOrder = "第 ${chapter?.order ?: 1} 章"
@@ -355,7 +358,8 @@ fun ReaderScreen(
 
                 // 切页：正文块流 → 页。字号/模式/正文变化都会重算，重算后停回当前阅读位置
                 val newPages = remember(
-                    visibleBlocks, fontSp, pageWidthPx, pageHeightPx, gapPx, headerHeightPx, measurer,
+                    visibleBlocks, fontSp, pageWidthPx, pageHeightPx, gapPx, paraGapPx,
+                    keyPointGapPx, headerHeightPx, measurer,
                 ) {
                     buildReaderPages(
                         visibleBlocks = visibleBlocks,
@@ -363,6 +367,8 @@ fun ReaderScreen(
                         fontSp = fontSp,
                         pageHeightPx = pageHeightPx,
                         gapPx = gapPx,
+                        paraGapPx = paraGapPx,
+                        keyPointGapPx = keyPointGapPx,
                         headerHeightPx = headerHeightPx,
                     )
                 }
@@ -392,7 +398,7 @@ fun ReaderScreen(
                             Modifier
                                 .fillMaxSize()
                                 .padding(horizontal = 24.dp)
-                                .padding(top = 16.dp),
+                                .padding(top = 20.dp),
                         ) {
                             if (pageIndex == 0) {
                                 ReaderPageHeader(
@@ -401,10 +407,20 @@ fun ReaderScreen(
                                     notices = headerNotices,
                                     palette = palette,
                                 )
-                                Spacer(Modifier.height(8.dp))
+                                Spacer(Modifier.height(16.dp))
                             }
                             pages.getOrElse(pageIndex) { emptyList() }.forEachIndexed { i, seg ->
-                                if (i > 0 && seg.firstOfBlock) Spacer(Modifier.height(16.dp))
+                                if (i > 0) {
+                                    // 块与块之间留呼吸空隙；关键结论前后再多一点，让它站出来；
+                                    // 同一块内的相邻段落只留小间距
+                                    val gap = when {
+                                        seg.firstOfBlock &&
+                                            seg.block.blockType == BlockType.KEY_POINT -> keyPointGapPx
+                                        seg.firstOfBlock -> gapPx
+                                        else -> paraGapPx
+                                    }
+                                    Spacer(Modifier.height(with(density) { gap.toDp() }))
+                                }
                                 BlockContent(
                                     block = seg.block,
                                     dense = dense,
@@ -1327,11 +1343,17 @@ private fun BlockContent(
             // 推演的落锤处：一句话钉住结论，用左侧竖线 + 大字号让它在长文里跳出来（问题2）
             BlockType.KEY_POINT -> {
                 val kpFs = fontSp + 2
-                Row(Modifier.fillMaxWidth()) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        // IntrinsicSize.Min 让左杠以文字高度为准。
+                        // 没有它，fillMaxHeight 的杠会以整页高度为上限拉满——
+                        // 一个两行的结论，红杠却从文字一直贯到页尾（2026-09-07 老板截图）
+                        .height(IntrinsicSize.Min),
+                ) {
                     Box(
                         Modifier
                             .width(3.dp)
-                            .heightIn(min = 24.dp)
                             .fillMaxHeight()
                             .background(palette.accent, RoundedCornerShape(2.dp)),
                     )
@@ -1439,9 +1461,9 @@ private fun BlockCard(
         shape = MaterialTheme.shapes.medium,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(12.dp)) {
+        Column(Modifier.padding(14.dp)) {
             Text(label, style = MaterialTheme.typography.labelMedium, color = content)
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(6.dp))
             Text(
                 text,
                 fontSize = bodyFs.sp,

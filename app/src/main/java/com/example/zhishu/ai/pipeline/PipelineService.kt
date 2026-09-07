@@ -1947,13 +1947,55 @@ class PipelineService(
         onPhase(ChapterPhase.VERIFY)
 
         val verification = verifyChapter(projectId, plan, blocks)
-        if (verification.isFailure) {
-            val message = verification.exceptionOrNull()?.message ?: "核验失败"
-            failAttempt(planId, attempt, "核验未完成：$message", ChapterStatus.NEEDS_REVIEW)
-            return Result.failure(verification.exceptionOrNull() ?: IllegalStateException("核验失败"))
+        val verified = verification.getOrNull()
+
+        // 核验「调用」失败（网络/超时/输出解析挂了）≠ 正文有问题。
+        // 之前这里把整章判 NEEDS_REVIEW：正文明明已经写好，重试却从头再写一遍，
+        // 新正文又可能在同一步断掉——「正文永远生成不了、一点重试就被刷掉」
+        // 就是这么来的（2026-09-07 老板实测）。现在：正文照常发布可读，
+        // 核验留待「更多 → 重新核验」单独补，只查不写。
+        if (verified == null) {
+            val reason = verification.exceptionOrNull()?.message ?: "核验失败"
+            chapterRepository.publishVersionAtomically(
+                version = version.copy(
+                    summary = output.summary,
+                    endingState = ContextBudget.clamp(
+                        output.endingState.ifBlank { output.summary },
+                        ContextBudget.CARRY_OVER_LIMIT,
+                    ),
+                    coveredTitles = output.coveredTitles.ifEmpty { nodes.map { it.title } },
+                    coveredNodeIds = output.coveredTitles
+                        .mapNotNull { titleToId[it.trim()] }
+                        .ifEmpty { nodes.map { it.id } }
+                        .distinct(),
+                    unverifiedClaims = output.unverifiedClaims
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                        .distinct()
+                        .take(MAX_UNVERIFIED_CLAIMS),
+                    usedModelKnowledge = modelKnowledge,
+                    verificationNote =
+                        "核验没跑完（$reason）。正文先发布可读；" +
+                            "「更多 → 重新核验」只补检查、不会重写正文",
+                ),
+                now = clock(),
+            )
+            attempt.published = true
+            // 记忆链照常推进：下一章要靠 coveredTitles/endingState 续写，
+            // 断在这里会让一次网络抖动传染成整本书写不下去
+            val fallbackTitles = output.coveredTitles.ifEmpty { nodes.map { it.title } }
+            val coveredIds = fallbackTitles
+                .mapNotNull { titleToId[it.trim()] }
+                .ifEmpty { nodes.map { it.id } }
+                .distinct()
+            advanceMemory(bible, output, coveredIds, allNodes.map { it.id }.toSet())
+            writeBackNodeChapters(projectId, planId, blocks)
+            scheduleReviews(projectId, blocks)
+            refreshProjectStatus(projectId)
+            // 出题跳过：还没过核验的正文先不基于它出题；补核验通过后可单独生成
+            return Result.success(Unit)
         }
 
-        val verified = verification.getOrThrow()
         // 核验问题落成一条条记录（4B）。
         //
         // 原来这里是 `issues.take(5).joinToString("\n")`：一整章的问题被拼成
@@ -2086,6 +2128,79 @@ class PipelineService(
             val message = quizResult.exceptionOrNull()?.message ?: "测验生成失败"
             chapterRepository.updateQuizState(planId, QuizState.FAILED, message)
         }
+        return Result.success(Unit)
+    }
+
+    /**
+     * 补核验（只查不写）。
+     *
+     * 配套「核验调用失败 → 正文照常发布」：核验因网络/超时/解析挂掉时正文已经
+     * 发布可读，核验留待以后补，这个函数就是入口——对当前发布版本重跑核验，
+     * 正文一个字不动。
+     *
+     * - 核验再失败：只更新章节说明并返回失败（UI 提示原因），正文不动
+     * - 核验成功：问题落库 → 与 runChapter 同款的一轮自动修复；
+     *   修不掉的标待复核（正文仍可读）
+     */
+    suspend fun reverifyChapter(
+        planId: String,
+        onPhase: ProgressReporter = NoOpProgressReporter,
+    ): Result<Unit> {
+        val plan = chapterRepository.getPlan(planId)
+            ?: return Result.failure(IllegalStateException("章节不存在"))
+        val projectId = plan.projectId
+        val active = chapterRepository.getActiveVersion(planId)
+            ?: return Result.failure(IllegalStateException("本章还没有已发布的正文"))
+        val blocks = chapterRepository.getBlocksByVersion(active.id)
+        if (blocks.isEmpty()) {
+            return Result.failure(IllegalStateException("当前正文没有内容可核验"))
+        }
+
+        onPhase(ChapterPhase.VERIFY)
+        val verification = verifyChapter(projectId, plan, blocks)
+        val verified = verification.getOrNull()
+        if (verified == null) {
+            val reason = verification.exceptionOrNull()?.message ?: "核验失败"
+            val note = "重试核验仍没跑完（$reason）。正文不受影响，可稍后再试"
+            chapterRepository.updateStatus(planId, plan.status, note)
+            return Result.failure(IllegalStateException(note))
+        }
+
+        val recorded = IssueRecorder.record(
+            projectId = projectId,
+            chapterId = planId,
+            versionId = active.id,
+            issues = verified.issues,
+            validBlockIds = blocks.map { it.id }.toSet(),
+            now = clock(),
+        )
+        issueRepository.replaceForVersion(active.id, recorded.issues)
+
+        if (recorded.issues.isEmpty()) {
+            // 干净了：清掉「核验没跑完」之类的说明
+            chapterRepository.updateStatus(planId, ChapterStatus.PUBLISHED, "")
+            return Result.success(Unit)
+        }
+
+        // 与 runChapter 相同的护栏：只修定位得到段落的问题，超过上限留给用户逐条处理
+        val repairTargets = autoRepairTargets(recorded)
+        if (repairTargets != null) {
+            val repaired = runRewrite(
+                projectId = projectId,
+                planId = planId,
+                plan = plan,
+                active = active,
+                oldBlocks = blocks,
+                targets = repairTargets.toSet(),
+                onPhase = onPhase,
+                onDraftCreated = {},
+                // 出题不在这里做：补核验只对「核验缺失/待复核」负责，题已有独立入口
+                regenerateQuiz = false,
+            )
+            if (repaired.isSuccess) return Result.success(Unit)
+        }
+        // 没修/没修好：正文可读、问题挂在当前版本上，标待复核由用户在阅读器里处理
+        chapterRepository.updateStatus(planId, ChapterStatus.NEEDS_REVIEW, issueSummary(recorded))
         return Result.success(Unit)
     }
 
@@ -3272,7 +3387,11 @@ class PipelineService(
                 "这一章的因果结构写清楚，不要改动大纲里已经定下的东西。"
         const val SYSTEM_NEXT_VOLUME =
             "你在给一条已经开讲的讲述路线接下一卷。已经写出来的部分不能改，只能往后接。"
-        const val SYSTEM_CHAPTER = "你在写一段推演：让读者跟着走，制度自己出现，而不是被告知名词。"
+        const val SYSTEM_CHAPTER =
+            "你是小说家，也是这门学科的讲述者。第一原则：一切通过具体的人、具体的场景、" +
+                "可感的细节展开——推演藏在人物的遭遇里，而不是旁白里。人物要有名有姓，" +
+                "场景要落地，关键处让人物开口或行动。读者是为故事往下翻的，读完却发现学会了一门学科：" +
+                "制度自己出现，而不是被告知名词。"
         const val SYSTEM_VERIFY = "你是核验员。既查知识准确性，也查推演有没有跳步。"
         const val SYSTEM_REWRITE =
             "你在修一整章里的一个段落。只解决指出的问题，其余保持原样，改完要能无缝接回原位。"

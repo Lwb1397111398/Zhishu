@@ -462,6 +462,10 @@ class ProjectDetailViewModel(
     private val _retryingContracts = MutableStateFlow<Set<String>>(emptySet())
     val retryingContracts: StateFlow<Set<String>> = _retryingContracts
 
+    /** 正在补核验的章节（只查不写，防重复点击） */
+    private val _reverifying = MutableStateFlow<Set<String>>(emptySet())
+    val reverifying: StateFlow<Set<String>> = _reverifying
+
     /** 正在补知识点的缺口 ID。防连点：补一个节点也是一次模型调用，重复点会重复扣额度 */
     private val _patchingGaps = MutableStateFlow<Set<String>>(emptySet())
     val patchingGaps: StateFlow<Set<String>> = _patchingGaps
@@ -1066,6 +1070,28 @@ class ProjectDetailViewModel(
                 "契约仍未生成：${result.exceptionOrNull()?.message ?: "未知原因"}"
             }
             _retryingContracts.value = _retryingContracts.value - planId
+        }
+    }
+
+    /**
+     * 补核验（只查不写）。
+     *
+     * 核验调用失败不再作废正文——正文照常发布，核验用这个入口单独补：
+     * 对当前发布版本重跑一次核验，正文一个字都不会动。
+     */
+    fun reverifyChapter(planId: String) {
+        viewModelScope.launch {
+            if (planId in _reverifying.value) return@launch
+            _reverifying.value = _reverifying.value + planId
+            _message.value = "正在重新核验这一章…"
+            val result = runCatching { container.pipeline.reverifyChapter(planId) }
+                .getOrElse { Result.failure(it) }
+            _message.value = if (result.isSuccess) {
+                "核验完成，正文没有变动"
+            } else {
+                result.exceptionOrNull()?.message ?: "核验没跑完，正文不受影响"
+            }
+            _reverifying.value = _reverifying.value - planId
         }
     }
 

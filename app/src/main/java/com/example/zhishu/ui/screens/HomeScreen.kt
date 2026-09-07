@@ -3,6 +3,7 @@ package com.example.zhishu.ui.screens
 import android.app.Application
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -11,9 +12,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -23,6 +26,7 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -61,9 +65,11 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.ProjectStatus
@@ -302,78 +308,121 @@ fun HomeScreen(
     }
 }
 
-/** 顶部「继续阅读」大卡：打开 APP 后两击进正文的最短路径 */
+/** 顶部「继续阅读」横幅：打开 APP 后两击进正文的最短路径。
+ *  深色渐变取自当前书的封面配色——像这本书从书架上探出头来 */
 @Composable
 private fun ContinueReadingCard(
     entry: ContinueEntry,
     stat: BookStat?,
     onOpenReader: (String, String?) -> Unit,
 ) {
-    Card(
-        onClick = { onOpenReader(entry.progress.chapterId, null) },
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primaryContainer,
-        ),
+    val palette = coverPalette(entry.project.id)
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(Brush.horizontalGradient(listOf(palette.top, palette.bottom)))
+            .clickable { onOpenReader(entry.progress.chapterId, null) }
+            .padding(14.dp),
     ) {
-        Column(Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                // 小书封：与书架封面同一套配色，一眼认出是哪本书
-                val palette = coverPalette(entry.project.id)
-                Box(
-                    Modifier
-                        .size(40.dp)
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(Brush.verticalGradient(listOf(palette.top, palette.bottom))),
-                ) {
-                    Text(
-                        entry.project.title.take(1),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // 迷你书封：带书脊，与书架封面同一套配色，一眼认出是哪本书
+            Box(
+                Modifier
+                    .width(46.dp)
+                    .height(64.dp)
+                    .clip(RoundedCornerShape(5.dp))
+                    .background(Brush.verticalGradient(listOf(palette.top, palette.bottom))),
+            ) {
+                SpineBar(palette, 9.dp)
+                Text(
+                    entry.project.title.take(1),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    modifier = Modifier.align(Alignment.Center),
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    "继续阅读",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White.copy(alpha = 0.65f),
+                )
+                Text(
+                    entry.project.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (stat != null && stat.totalChapters > 0) {
+                    Spacer(Modifier.height(8.dp))
+                    LinearProgressIndicator(
+                        progress = {
+                            (entry.chapterOrder.toFloat() / stat.totalChapters).coerceIn(0f, 1f)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                            .clip(RoundedCornerShape(3.dp)),
                         color = Color.White,
-                        modifier = Modifier.align(Alignment.Center),
+                        trackColor = Color.White.copy(alpha = 0.2f),
                     )
-                }
-                Spacer(Modifier.width(12.dp))
-                Column(Modifier.weight(1f)) {
+                    Spacer(Modifier.height(4.dp))
                     Text(
-                        "继续阅读",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        "读到第 ${entry.chapterOrder} 章 · 全书 ${stat.totalChapters} 章",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White.copy(alpha = 0.6f),
                     )
+                } else {
+                    Spacer(Modifier.height(6.dp))
                     Text(
-                        entry.project.title,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        "上次读到：第 ${entry.chapterOrder} 章 · ${entry.chapterTitle}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.White.copy(alpha = 0.75f),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
             }
-            Spacer(Modifier.height(10.dp))
-            Text(
-                "上次读到：第 ${entry.chapterOrder} 章 · ${entry.chapterTitle}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (stat != null && stat.totalChapters > 0) {
-                Spacer(Modifier.height(8.dp))
-                LinearProgressIndicator(
-                    progress = { (entry.chapterOrder.toFloat() / stat.totalChapters).coerceIn(0f, 1f) },
-                    modifier = Modifier.fillMaxWidth(),
-                    color = MaterialTheme.colorScheme.primary,
-                    trackColor = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.15f),
-                )
-                Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.width(12.dp))
+            Box(
+                Modifier
+                    .border(1.dp, Color.White.copy(alpha = 0.35f), CircleShape)
+                    .background(Color.White.copy(alpha = 0.14f), CircleShape)
+                    .padding(horizontal = 16.dp, vertical = 9.dp),
+            ) {
                 Text(
-                    "全书 ${stat.totalChapters} 章",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    "继续读 →",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White,
                 )
             }
         }
+    }
+}
+
+/** 封面左侧的书脊：深色条 + 右缘一条高光——实体书的质感来源（书封方案 A） */
+@Composable
+private fun SpineBar(palette: CoverPalette, width: Dp, modifier: Modifier = Modifier) {
+    Box(modifier) {
+        Box(
+            Modifier
+                .fillMaxHeight()
+                .width(width)
+                .background(lerp(palette.bottom, Color.Black, 0.35f)),
+        )
+        Box(
+            Modifier
+                .fillMaxHeight()
+                .padding(start = width)
+                .width(1.5.dp)
+                .background(Color.White.copy(alpha = 0.25f)),
+        )
     }
 }
 
@@ -414,7 +463,31 @@ private fun BookCard(
                         onLongClick = { menuExpanded = true },
                     ),
             ) {
-                Column(Modifier.padding(14.dp)) {
+                // 实体书脊（方案 A）：深色条 + 右缘高光，像一本立着的真书
+                SpineBar(palette, 14.dp)
+                // 右下角两道圆弧纹样：半透明细圆，给渐变底一点层次，不抢书名
+                Box(
+                    Modifier
+                        .align(Alignment.BottomEnd)
+                        .offset(x = 34.dp, y = 34.dp)
+                        .size(120.dp)
+                        .border(2.dp, Color.White.copy(alpha = 0.12f), CircleShape),
+                )
+                Box(
+                    Modifier
+                        .align(Alignment.BottomEnd)
+                        .offset(x = 10.dp, y = 10.dp)
+                        .size(72.dp)
+                        .border(1.5.dp, Color.White.copy(alpha = 0.10f), CircleShape),
+                )
+                Column(
+                    Modifier.padding(
+                        start = 26.dp, // 避开书脊
+                        end = 14.dp,
+                        top = 14.dp,
+                        bottom = 14.dp,
+                    ),
+                ) {
                     Text(
                         "知述",
                         style = MaterialTheme.typography.labelSmall,
@@ -440,6 +513,14 @@ private fun BookCard(
                         )
                     }
                     Spacer(Modifier.weight(1f))
+                    // 底部细线 + 讲法：扉页题字的收法
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(1.dp)
+                            .background(Color.White.copy(alpha = 0.3f)),
+                    )
+                    Spacer(Modifier.height(8.dp))
                     Text(
                         project.effectiveGenre,
                         style = MaterialTheme.typography.labelSmall,
@@ -512,9 +593,22 @@ fun KnowledgeHubScreen(
     val app = LocalContext.current.applicationContext as Application
     val vm: HomeViewModel = rememberZhishuViewModel(key = "knowledge_hub") { HomeViewModel(app) }
     val projects by vm.projects.collectAsState()
-    val knowledgeStats by vm.knowledgeStats.collectAsState()
+    val continueEntry by vm.continueEntry.collectAsState()
     val dueCount by vm.dueCount.collectAsState()
     val reviewEnabled by vm.spacedReviewEnabled.collectAsState()
+    val weekReadCount by vm.weekReadCount.collectAsState()
+    val knowledgeStats by vm.knowledgeStats.collectAsState()
+
+    // 排序与书架完全一致：最近在读的那本置顶，其余按更新时间——
+    // 「书怎么排，知识就怎么排」，两页来回切换时位置感是连续的
+    val sortedProjects = remember(projects, continueEntry) {
+        val readingId = continueEntry?.project?.id
+        if (readingId == null) {
+            projects
+        } else {
+            projects.sortedByDescending { it.id == readingId }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -566,10 +660,10 @@ fun KnowledgeHubScreen(
                 item(key = "__stats__") {
                     Spacer(Modifier.height(12.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        KnowledgeStatCard("书", projects.size.toString(), Modifier.weight(1f))
+                        KnowledgeStatCard("书", sortedProjects.size.toString(), Modifier.weight(1f))
                         KnowledgeStatCard(
-                            "知识点",
-                            knowledgeStats.values.sum().toString(),
+                            "本周读过",
+                            weekReadCount.toString(),
                             Modifier.weight(1f),
                         )
                         if (reviewEnabled) {
@@ -580,10 +674,10 @@ fun KnowledgeHubScreen(
                 item(key = "__list_title__") {
                     SectionTitle("按书查看")
                 }
-                items(projects, key = { it.id }) { project ->
+                items(sortedProjects, key = { it.id }) { project ->
                     KnowledgeProjectCard(
                         project = project,
-                        nodeCount = knowledgeStats[project.id] ?: 0,
+                        hasMap = (knowledgeStats[project.id] ?: 0) > 0,
                         onOpen = { onOpenMap(project.id) },
                     )
                 }
@@ -626,9 +720,11 @@ private fun KnowledgeStatCard(label: String, value: String, modifier: Modifier =
 @Composable
 private fun KnowledgeProjectCard(
     project: Project,
-    nodeCount: Int,
+    /** 是否已经生成过知识地图（没有就引导「先去读书」而不是甩一个 0 */
+    hasMap: Boolean,
     onOpen: () -> Unit,
 ) {
+    val palette = coverPalette(project.id)
     Card(
         onClick = onOpen,
         modifier = Modifier.padding(vertical = 6.dp),
@@ -636,14 +732,28 @@ private fun KnowledgeProjectCard(
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
+                .padding(14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(
-                Icons.Default.School,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-            )
+            // 迷你书封（带书脊）：与书架封面同一套配色——一眼认出「这就是那本书」，
+            // 替掉原来那个学校图标；右侧也不再挂「N 个知识点」——
+            // 数数字给人「好多要学」的压力，读书的人不需要它
+            Box(
+                Modifier
+                    .width(40.dp)
+                    .height(54.dp)
+                    .clip(RoundedCornerShape(5.dp))
+                    .background(Brush.verticalGradient(listOf(palette.top, palette.bottom))),
+            ) {
+                SpineBar(palette, 8.dp)
+                Text(
+                    project.title.take(1),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    modifier = Modifier.align(Alignment.Center),
+                )
+            }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(
@@ -666,13 +776,15 @@ private fun KnowledgeProjectCard(
             Spacer(Modifier.width(8.dp))
             Column(horizontalAlignment = Alignment.End) {
                 Text(
-                    if (nodeCount > 0) "$nodeCount 个知识点" else "还没有知识地图",
+                    if (hasMap) project.effectiveGenre else "还没有知识地图",
                     style = MaterialTheme.typography.labelMedium,
-                    color = if (nodeCount > 0) {
+                    color = if (hasMap) {
                         MaterialTheme.colorScheme.primary
                     } else {
                         MaterialTheme.colorScheme.onSurfaceVariant
                     },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 Text(
                     "查看地图 →",

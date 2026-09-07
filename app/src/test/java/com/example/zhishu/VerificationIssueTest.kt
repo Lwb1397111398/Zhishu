@@ -149,6 +149,62 @@ class VerificationIssueTest {
     }
 
     /**
+     * 核验「调用」失败（网络/超时/解析挂掉）不再作废正文：正文照常发布可读，
+     * 核验说明写明没跑完；补核验（reverifyChapter）成功后说明清掉、正文原封不动。
+     *
+     * 回归锁定：之前核验一挂整章判 NEEDS_REVIEW，重试 = 从头重写正文，
+     * 新正文又可能在同一步断掉——「正文永远生成不了、一点重试就被刷掉」。
+     */
+    @Test
+    fun verifyCallFailure_publishesBodyInsteadOfDroppingIt() = runBlocking {
+        val planId = seedThroughBible()
+        router.failAt = ScriptedRouter.Phase.VERIFY
+        assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
+
+        // 正文发布、可读，说明里写明核验没跑完与原因
+        val plan = db.chapterPlanDao().getById(planId)!!
+        assertEquals(ChapterStatus.PUBLISHED, plan.status)
+        assertTrue(plan.verificationNote.contains("核验没跑完"))
+        val active = db.chapterVersionDao().getActive(planId)!!
+        val publishedBlocks = db.chapterBlockDao().getActiveBlocks(planId)
+        assertTrue(publishedBlocks.isNotEmpty())
+
+        // 补核验成功：说明清掉，还是同一个版本、同一批块——一个字没动
+        router.failAt = null
+        router.verifyJson = """{"issues":[]}"""
+        assertTrue(pipeline.reverifyChapter(planId).isSuccess)
+        val after = db.chapterPlanDao().getById(planId)!!
+        assertEquals(ChapterStatus.PUBLISHED, after.status)
+        assertEquals("", after.verificationNote)
+        assertEquals(active.id, db.chapterVersionDao().getActive(planId)!!.id)
+        assertEquals(
+            publishedBlocks.map { it.id },
+            db.chapterBlockDao().getActiveBlocks(planId).map { it.id },
+        )
+    }
+
+    /**
+     * 补核验再失败时正文同样不能动：只更新说明，返回失败给 UI 提示原因。
+     */
+    @Test
+    fun reverifyFailure_keepsPublishedBodyIntact() = runBlocking {
+        val planId = seedThroughBible()
+        // 第一次核验调用就挂：正文照常发布
+        router.failAt = ScriptedRouter.Phase.VERIFY
+        assertTrue(pipeline.generateChapter("p-1", planId).isSuccess)
+        val active = db.chapterVersionDao().getActive(planId)!!
+        val blocks = db.chapterBlockDao().getActiveBlocks(planId).map { it.id }
+
+        // 补核验还是挂：返回失败，但版本指针与块都原样
+        assertTrue(pipeline.reverifyChapter(planId).isFailure)
+        assertEquals(active.id, db.chapterVersionDao().getActive(planId)!!.id)
+        assertEquals(blocks, db.chapterBlockDao().getActiveBlocks(planId).map { it.id })
+        assertTrue(
+            db.chapterPlanDao().getById(planId)!!.verificationNote.contains("重试核验仍没跑完"),
+        )
+    }
+
+    /**
      * 模型给了一个不存在的 blockId 时，记成「定位不到具体段落」，而不是猜一个最像的块。
      *
      * 猜错的后果是用户点开一段没有问题的正文，看不出问题在哪，

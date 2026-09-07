@@ -1342,6 +1342,7 @@ private fun OutlineTab(
     val issueBlocks by vm.issueBlocks.collectAsState()
     val rewriting by vm.rewriting.collectAsState()
     val retryingContracts by vm.retryingContracts.collectAsState()
+    val reverifying by vm.reverifying.collectAsState()
     // 「继续下一卷」的入口状态（3C）
     val nextVolume by vm.nextVolume.collectAsState()
     // 统计只数当前版本正文（3D）
@@ -1465,6 +1466,8 @@ private fun OutlineTab(
                         rewriting = plan.id in rewriting,
                         onRetryContract = { vm.retryChapterContract(plan.id) },
                         retryingContract = plan.id in retryingContracts,
+                        onReverify = { vm.reverifyChapter(plan.id) },
+                        reverifying = plan.id in reverifying,
                     )
                 }
             }
@@ -1799,6 +1802,10 @@ private fun ChapterPlanCard(
     onRetryContract: () -> Unit = {},
     /** 契约正在补 */
     retryingContract: Boolean = false,
+    /** 补核验（只查不写）。核验没跑完但正文已发布的章显示入口 */
+    onReverify: () -> Unit = {},
+    /** 核验正在补 */
+    reverifying: Boolean = false,
 ) {
     // 可读性只看正文状态。QUIZ_FAILED 是旧库里的值，正文其实是通过核验的
     val canRead = plan.isReadable ||
@@ -2019,6 +2026,19 @@ private fun ChapterPlanCard(
                                 menuExpanded = false
                                 onRegenerateQuiz()
                             },
+                        )
+                    }
+                    // 核验没跑完但正文已发布的章：只补检查、绝不重写正文。
+                    // 没有这个入口，用户唯一的重试路径是「重新生成正文」——
+                    // 好好的正文会被推倒重来，这正是「正文永远生成不了」的死循环
+                    if (canRead && plan.verificationNote.contains("核验没跑完")) {
+                        DropdownMenuItem(
+                            text = { Text(if (reverifying) "核验中…" else "重新核验") },
+                            onClick = {
+                                menuExpanded = false
+                                onReverify()
+                            },
+                            enabled = !reverifying,
                         )
                     }
                     // 有可定位到段落的问题时，「逐条处理」比整章重新生成便宜得多，

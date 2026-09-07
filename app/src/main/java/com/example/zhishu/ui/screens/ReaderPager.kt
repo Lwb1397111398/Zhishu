@@ -157,22 +157,22 @@ internal class PageMeasurer(
         )
     }
 
-    /** 讲解卡片：label 一行 + 4dp + 正文(小 2 号) + 上下 padding 24dp */
+    /** 讲解卡片：label 一行 + 6dp + 正文(小 2 号) + 上下 padding 28dp */
     fun card(text: String, fontSp: Int): Int {
         val fs = (fontSp - 2).coerceAtLeast(13)
         val label = measure("知识讲解", TextStyle(fontSize = 12.sp, lineHeight = 16.sp))
         val body = measure(text, TextStyle(fontSize = fs.sp, lineHeight = (fs * 1.55f).sp))
-        return label + dp(4) + body + dp(24)
+        return label + dp(6) + body + dp(28)
     }
 
-    /** 章首头（仅第一页）：章名 + 「第 x 章」 + 可选的通知条 */
+    /** 章首头（仅第一页）：章名 + 「第 x 章」 + 可选的通知条，尾部含与正文的间距（渲染 16dp + 余量） */
     fun header(title: String, order: String, notices: List<String>): Int {
         var h = measure(title, TextStyle(fontSize = 24.sp, lineHeight = 32.sp, fontWeight = FontWeight.Bold))
         h += dp(4) + measure(order, TextStyle(fontSize = 12.sp, lineHeight = 16.sp))
         notices.forEach { n ->
             h += dp(12) + measure(n, TextStyle(fontSize = 12.sp, lineHeight = 17.sp)) + dp(20)
         }
-        return h + dp(20)
+        return h + dp(28)
     }
 }
 
@@ -186,16 +186,23 @@ private data class PageUnit(val segment: PageSegment, val heightPx: Int, val gap
  * - STORY 段落是最小单元，可以跨页；讲解卡片 / 关键结论整块不拆，
  *   放不下就整体挪到下一页（读起来像卡片被拦腰斩断是硬伤）；
  * - 单元本身比一页还高（超长卡片）就独占一页，页内由渲染层兜底滚动；
- * - 同一 STORY 块的相邻段落之间不加额外间距，块与块之间留一段呼吸空隙。
+ * - 同一 STORY 块的相邻段落之间留小间距，块与块之间留一段呼吸空隙，
+ *   关键结论（KEY_POINT）前后再宽一点。
  *
  * [pageHeightPx] 必须是已扣除页码区与余量的净高。
+ * 三个间距必须与 ReaderScreen 渲染层的 Spacer 一致（测量与渲染同源）。
  */
 internal fun buildReaderPages(
     visibleBlocks: List<ChapterBlock>,
     measurer: PageMeasurer,
     fontSp: Int,
     pageHeightPx: Int,
+    /** 块与块之间的间距 */
     gapPx: Int,
+    /** 同一 STORY 块内相邻段落的间距 */
+    paraGapPx: Int = 0,
+    /** KEY_POINT 前后的间距（比普通块更宽） */
+    keyPointGapPx: Int = gapPx,
     /** 第一页顶部章首头（章名/章序/通知条）的高度，第一页的可用空间要扣掉它 */
     headerHeightPx: Int = 0,
 ): List<List<PageSegment>> {
@@ -220,7 +227,7 @@ internal fun buildReaderPages(
                                 lastOfBlock = i == paragraphs.lastIndex,
                             ),
                             measurer.story(p, fontSp),
-                            if (i == 0) gapPx else 0,
+                            if (i == 0) gapPx else paraGapPx,
                         )
                     }
                 }
@@ -229,7 +236,7 @@ internal fun buildReaderPages(
             BlockType.KEY_POINT -> units += PageUnit(
                 PageSegment(block, block.text, true, true),
                 measurer.keyPoint(block.text, fontSp),
-                gapPx,
+                keyPointGapPx,
             )
 
             else -> units += PageUnit(

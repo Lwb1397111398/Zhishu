@@ -144,8 +144,11 @@ class VersionHardeningTest {
         val planId = firstPublishedChapter()
         val v1 = activeVersionId(planId)
 
-        // 第二次：失败
-        router.failAt = ScriptedRouter.Phase.VERIFY
+        // 第二次：正文阶段失败（新尝试作废，当前发布版本不动）。
+        // 注意不能用 VERIFY 阶段制造失败：核验「调用」失败现在不再作废正文——
+        // 正文照常发布（见 VerificationIssueTest.verifyCallFailure_*），
+        // 版本历史里也就不会出现它的 ABANDONED 记录
+        router.failAt = ScriptedRouter.Phase.CHAPTER
         assertTrue(pipeline.generateChapter("p-1", planId).isFailure)
         router.failAt = null
 
