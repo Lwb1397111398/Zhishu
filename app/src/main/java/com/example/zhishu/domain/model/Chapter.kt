@@ -32,6 +32,20 @@ enum class ChapterStatus {
      * 不能因为出题这一步失败而把章节变成打不开的状态。
      */
     val isReadable: Boolean get() = this == PUBLISHED || this == QUIZ_FAILED
+
+    /**
+     * 这一章是否还在「生成流程」里，因而下一卷的开场还接不上。
+     *
+     * 与 [isReadable] 的区别就是续卷入口能不能被永久堵死：
+     * `isReadable` 不含 NEEDS_REVIEW / FAILED，任何一章停在待复核，
+     * 「继续下一卷」就再也不出现（用户实测「老是在第一卷」的头号原因）。
+     *
+     * NEEDS_REVIEW 正文已带问题发布、可读，下一章要接的是它当前版本的结尾状态
+     * （`PipelineService` 的 previousEnding 取 activeVersion），不必等用户复核；
+     * FAILED 交给「点继续 → 重排该章」的自动重试路径，也不该永久挡住整本书往下走。
+     */
+    val isVolumeBlocking: Boolean
+        get() = this == QUEUED || this == RUNNING || this == DRAFT || this == VERIFYING
 }
 
 /**
