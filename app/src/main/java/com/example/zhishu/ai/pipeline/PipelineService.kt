@@ -834,6 +834,32 @@ class PipelineService(
     }
 
     /**
+     * 自动补「漏掉的知识点」（自动化闭环）。总开关开启时，在知识主干 FULL 梳理审计完成后调用。
+     *
+     * 只补 [GapStatus.OPEN] 且 `actionable`（= [GapType.MISSING_NODE]）的缺口——
+     * 免责提示型（过时 / 地区差异 / 说法不一 / 无法核实）本就不该被自动关掉，
+     * 它们要一直提醒用户核实，自动补反而抹掉了「别只信AI」的意义。
+     *
+     * 复用 [generateKnowledgeMapPatch]（已幂等：同名节点直接标 RESOLVED，不重复烧调用），
+     * 不产生第二套补节点逻辑。单条失败不中断其余：gap 留 OPEN，下次点「继续」再补。
+     * [limit] 是成本护栏——补一条 = 一次模型调用，超出的留给下一次或手点。
+     *
+     * @return 实际补上的条数
+     */
+    suspend fun autoResolveGaps(projectId: String, limit: Int = 10): Int {
+        val targets = knowledgeRepository.getGaps(projectId)
+            .filter { it.gapStatus == GapStatus.OPEN && it.actionable && it.suggestedTitle.isNotBlank() }
+            .take(limit)
+        var done = 0
+        for (g in targets) {
+            // generateKnowledgeMapPatch 内部已保证失败时 gap 仍 OPEN、占位节点不冒充完成，
+            // 这里只累计成功数；调用方据返回值决定要不要提示「还有 N 条待补」
+            if (generateKnowledgeMapPatch(projectId, g.id).isSuccess) done += 1
+        }
+        return done
+    }
+
+    /**
      * 用户点「知道了」：把一条资料冲突移出「别只信AI」。
      *
      * 冲突不是缺口——没有"补上"一说，只有"我已经知道两边说法了，别反复提示"。
