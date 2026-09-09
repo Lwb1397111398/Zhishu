@@ -1567,18 +1567,22 @@ class PipelineService(
     /**
      * 能不能规划下一卷（第三阶段 3C）。
      *
-     * 两个条件：当前卷全部可读了，而且知识地图里还有没讲到的节点。
+     * 两个条件：当前卷没有「还在生成流程里」的章（[ChapterStatus.isVolumeBlocking]），
+     * 而且知识地图里还有没讲到的节点。
      * 当前卷没写完就续卷会打乱故事顺序——读者还没读到那儿，
      * 而新卷的开场必须接上「上一章的结尾」，那个结尾此刻还不存在。
+     *
+     * 判据用 isVolumeBlocking 而不是 !isReadable：待复核/失败的章正文已可读（或不该等复核），
+     * 用 isReadable 会让一章 NEEDS_REVIEW 永久堵死续卷入口（用户「老是在第一卷」的头号原因）。
      */
     suspend fun nextVolumeAvailability(projectId: String): NextVolumeAvailability {
         val plans = chapterRepository.getPlans(projectId)
         if (plans.isEmpty()) return NextVolumeAvailability.NoPlanYet
         val currentVolume = plans.maxOf { it.volumeIndex }
         val currentVolumeChapters = plans.filter { it.volumeIndex == currentVolume }
-        if (currentVolumeChapters.any { !it.isReadable }) {
+        if (currentVolumeChapters.any { it.status.isVolumeBlocking }) {
             return NextVolumeAvailability.CurrentVolumeUnfinished(
-                remaining = currentVolumeChapters.count { !it.isReadable },
+                remaining = currentVolumeChapters.count { it.status.isVolumeBlocking },
             )
         }
         val pending = coverageReport(projectId, plans).pendingNodes
@@ -1606,7 +1610,12 @@ class PipelineService(
             return Result.failure(IllegalStateException("还没有讲述路线，先规划第一卷"))
         }
         val currentVolume = plans.maxOf { it.volumeIndex }
-        val unfinished = plans.filter { it.volumeIndex == currentVolume && !it.isReadable }
+        // 与 nextVolumeAvailability 共用同一判据（isVolumeBlocking），否则会出现
+        // 「按钮亮着、点了报未写完」。待复核/失败章不阻断续卷：下一章接的是已发布
+        // 版本的结尾状态，不是一章没处理的复核。
+        val unfinished = plans.filter {
+            it.volumeIndex == currentVolume && it.status.isVolumeBlocking
+        }
         if (unfinished.isNotEmpty()) {
             return Result.failure(
                 IllegalStateException("当前这一卷还有 ${unfinished.size} 章没写完，先把它读完再往下讲"),
