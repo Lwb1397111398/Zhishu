@@ -68,16 +68,34 @@ class LearningPrefs(context: Context) {
         _readerPaper.value = paper
     }
 
+    /**
+     * 正文字体族：衬线（宋体，默认——「像一本书」）或黑体。
+     *
+     * 中文阅读 App 正文默认用宋体/衬线，系统黑体是最不像书的一处。
+     * 这里不打包字体文件（体积/授权/OEM 回退都复杂），走系统 FontFamily.Serif。
+     */
+    private val _readerSerif = MutableStateFlow(
+        prefs.getBoolean(KEY_READER_SERIF, DEFAULT_READER_SERIF),
+    )
+    val readerSerif: StateFlow<Boolean> = _readerSerif.asStateFlow()
+
+    fun setReaderSerif(serif: Boolean) {
+        prefs.edit().putBoolean(KEY_READER_SERIF, serif).apply()
+        _readerSerif.value = serif
+    }
+
     companion object {
         const val DEFAULT_SPACED_REVIEW = false
         val DEFAULT_READER_MODE = ReaderMode.PAGER
         const val DEFAULT_FONT_INDEX = 1
         val DEFAULT_READER_PAPER = ReaderPaper.CREAM
+        const val DEFAULT_READER_SERIF = true
         private const val PREFS_NAME = "zhishu_learning_prefs"
         private const val KEY_SPACED_REVIEW = "spaced_review_enabled"
         private const val KEY_READER_MODE = "reader_mode"
         private const val KEY_READER_FONT = "reader_font_size"
         private const val KEY_READER_PAPER = "reader_paper"
+        private const val KEY_READER_SERIF = "reader_serif"
     }
 }
 

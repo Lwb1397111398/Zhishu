@@ -5,6 +5,28 @@ import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.QuizType
 
 /**
+ * 规范化模型回传的知识点编号，让「带不带 #」这类抄写差异不再是整章作废的理由。
+ *
+ * 交互层给模型看的编号有两种写法：大纲/契约 prompt 里是 `#nk-3`（[nodeKeyLabel] 刻意
+ * 加 `#`，是让模型把它当成编号原样抄回的提示），单链展开 prompt 的清单里是裸 `nk-3`。
+ * 而模型往回抄时什么都有可能：`nk-3`、`#nk-3`、全角 `＃nk-3`、`NK-3`、`# nk-3`、
+ * 带首尾空格——原来这些一律按精确字符串比对（白名单 `it in validKeys`、反解
+ * `keyToId[it.trim()]`），差一个 `#` 就判「引用了不存在的知识点编号」，
+ * 于是大纲整卷重来、契约标 FAILED、正文被 `generateChapter` 入口直接拦下。
+ * 这正是「生成正文时跑不通」的一条真实路径，且与模型选择强相关（有的服务商更爱
+ * 加 #、有的更爱丢 #），换个模型就时对时错，最难排查。
+ *
+ * 做法：两端都过这个函数——白名单建表、回传查表、引入/应用归属比对，全部归一到
+ * 裸小写 `nk-N`。`#` 只是提示层的糖，匹配层不需要它。非 `nk-` 前缀的输入原样保留
+ * （资料片段 ID 等也走这里，不该被改写）。
+ */
+internal fun canonicalNodeKey(raw: String): String {
+    var k = raw.trim().trimStart('#', '＃').trim()
+    if (k.startsWith("NK-", ignoreCase = true)) k = "nk-" + k.substring(3)
+    return k
+}
+
+/**
  * 模型输出的业务校验（N14）。
  * JSON 能反序列化不代表内容可用：标题为空、引用不存在的节点、题目缺答案都必须直接失败，
  * 不做「盲目重试」，避免把无依据内容写进数据库。
@@ -55,6 +77,7 @@ object OutputValidators {
         expectedKeys: Set<String>,
         knownTitles: Set<String>,
     ): Result<Pair<List<NodeDto>, List<String>>> {
+        val expected = expectedKeys.map(::canonicalNodeKey).toSet()
         val valid = output.nodes.filter { dto ->
             // 没有 definition 的节点没有任何可写入的内容：多半是截断修复剪出来的
             // 残壳。放它过去会把占位节点标成 COMPLETED——用户看到一个空节点，
@@ -62,7 +85,7 @@ object OutputValidators {
             // 占位，本链会被判为「没填满」并重新展开。
             dto.definition.isNotBlank() &&
                 (
-                    (dto.nodeKey.isNotBlank() && dto.nodeKey in expectedKeys) ||
+                    (dto.nodeKey.isNotBlank() && canonicalNodeKey(dto.nodeKey) in expected) ||
                         dto.title.trim() in knownTitles
                     )
         }

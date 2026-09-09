@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -35,6 +36,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.zhishu.ui.common.EmptyState
 import com.example.zhishu.ui.common.rememberZhishuViewModel
@@ -119,7 +121,7 @@ fun TrustCenterScreen(
                     icon = Icons.Default.Check,
                     title = "没有需要核对的内容",
                     subtitle = "当前正文的每条引用都对上了资料，也没有待处理的核验问题。",
-                    modifier = Modifier.fillMaxWidth().height(260.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 260.dp),
                 )
                 return@Column
             }
@@ -129,7 +131,9 @@ fun TrustCenterScreen(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                items(visible, key = { "${it.kind}-${it.chapterId}-${it.blockId}-${it.title}" }) { entry ->
+                // key 只能用 sourceId：kind/title 是展示文本（同章多条引用 title 相同），
+                // blockId 在源块换版后为 null——拼出来的 key 会撞车，滚到那条就闪退
+                items(visible, key = { "${it.kind}-${it.sourceId}" }) { entry ->
                     TrustEntryCard(entry = entry, onOpenReader = onOpenReader)
                 }
                 item { Spacer(Modifier.height(24.dp)) }
@@ -166,10 +170,14 @@ private fun TrustEntryCard(
                     color = MaterialTheme.colorScheme.tertiary,
                 )
                 Spacer(Modifier.width(8.dp))
+                // 章节标题长短不可控：吃掉剩余宽度并省略，kind 标签（固宽）留在前面
                 Text(
                     "第 ${entry.chapterOrder} 章 · ${entry.chapterTitle}",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                 )
             }
             Spacer(Modifier.height(4.dp))

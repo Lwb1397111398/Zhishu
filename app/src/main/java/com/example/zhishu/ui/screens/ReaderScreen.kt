@@ -26,19 +26,24 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.School
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -139,6 +144,7 @@ fun ReaderScreen(
     val readerMode by vm.readerMode.collectAsState()
     val fontIndex by vm.readerFontSizeIndex.collectAsState()
     val paper by vm.readerPaper.collectAsState()
+    val serifBody by vm.readerSerif.collectAsState()
     val allPlans by vm.allPlans.collectAsState()
 
     var selectedNode by remember { mutableStateOf<KnowledgeNode?>(null) }
@@ -157,6 +163,8 @@ fun ReaderScreen(
     val scope = rememberCoroutineScope()
     val palette = readerPalette(paper)
     val fontSp = readerFontSizeSp(fontIndex)
+    // 测量与渲染共用的样式表：翻页与滚动两种模式画的是同一批 TextStyle
+    val typography = remember(fontSp, serifBody) { ReaderTypography(fontSp, serifBody) }
 
     // 安静模式（现在叫「只看故事」）只藏讲解/引文/类比这些"旁注"，但保留 KEY_POINT——
     // 那些重述句本身就是推演的骨架，藏掉会让主线断掉（问题2）
@@ -186,6 +194,8 @@ fun ReaderScreen(
 
     // 翻页模式的分页结果（正文页），由翻页分支计算后写入
     var pages by remember { mutableStateOf<List<List<PageSegment>>>(emptyList()) }
+    // 切页器标出的「内容比一页还高」的页：这些页开纵向滚动兜底而不是裁掉页底
+    var overflowPages by remember { mutableStateOf<Set<Int>>(emptySet()) }
     // 章末「本章完 / 自测 / 下一章」在翻页模式下独立成最后一页
     val footerPageCount = if (readerMode == ReaderMode.PAGER) 1 else 0
 
@@ -327,20 +337,28 @@ fun ReaderScreen(
             }
         } else if (readerMode == ReaderMode.PAGER) {
             // ================= 翻页模式（默认）：像小说软件一样左右翻页 =================
-            BoxWithConstraints(Modifier.fillMaxSize()) {
+            // 安全区在 BoxWithConstraints 上就扣掉：页宽/页高量的是真正可写的区域，
+            // 正文不会再钻到状态栏底下（以前 padding 加在内侧、测量按全屏算，两头对不上）
+            BoxWithConstraints(
+                Modifier
+                    .fillMaxSize()
+                    .statusBarsPadding()
+                    .navigationBarsPadding(),
+            ) {
                 val density = LocalDensity.current
-                // 页内容左右各 24dp；页高扣除上下留白（上 20 下 16）、页码区 20dp、防裁切余量 10dp
-                val pageWidthPx = with(density) { (maxWidth - 48.dp).roundToPx().coerceAtLeast(200) }
-                val pageHeightPx = with(density) {
-                    (maxHeight - 20.dp - 16.dp - 20.dp - 10.dp).roundToPx().coerceAtLeast(200)
+                // 页宽页高的扣除口径全在 ReaderLayout——测量与渲染读同一份数字
+                val margin = ReaderLayout.horizontalMargin
+                val pageWidthPx = with(density) {
+                    (maxWidth - margin * 2).roundToPx().coerceAtLeast(200)
                 }
-                val gapPx = with(density) { 16.dp.roundToPx() }
-                val paraGapPx = with(density) { 6.dp.roundToPx() }
-                val keyPointGapPx = with(density) { 20.dp.roundToPx() }
+                val pageHeightPx = with(density) {
+                    (maxHeight - ReaderLayout.pageTopPadding - ReaderLayout.footerZone - ReaderLayout.slack)
+                        .roundToPx().coerceAtLeast(200)
+                }
                 val textMeasurer = rememberTextMeasurer(cacheSize = 512)
                 val headerTitle = chapter?.title ?: "阅读"
                 val headerOrder = "第 ${chapter?.order ?: 1} 章"
-                val measurer = remember(density, textMeasurer, pageWidthPx) {
+                val measurer = remember(density, textMeasurer, pageWidthPx, typography) {
                     PageMeasurer(
                         measure = { text, style ->
                             textMeasurer.measure(
@@ -352,37 +370,56 @@ fun ReaderScreen(
                             ).size.height
                         },
                         density = density,
+                        typography = typography,
                     )
                 }
                 val headerHeightPx = measurer.header(headerTitle, headerOrder, headerNotices)
 
+                // 附件高度：chip 行 + 来源入口以前没人量过，带附件的块页页底被裁
+                val attachmentHeights = remember(
+                    visibleBlocks, dense, blockSources, nodes, fontSp, pageWidthPx,
+                ) {
+                    buildAttachmentHeights(
+                        blocks = visibleBlocks,
+                        dense = dense,
+                        nodeTitles = { b ->
+                            b.knowledgeNodeIds.mapNotNull { id -> nodes.firstOrNull { it.id == id }?.title }
+                        },
+                        hasSourceEntry = { b ->
+                            val s = blockSources[b.id]
+                            s != null && s.hasAnything && (dense || s.deservesAttention)
+                        },
+                        density = density,
+                        fontPx = with(density) { fontSp.sp.roundToPx() },
+                        pageWidthPx = pageWidthPx,
+                    )
+                }
+
                 // 切页：正文块流 → 页。字号/模式/正文变化都会重算，重算后停回当前阅读位置
-                val newPages = remember(
-                    visibleBlocks, fontSp, pageWidthPx, pageHeightPx, gapPx, paraGapPx,
-                    keyPointGapPx, headerHeightPx, measurer,
+                val newPaging = remember(
+                    visibleBlocks, pageWidthPx, pageHeightPx, headerHeightPx,
+                    measurer, attachmentHeights,
                 ) {
                     buildReaderPages(
                         visibleBlocks = visibleBlocks,
                         measurer = measurer,
-                        fontSp = fontSp,
                         pageHeightPx = pageHeightPx,
-                        gapPx = gapPx,
-                        paraGapPx = paraGapPx,
-                        keyPointGapPx = keyPointGapPx,
                         headerHeightPx = headerHeightPx,
+                        attachments = attachmentHeights,
                     )
                 }
-                LaunchedEffect(newPages) {
+                LaunchedEffect(newPaging) {
                     // 保持位置：记录当前页（章末页则按最后一页正文算）页首块，
                     // 重算后跳回包含该块的新页，而不是被甩回章首
                     val currentPageIdx = pagerState.currentPage
                         .coerceIn(0, (pages.size - 1).coerceAtLeast(0))
                     val keepBlockId = pages.getOrNull(currentPageIdx)
                         ?.firstOrNull()?.block?.id
-                    pages = newPages
+                    pages = newPaging.pages
+                    overflowPages = newPaging.overflowPages
                     if (restored) {
                         val target = keepBlockId?.let { id ->
-                            newPages.indexOfFirst { page -> page.any { it.block.id == id } }
+                            newPaging.pages.indexOfFirst { page -> page.any { it.block.id == id } }
                         }
                         pagerState.scrollToPage(if (target != null && target >= 0) target else 0)
                     }
@@ -394,32 +431,36 @@ fun ReaderScreen(
                     palette = palette,
                 ) { pageIndex ->
                     if (pageIndex < pages.size) {
+                        // 超页内容的兜底滚动：切页器标出的 overflow 页开 verticalScroll，
+                        // 以前这类页直接被裁掉页底（注释里承诺了滚动却没人实现）
+                        val canScroll = pageIndex in overflowPages || pageIndex == 0
                         Column(
                             Modifier
                                 .fillMaxSize()
-                                .padding(horizontal = 24.dp)
-                                .padding(top = 20.dp),
+                                .verticalScroll(rememberScrollState(), enabled = canScroll)
+                                .padding(horizontal = margin)
+                                .padding(top = ReaderLayout.pageTopPadding),
                         ) {
                             if (pageIndex == 0) {
                                 ReaderPageHeader(
                                     title = headerTitle,
                                     order = headerOrder,
                                     notices = headerNotices,
+                                    typography = typography,
                                     palette = palette,
                                 )
-                                Spacer(Modifier.height(16.dp))
+                                Spacer(Modifier.height(ReaderLayout.headerToBody))
                             }
                             pages.getOrElse(pageIndex) { emptyList() }.forEachIndexed { i, seg ->
                                 if (i > 0) {
-                                    // 块与块之间留呼吸空隙；关键结论前后再多一点，让它站出来；
-                                    // 同一块内的相邻段落只留小间距
+                                    // 块间留呼吸空隙；关键结论前后再多一点；同块段落中等间距。
+                                    // 数字全取 ReaderLayout——切页测量用的就是这几个
                                     val gap = when {
-                                        seg.firstOfBlock &&
-                                            seg.block.blockType == BlockType.KEY_POINT -> keyPointGapPx
-                                        seg.firstOfBlock -> gapPx
-                                        else -> paraGapPx
+                                        !seg.firstOfBlock -> ReaderLayout.paraGap
+                                        seg.block.blockType == BlockType.KEY_POINT -> ReaderLayout.keyPointGap
+                                        else -> ReaderLayout.blockGap
                                     }
-                                    Spacer(Modifier.height(with(density) { gap.toDp() }))
+                                    Spacer(Modifier.height(gap))
                                 }
                                 BlockContent(
                                     block = seg.block,
@@ -430,7 +471,7 @@ fun ReaderScreen(
                                     onOpenNode = { selectedNode = it },
                                     onOpenSources = { sourceBlockId = seg.block.id },
                                     palette = palette,
-                                    fontSp = fontSp,
+                                    typography = typography,
                                     textOverride = if (seg.block.blockType == BlockType.STORY) seg.text else null,
                                     showAttachments = seg.lastOfBlock,
                                 )
@@ -529,7 +570,7 @@ fun ReaderScreen(
                         onOpenNode = { selectedNode = it },
                         onOpenSources = { sourceBlockId = block.id },
                         palette = palette,
-                        fontSp = fontSp,
+                        typography = typography,
                     )
                 }
                 item(key = "__footer__") {
@@ -615,7 +656,12 @@ fun ReaderScreen(
                 onToc = { showToc = true },
                 onSettings = { showReaderSettings = true },
                 onSeek = { pageIdx ->
-                    scope.launch { pagerState.scrollToPage(pageIdx) }
+                    // 页码来自渲染时读到的 pageCount，但改字号/重生成正文会先让页数变小，
+                    // 再触发这里的滚动——不夹一下就落到不存在的页上（IllegalArgumentException）
+                    scope.launch {
+                        val last = (pagerState.pageCount - 1).coerceAtLeast(0)
+                        pagerState.scrollToPage(pageIdx.coerceIn(0, last))
+                    }
                 },
             )
         }
@@ -673,6 +719,8 @@ fun ReaderScreen(
         ReaderSettingsSheet(
             fontIndex = fontIndex,
             onFont = { vm.setFontSize(it) },
+            serif = serifBody,
+            onSerif = { vm.setSerif(it) },
             paper = paper,
             onPaper = { vm.setPaper(it) },
             mode = readerMode,
@@ -723,26 +771,26 @@ fun ReaderScreen(
     }
 }
 
-/** 翻页模式第一页的章首头：章名 + 章序 + 必要的一次性提示 */
+/**
+ * 翻页模式第一页的章首头：章名 + 章序 + 必要的一次性提示。
+ *
+ * 样式与间距必须逐条对上 PageMeasurer.header（headerTitle/6dp/headerOrder/
+ * 每条 notice 的 noticeGap+notice+10dp×2），量多少画多少才不会把第一条正文顶出页。
+ */
 @Composable
 private fun ReaderPageHeader(
     title: String,
     order: String,
     notices: List<String>,
+    typography: ReaderTypography,
     palette: ReaderPalette,
 ) {
     Column {
-        Text(
-            title,
-            fontSize = 24.sp,
-            lineHeight = 32.sp,
-            fontWeight = FontWeight.Bold,
-            color = palette.text,
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(order, style = MaterialTheme.typography.labelMedium, color = palette.secondary)
+        Text(title, style = typography.headerTitle, color = palette.text)
+        Spacer(Modifier.height(6.dp))
+        Text(order, style = typography.headerOrder, color = palette.secondary)
         notices.forEach { notice ->
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(ReaderLayout.noticeGap))
             Surface(
                 color = palette.cardContainer,
                 shape = MaterialTheme.shapes.small,
@@ -750,7 +798,7 @@ private fun ReaderPageHeader(
             ) {
                 Text(
                     notice,
-                    style = MaterialTheme.typography.bodySmall,
+                    style = typography.notice,
                     color = palette.cardContent,
                     modifier = Modifier.padding(10.dp),
                 )
@@ -1143,10 +1191,15 @@ private fun ChapterFooter(
             style = MaterialTheme.typography.titleSmall,
             color = palette.secondary,
         )
-        // 无资料模式：章末列出需要自己核对的断言（问题3）
+        // 无资料模式：章末列出需要自己核对的断言（问题3）。
+        // 传纸面色——夜间纸面上跟主题走的卡片会浮成一块刺眼的白
         chapter?.unverifiedClaims?.takeIf { it.isNotEmpty() }?.let { claims ->
             Spacer(Modifier.height(16.dp))
-            UnverifiedClaimsCard(claims = claims)
+            UnverifiedClaimsCard(
+                claims = claims,
+                container = palette.cardContainer,
+                content = palette.cardContent,
+            )
         }
         Spacer(Modifier.height(16.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1307,8 +1360,8 @@ private fun BlockContent(
     onOpenNode: (KnowledgeNode) -> Unit,
     onOpenSources: () -> Unit,
     palette: ReaderPalette,
-    /** 正文基准字号（sp），随阅读设置变化 */
-    fontSp: Int,
+    /** 测量与渲染共用的样式表——字号/行高/字距/字体族与分页测量一字不差 */
+    typography: ReaderTypography,
     /** 翻页模式下本段实际渲染的文本（STORY 段落级切分）；null 表示整块 */
     textOverride: String? = null,
     /** 翻页模式下只有块的最后一段才挂知识点 chip 与来源入口 */
@@ -1333,72 +1386,68 @@ private fun BlockContent(
         when (block.blockType) {
             BlockType.STORY -> {
                 Text(
-                    textOverride ?: block.text,
-                    fontSize = fontSp.sp,
-                    lineHeight = (fontSp * 1.7f).sp,
+                    textOverride ?: ReaderTypography.indentFirst(block.text),
+                    style = typography.story,
                     color = palette.text,
                 )
             }
 
             // 推演的落锤处：一句话钉住结论，用左侧竖线 + 大字号让它在长文里跳出来（问题2）
-            BlockType.KEY_POINT -> {
-                val kpFs = fontSp + 2
-                Row(
+            BlockType.KEY_POINT -> Row(
+                Modifier
+                    .fillMaxWidth()
+                    // IntrinsicSize.Min 让左杠以文字高度为准。
+                    // 没有它，fillMaxHeight 的杠会以整页高度为上限拉满——
+                    // 一个两行的结论，红杠却从文字一直贯到页尾（2026-09-07 老板截图）
+                    .height(IntrinsicSize.Min),
+            ) {
+                Box(
                     Modifier
-                        .fillMaxWidth()
-                        // IntrinsicSize.Min 让左杠以文字高度为准。
-                        // 没有它，fillMaxHeight 的杠会以整页高度为上限拉满——
-                        // 一个两行的结论，红杠却从文字一直贯到页尾（2026-09-07 老板截图）
-                        .height(IntrinsicSize.Min),
-                ) {
-                    Box(
-                        Modifier
-                            .width(3.dp)
-                            .fillMaxHeight()
-                            .background(palette.accent, RoundedCornerShape(2.dp)),
-                    )
-                    Spacer(Modifier.width(14.dp))
-                    Text(
-                        block.text,
-                        fontSize = kpFs.sp,
-                        lineHeight = (kpFs * 1.55f).sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = palette.text,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
+                        .width(3.dp)
+                        .fillMaxHeight()
+                        .background(palette.accent, RoundedCornerShape(2.dp)),
+                )
+                Spacer(Modifier.width(14.dp))
+                Text(
+                    block.text,
+                    style = typography.keyPoint,
+                    color = palette.text,
+                    modifier = Modifier.weight(1f),
+                )
             }
 
+            // 四类旁注卡各有一套颜色 + 左侧色条，不再共用一个米色容器；
+            // emoji 标签（📘💡…）跨机型渲染漂移、也配不上纸质书，换成色条 + 文字标签
             BlockType.EXPLANATION -> BlockCard(
-                label = "📘 知识讲解",
+                label = "知识讲解",
                 text = block.text,
-                container = palette.cardContainer,
-                content = palette.cardContent,
-                fontSp = fontSp,
+                tone = palette.explanation,
+                border = palette.cardBorder,
+                typography = typography,
             )
 
             BlockType.FACT -> BlockCard(
-                label = "📄 原始事实",
+                label = "原始事实",
                 text = block.text,
-                container = palette.cardContainer,
-                content = palette.cardContent,
-                fontSp = fontSp,
+                tone = palette.fact,
+                border = palette.cardBorder,
+                typography = typography,
             )
 
             BlockType.ANALOGY -> BlockCard(
-                label = "💡 类比说明",
+                label = "类比说明",
                 text = block.text,
-                container = palette.cardContainer,
-                content = palette.cardContent,
-                fontSp = fontSp,
+                tone = palette.analogy,
+                border = palette.cardBorder,
+                typography = typography,
             )
 
             BlockType.FICTION -> BlockCard(
-                label = "🎭 虚构演绎",
+                label = "虚构演绎",
                 text = block.text,
-                container = palette.cardContainer,
-                content = palette.cardContent,
-                fontSp = fontSp,
+                tone = palette.fiction,
+                border = palette.cardBorder,
+                typography = typography,
             )
         }
 
@@ -1408,10 +1457,7 @@ private fun BlockContent(
                 block.knowledgeNodeIds.forEach { nodeId ->
                     val node = nodes.firstOrNull { it.id == nodeId }
                     if (node != null) {
-                        AssistChip(
-                            onClick = { onOpenNode(node) },
-                            label = { Text("🔗 ${node.title}") },
-                        )
+                        ReaderChip(text = node.title, palette = palette, onClick = { onOpenNode(node) })
                     }
                 }
             }
@@ -1447,28 +1493,84 @@ private fun BlockContent(
     }
 }
 
+/**
+ * 一类旁注卡：左侧色条 + 类型标签 + 正文。
+ *
+ * 高度构成必须与 PageMeasurer.card 一字不差——label(cardLabel) + cardLabelGap +
+ * 正文(cardBody) + 14dp×2 内边距，所以这里 padding=ReaderLayout.cardPadding、
+ * label 间距=cardLabelGap、样式取 typography。色条在行内不占高度。
+ */
 @Composable
 private fun BlockCard(
     label: String,
     text: String,
-    container: Color,
-    content: Color,
-    fontSp: Int,
+    tone: CardTone,
+    border: Color,
+    typography: ReaderTypography,
 ) {
-    val bodyFs = (fontSp - 2).coerceAtLeast(13)
-    Surface(
-        color = container,
-        shape = MaterialTheme.shapes.medium,
-        modifier = Modifier.fillMaxWidth(),
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(IntrinsicSize.Min),
     ) {
-        Column(Modifier.padding(14.dp)) {
-            Text(label, style = MaterialTheme.typography.labelMedium, color = content)
-            Spacer(Modifier.height(6.dp))
+        Box(
+            Modifier
+                .width(3.dp)
+                .fillMaxHeight()
+                .background(tone.rule, RoundedCornerShape(2.dp)),
+        )
+        Spacer(Modifier.width(10.dp))
+        Surface(
+            color = tone.container,
+            contentColor = tone.content,
+            shape = MaterialTheme.shapes.small,
+            border = androidx.compose.foundation.BorderStroke(1.dp, border),
+            modifier = Modifier.weight(1f),
+        ) {
+            Column(Modifier.padding(ReaderLayout.cardPadding)) {
+                Text(label, style = typography.cardLabel, color = tone.rule)
+                Spacer(Modifier.height(ReaderLayout.cardLabelGap))
+                Text(text, style = typography.cardBody, color = tone.content)
+            }
+        }
+    }
+}
+
+/**
+ * 阅读器里的知识点 chip：吃纸面调色板而不是 MaterialTheme。
+ *
+ * AssistChip 的底色跟着主题走——切到夜间纸面时它会浮成一团白，像贴了张便利贴。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ReaderChip(
+    text: String,
+    palette: ReaderPalette,
+    onClick: () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        color = palette.chips,
+        contentColor = palette.chipContent,
+        shape = CircleShape,
+    ) {
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Default.School,
+                contentDescription = null,
+                tint = palette.chipContent,
+                modifier = Modifier.size(14.dp),
+            )
+            Spacer(Modifier.width(4.dp))
             Text(
                 text,
-                fontSize = bodyFs.sp,
-                lineHeight = (bodyFs * 1.55f).sp,
-                color = content,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 200.dp),
             )
         }
     }

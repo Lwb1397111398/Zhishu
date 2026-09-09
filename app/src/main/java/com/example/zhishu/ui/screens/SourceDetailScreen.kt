@@ -35,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
@@ -235,12 +236,16 @@ private fun ChunkCard(
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(12.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // locator 可能是长章节路径：省略收尾，右侧引用数固宽永不被挤掉
                 Text(
                     chunk.locatorLabel,
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                 )
                 if (citingBlocks.isNotEmpty()) {
                     Text(

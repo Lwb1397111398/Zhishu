@@ -38,6 +38,7 @@ class OpenAiModelProviderTest {
     private fun provider(
         maxTokens: Int = 4096,
         temperature: Float = 0.7f,
+        firstTokenTimeoutMillis: Long = 90_000,
     ): OpenAiModelProvider {
         val profile = ApiProfile(
             name = "test",
@@ -47,7 +48,12 @@ class OpenAiModelProviderTest {
             temperature = temperature,
         )
         // MockWebServer 是 http，测试关掉 HTTPS 强制
-        return OpenAiModelProvider(profile = profile, apiKey = "test-key", requireHttps = false)
+        return OpenAiModelProvider(
+            profile = profile,
+            apiKey = "test-key",
+            requireHttps = false,
+            firstTokenTimeoutMillis = firstTokenTimeoutMillis,
+        )
     }
 
     private fun request(): ModelRequest = ModelRequest(
@@ -342,4 +348,7 @@ class OpenAiModelProviderTest {
         assertEquals("没有 usage 时不得回调", 0, calls)
         assertEquals(null, captured)
     }
+
+    // 流式可靠性降级的回归测试已移至 OpenAiModelProviderStreamTest（不挂 Robolectric，
+    // 本机内存紧张时可稳定运行）。
 }

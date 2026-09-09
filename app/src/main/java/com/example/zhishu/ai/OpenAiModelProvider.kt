@@ -149,6 +149,17 @@ class OpenAiModelProvider(
     private val socketTimeoutMillis: Long = 300_000,
     private val requestTimeoutMillis: Long = 600_000,
     /**
+     * 流式请求的「无数据超时」：两次响应数据之间最长可容忍的间隔（默认 90 秒）。
+     *
+     * 限流中的中转站典型表现是 HTTP 200 已返回、却迟迟不吐第一个字节（排在队列
+     * 里干等）。正常流式生成期间连接上持续有 chunk 流动，90 秒没有任何数据 =
+     * 要么排队卡死、要么中途断流——继续按 socketTimeout（300 秒）死等只会让界面
+     * 挂在「正在写正文」几分钟。实现方式：流式走独立的 [streamClient]，把 OkHttp
+     * 的 readTimeout 压到本值，超时由 socket 层真正触发（协程 withTimeout 掐不住
+     * 引擎的阻塞读，试过，白等）。超时后降级为非流式重发，代价只是重来一次。
+     */
+    private val firstTokenTimeoutMillis: Long = 90_000,
+    /**
      * 关闭推理模型的思考（Ark thinking:disabled）。样本运行器用：
      * 把 doubao-seed 等推理模型当普通对话模型，避免长思考导致超时与高成本。
      */
@@ -163,9 +174,31 @@ class OpenAiModelProvider(
 ) : ModelProvider {
     init {
         require(socketTimeoutMillis > 0 && requestTimeoutMillis > 0) { "超时必须是正数" }
+        require(firstTokenTimeoutMillis > 0) { "首字超时必须是正数" }
     }
 
     private val client: HttpClient = clientOverride ?: defaultClient(socketTimeoutMillis, requestTimeoutMillis)
+
+    /**
+     * 流式专用客户端：与非流式同一套配置，唯一区别是 OkHttp 引擎的 readTimeout =
+     * [firstTokenTimeoutMillis]。数据块之间一旦间隔超过它（最常见：200 后排队不吐
+     * 首字节），socket 层立即抛超时，[readStreamResponse] 据此降级非流式重发。
+     *
+     * 为什么不用 HttpTimeout 插件的 socketTimeoutMillis：实测它对 ktor 引擎的
+     * 流式读不生效（挂死的流式连接一路等到 requestTimeout 才触发），必须由
+     * OkHttp 引擎自己的 readTimeout 来掐。
+     */
+    private val streamClient: HttpClient = clientOverride ?: defaultStreamClient(firstTokenTimeoutMillis)
+
+    /**
+     * 本次业务调用内「流式已证明不可靠」的标记（首字迟迟不来、或中途断流）。
+     *
+     * Provider 每次业务生成新建一个实例（见 ConfiguredModelRouter.resolveProvider），
+     * 所以这个标记天然覆盖 DefaultModelRouter 的整段退避重试：第一次流式抖动后
+     * 改用非流式，不再反复重试同一个不稳定的流式请求。下一次业务生成恢复默认（流式优先）。
+     */
+    @Volatile
+    private var streamUnusable = false
 
     override suspend fun listModels(): Result<List<String>> {
         return try {
@@ -196,6 +229,15 @@ class OpenAiModelProvider(
         val dropStreamOptions: Boolean = false,
         val dropStream: Boolean = false,
     ) : Exception("unsupported parameter")
+
+    /**
+     * 流式路径「不可靠」的信号：首字节迟迟不来、或已吐一部分后中途断流。
+     *
+     * 与非流式业务错误不同，它不是服务商明确拒绝参数，而是连接层面的抖动——
+     * 最常见的来源是限流排队（200 后不吐字节）。此时反复重试流式只会反复抖动，
+     * 所以外层捕获后把 [streamUnusable] 置真，改用非流式重发这一次调用。
+     */
+    private class StreamFallback(val reason: String) : Exception(reason)
 
     override suspend fun complete(
         request: ModelRequest,
@@ -230,39 +272,57 @@ class OpenAiModelProvider(
                     streamOptions = if (useStream && useStreamOptions) StreamOptionsDto() else null,
                 )
                 val startedAt = System.currentTimeMillis()
-                return client.preparePost(url) {
-                    header(HttpHeaders.Authorization, "Bearer $apiKey")
-                    contentType(ContentType.Application.Json)
-                    setBody(body)
-                }.execute { response ->
-                    val latencyMillis = System.currentTimeMillis() - startedAt
-                    if (!response.status.isSuccess()) {
-                        val text = response.bodyAsText()
-                        onRawResponse(text)
-                        val rejected = rejectsParam(text)
-                        if (rejected != null) throw rejected
-                        return@execute Result.failure(
-                            classify(response.status.value, errorMessage(text, response.status.value), response),
-                        )
+                // 流式走专用客户端：readTimeout 压到首字超时，排队卡死能在秒级暴露
+                return try {
+                    (if (useStream) streamClient else client).preparePost(url) {
+                        header(HttpHeaders.Authorization, "Bearer $apiKey")
+                        contentType(ContentType.Application.Json)
+                        setBody(body)
+                    }.execute { response ->
+                        val latencyMillis = System.currentTimeMillis() - startedAt
+                        if (!response.status.isSuccess()) {
+                            val text = response.bodyAsText()
+                            onRawResponse(text)
+                            val rejected = rejectsParam(text)
+                            if (rejected != null) throw rejected
+                            return@execute Result.failure(
+                                classify(response.status.value, errorMessage(text, response.status.value), response),
+                            )
+                        }
+                        if (useStream) {
+                            readStreamResponse(response, latencyMillis, onUsage, onRawResponse)
+                        } else {
+                            handleResponse(response, latencyMillis, onUsage, onRawResponse)
+                        }
                     }
+                } catch (e: StreamFallback) {
+                    throw e
+                } catch (e: java.io.IOException) {
+                    // OkHttp 引擎读超时（streamClient 的 readTimeout=firstToken）发生时，
+                    // 异常在 body 泵线程抛出并顶替 execute 闭包里已抛的 StreamFallback
+                    // （lambda 异常降为 suppressed）——所以 [readStreamResponse] 内层的转换
+                    // 未必拦得住，这里再兜一道：流式的 IOException 一律视为抖动、降级非流式；
+                    // 非流式原样上抛给 complete 顶层按网络错误处理。
                     if (useStream) {
-                        readStreamResponse(response, latencyMillis, onUsage, onRawResponse)
-                    } else {
-                        handleResponse(response, latencyMillis, onUsage, onRawResponse)
+                        throw StreamFallback("流式响应中断或超时：${e.message ?: e::class.simpleName}")
                     }
+                    throw e
                 }
             }
 
             // 降级顺序：流式+usage → 去 stream_options → 整个转非流式；thinking 参数单独降级。
-            // 每一级只在服务商明确抱怨对应参数时才触发，真正的业务错误原样上抛。
+            // 每一级只在服务商明确抱怨对应参数、或流式实际抖动（首字超时/中途断流）时才触发，
+            // 真正的业务错误原样上抛。上限 = 参数降级 3 次 + 流式抖动 1 次 + 余量 2。
             var dropThinking = false
             var dropStreamOptions = false
             var dropStream = false
-            var fallbackError: Throwable? = null
-            repeat(4) {
+            var attempts = 0
+            while (attempts++ < 6) {
                 try {
                     return send(
-                        useStream = !dropStream,
+                        // 流式一旦证明不可靠（本实例内），后续全部直接走非流式，
+                        // 不再反复重试同一个不稳定的流式请求
+                        useStream = !dropStream && !streamUnusable,
                         useStreamOptions = !dropStreamOptions,
                         useThinking = !dropThinking,
                     )
@@ -270,7 +330,8 @@ class OpenAiModelProvider(
                     dropThinking = dropThinking || e.dropThinking
                     dropStreamOptions = dropStreamOptions || e.dropStreamOptions
                     dropStream = dropStream || e.dropStream
-                    fallbackError = e
+                } catch (e: StreamFallback) {
+                    streamUnusable = true
                 }
             }
             Result.failure(
@@ -319,6 +380,11 @@ class OpenAiModelProvider(
      * usage 取自最后一个 chunk（stream_options.include_usage）。
      * 兼容两类「不按规矩来的服务商」：① 返回完整 JSON 而非 SSE——按非流式解析；
      * ② 中途断流但 finish_reason 已到——内容完整，照常成功。
+     *
+     * 「等不到第一个字节」和「吐了一半被掐断」都抛 [StreamFallback]：这不是业务错误，
+     * 重试同一个流式请求只会再抖一次。外层据此改用非流式重发（complete 注释）。
+     * 限流中的中转站典型表现恰恰是 HTTP 200 后迟迟不吐首字节——按 socket 空闲
+     * 超时（300 秒）死等，用户看到的就是「正在写正文」挂几分钟然后报「服务商不可用」。
      */
     private suspend fun readStreamResponse(
         response: HttpResponse,
@@ -333,19 +399,37 @@ class OpenAiModelProvider(
         var usage: UsageDto? = null
         val raw = StringBuilder()
         val dataLines = mutableListOf<String>()
-        while (!channel.isClosedForRead) {
-            val line = channel.readUTF8Line() ?: break
-            raw.appendLine(line)
-            if (!line.startsWith("data:")) continue
-            val payload = line.removePrefix("data:").trim()
-            if (payload == "[DONE]") break
-            dataLines.add(payload)
-            val chunk = runCatching { lenientJson.decodeFromString<StreamChunk>(payload) }.getOrNull() ?: continue
-            chunk.usage?.let { usage = it }
-            val choice = chunk.choices.firstOrNull() ?: continue
-            choice.finishReason?.let { finishReason = it }
-            choice.delta?.content?.let { content.append(it) }
-            choice.delta?.reasoningContent?.let { reasoning.append(it) }
+        try {
+            while (!channel.isClosedForRead) {
+                val line = channel.readUTF8Line() ?: break
+                raw.appendLine(line)
+                if (!line.startsWith("data:")) continue
+                val payload = line.removePrefix("data:").trim()
+                if (payload == "[DONE]") break
+                dataLines.add(payload)
+                val chunk = runCatching { lenientJson.decodeFromString<StreamChunk>(payload) }.getOrNull() ?: continue
+                chunk.usage?.let { usage = it }
+                val choice = chunk.choices.firstOrNull() ?: continue
+                choice.finishReason?.let { finishReason = it }
+                choice.delta?.content?.let { content.append(it) }
+                choice.delta?.reasoningContent?.let { reasoning.append(it) }
+            }
+        } catch (e: StreamFallback) {
+            onRawResponse(raw.toString())
+            throw e
+        } catch (e: java.io.IOException) {
+            // streamClient 的 readTimeout = firstTokenTimeoutMillis 在这里生效：
+            // ① 一个数据块都没收到就超时 = 排队卡死（200 后不吐首字节）；
+            // ② 收到一半断流 = 网关掐连接/网络抖动。
+            // 两者都不是业务错误，重试同一个流式请求只会再抖一次——
+            // 抛 StreamFallback 让外层立即改用非流式重发。
+            onRawResponse(raw.toString())
+            if (dataLines.isEmpty()) {
+                throw StreamFallback(
+                    "服务器 ${(firstTokenTimeoutMillis / 1000).coerceAtLeast(1)} 秒没有返回任何内容（通常在限流排队）。",
+                )
+            }
+            throw StreamFallback("生成中途连接中断：${e.message ?: "网络错误"}")
         }
         onRawResponse(raw.toString())
         usage?.let {
@@ -363,10 +447,10 @@ class OpenAiModelProvider(
         if (dataLines.isEmpty()) {
             return parseCompletionBody(raw.toString(), latencyMillis, onUsage)
         }
-        // 连接中途断掉且服务端没给结束标记：内容不完整，按网络错误让上层重试
+        // 连接中途断掉且服务端没给结束标记：内容不完整，换非流式重发
         if (finishReason == null && content.isNotEmpty()) {
-            return Result.failure(
-                ModelError.Network("生成中途连接中断（服务端未发送完成标记），已收到 ${content.length} 字。请重试。"),
+            throw StreamFallback(
+                "生成中途连接中断（服务端未发送完成标记），已收到 ${content.length} 字。",
             )
         }
         return judgeOutput(contentText = content.toString(), finishReason = finishReason, reasoningText = reasoning.toString())
@@ -534,6 +618,28 @@ class OpenAiModelProvider(
 
         /** 原始错误体最多保留这么长，避免整页 HTML 灌进提示里 */
         private const val ERROR_BODY_LIMIT = 300
+
+        /**
+         * 流式专用客户端工厂：只靠 OkHttp 引擎的 readTimeout 掐「首字超时」。
+         *
+         * 探针实测（ktor 2.3.12 + OkHttp，流式 body 200 后卡住不吐字节）：
+         *  • 仅设 connectTimeout + readTimeout：readTimeout 秒级抛 SocketTimeoutException ✓
+         *  • 再叠加 callTimeout：readTimeout 反而失效，一路挂到调用结束 ✗
+         *  • 用 HttpTimeout 插件的 socketTimeout：覆盖引擎配置，形同虚设 ✗
+         * 所以这里刻意只用引擎 config、且不装 HttpTimeout。正常流式持续吐字节不会触发
+         * readTimeout；一旦排队卡死/中途断流超过 [OpenAiModelProvider.firstTokenTimeoutMillis]，
+         * [readStreamResponse] 捕获后降级非流式重发，不会死等。
+         */
+        fun defaultStreamClient(readTimeoutMillis: Long): HttpClient =
+            HttpClient(OkHttp) {
+                install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
+                engine {
+                    config {
+                        connectTimeout(20_000, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        readTimeout(readTimeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    }
+                }
+            }
 
         fun defaultClient(socketTimeout: Long = 300_000, requestTimeout: Long = 600_000): HttpClient =
             HttpClient(OkHttp) {

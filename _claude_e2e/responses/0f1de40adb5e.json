@@ -1,0 +1,7 @@
+{"issues":[],"unverifiedClaims":["可见光的波长边界（约380到750纳米）以及红约700、紫约400纳米等具体数值为近似，不同教材/测量口径略有出入，需核对权威出处","各色大致的纳米对应值（如红650、蓝470）是教学用近似，精确色度与波长映射依赖标准观察者曲线，建议查证","『品红是红与蓝叠加、光谱上无单色品红』的表述属色彩科学共识，但具体合成比例未给数值，如需精确应查色度学资料"],"checks":[
+{"nodeTitle":"可见光","claim":"INTRODUCED","evidence":"PRESENT","evidenceBlockIds":[],"comment":"正文用『白是眼睛的收据、可见光380-750nm』把可见光概念真正引出并讲透"},
+{"nodeTitle":"电磁波谱","claim":"INTRODUCED","evidence":"PRESENT","evidenceBlockIds":[],"comment":"借林越画正弦线讲波长与全谱排布，可见光在谱上的位置被讲清"},
+{"nodeTitle":"棱镜色散","claim":"INTRODUCED","evidence":"PRESENT","evidenceBlockIds":[],"comment":"从彩带现象到『折射率随波长变』机制，并纠正『色散创造颜色』的误解"},
+{"nodeTitle":"光的干涉与衍射","claim":"APPLIED","evidence":"PRESENT","evidenceBlockIds":[],"comment":"用光栅/双缝给波长定量编号，是本章把定性顺序变可测刻度的应用环节"},
+{"nodeTitle":"波长与颜色的对应","claim":"INTRODUCED","evidence":"PRESENT","evidenceBlockIds":[],"comment":"对应表建立、并以品红说明对应非一一，概念讲透"}
+]}

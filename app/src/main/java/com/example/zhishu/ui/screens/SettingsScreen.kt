@@ -694,10 +694,15 @@ private fun ProfileSummaryCard(
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                // 方案名用户可自填，「使用中」列出所有角色：两段都可变长，
+                // 都得带 weight——无 weight 的那个会先量走全部宽度，把另一个挤到 0
                 Text(
                     profile.name.ifBlank { "未命名方案" },
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1.4f, fill = false),
                 )
                 Spacer(Modifier.width(8.dp))
                 if (usedBy.isNotEmpty()) {
@@ -705,6 +710,9 @@ private fun ProfileSummaryCard(
                         "使用中：${usedBy.joinToString("、") { it.displayName }}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
                     )
                 }
             }

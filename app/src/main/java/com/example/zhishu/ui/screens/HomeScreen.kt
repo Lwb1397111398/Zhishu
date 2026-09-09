@@ -616,8 +616,9 @@ fun KnowledgeHubScreen(
         },
     ) { padding ->
         if (projects.isEmpty()) {
-            Box(Modifier.padding(padding)) {
+            Box(Modifier.fillMaxSize().padding(padding)) {
                 EmptyState(
+                    modifier = Modifier.fillMaxSize(),
                     icon = Icons.Default.School,
                     title = "暂无知识地图",
                     subtitle = "先在书架上打开一本书并生成知识地图，所有知识点会以树形结构呈现在这里。",
@@ -824,8 +825,9 @@ fun ReviewScreen(
         },
     ) { padding ->
         if (items.isEmpty()) {
-            Box(Modifier.padding(padding)) {
+            Box(Modifier.fillMaxSize().padding(padding)) {
                 EmptyState(
+                    modifier = Modifier.fillMaxSize(),
                     icon = Icons.Default.Star,
                     title = "暂无到期复习",
                     subtitle = "间隔复习是可选功能。在「我的」页打开后，读过的知识点会按 1/3/7 天的节奏排进这里。",

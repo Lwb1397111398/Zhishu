@@ -86,8 +86,16 @@ class SourceDetailViewModel(
     }
 }
 
-/** 未核实内容的一条（4C） */
+/**
+ * 未核实内容的一条（4C）。
+ *
+ * [sourceId] 是这条记录的唯一身份（citation.id / issue.id）：列表项的 LazyColumn key
+ * 必须用它——kind/title 是可重复的展示文本（同章多条「出处没能对上资料」title 相同），
+ * blockId 在源块已不属于当前版本时为空，两者拼出来的 key 会撞车，
+ * 表现为「逐条查看往下一滑就闪退」（Key was already used）。
+ */
 data class TrustEntry(
+    val sourceId: String,
     val kind: Kind,
     val chapterId: String,
     val chapterOrder: Int,
@@ -159,6 +167,7 @@ class TrustCenterViewModel(
                 val block = blocks[citation.blockId]
                 val deleted = citation.status == CitationStatus.SOURCE_DELETED
                 TrustEntry(
+                    sourceId = citation.id,
                     kind = if (deleted) {
                         TrustEntry.Kind.DELETED_SOURCE
                     } else {
@@ -189,6 +198,7 @@ class TrustCenterViewModel(
             val fromIssues = issues.map { issue ->
                 val plan = plans[issue.chapterId]
                 TrustEntry(
+                    sourceId = issue.id,
                     kind = TrustEntry.Kind.OPEN_ISSUE,
                     chapterId = issue.chapterId,
                     chapterOrder = plan?.order ?: 0,

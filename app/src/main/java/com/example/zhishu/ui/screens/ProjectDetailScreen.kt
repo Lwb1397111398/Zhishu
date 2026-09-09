@@ -7,12 +7,15 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -282,7 +285,7 @@ fun ProjectDetailScreen(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun SourcesTab(
     project: com.example.zhishu.domain.model.Project?,
@@ -354,7 +357,8 @@ private fun SourcesTab(
 
         if (!modelKnowledge) {
             item {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // FlowRow：大字号下三个来源按钮不会挤成一条裁掉「文件」，放不下的自动换行
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = { showText = true }) {
                         Icon(Icons.Default.NoteAdd, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
@@ -378,7 +382,8 @@ private fun SourcesTab(
                         icon = Icons.Default.NoteAdd,
                         title = "还没有资料",
                         subtitle = "添加教材、讲义、法条或网页内容；或者切换到上面的「AI 自备知识」，让 AI 自己组织这门学科。",
-                        modifier = Modifier.height(220.dp),
+                        // min 而不是定值：定高在大字号下会把副标题裁掉
+                        modifier = Modifier.heightIn(min = 220.dp),
                     )
                 }
             } else {
@@ -1112,7 +1117,7 @@ private fun KnowledgeInsightCard(
  * 不如直接不给这个按钮。
  */
 @Composable
-private fun GapActionRow(
+internal fun GapActionRow(
     gap: KnowledgeGap,
     patching: Boolean,
     onPatchGap: (String) -> Unit,
@@ -1125,14 +1130,31 @@ private fun GapActionRow(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onTertiaryContainer,
         )
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        // 「补上」按钮里的标题是模型给的，长短完全不可控：不约束就会把旁边的
+        // 「知道了」整颗挤出屏幕（按钮们均分宽度，长标题省略号收尾而不是赶走兄弟）
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             if (canPatch) {
-                Button(onClick = { onPatchGap(gap.id) }, enabled = !patching) {
-                    Text(if (patching) "正在补上…" else "补上「${gap.suggestedTitle}」")
+                Button(
+                    onClick = { onPatchGap(gap.id) },
+                    enabled = !patching,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(
+                        if (patching) "正在补上…" else "补上「${gap.suggestedTitle}」",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
-                Spacer(Modifier.width(8.dp))
             }
-            OutlinedButton(onClick = { onDismissGap(gap.id) }, enabled = !patching) {
+            // 不带 weight：Row 先按固宽量它，再让「补上」吃剩余——它永远挤不掉
+            OutlinedButton(
+                onClick = { onDismissGap(gap.id) },
+                enabled = !patching,
+            ) {
                 Text("知道了")
             }
         }
@@ -1194,8 +1216,16 @@ private fun TreeNodeRow(
         )
         Spacer(Modifier.width(8.dp))
         Column(Modifier.weight(1f)) {
+            // 节点标题是模型生成的长文本：给它 weight，状态标签（固宽）才不会被挤出屏幕
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(node.title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                Text(
+                    node.title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
                 node.generateStatusLabel()?.let { (labelText, labelColor) ->
                     Spacer(Modifier.width(6.dp))
                     Text(
@@ -1305,7 +1335,12 @@ private fun NodeDetailSheet(
         }
         Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("已确认（可用于后续故事规划）", style = MaterialTheme.typography.bodyMedium)
+            Text(
+                "已确认（可用于后续故事规划）",
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 2,
+                modifier = Modifier.weight(1f),
+            )
             Spacer(Modifier.width(8.dp))
             Switch(checked = node.confirmed, onCheckedChange = onToggleConfirm)
         }

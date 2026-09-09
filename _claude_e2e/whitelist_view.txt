@@ -1,0 +1,15 @@
+KEY 30a9374e5534 | ch 2 透明空气里的拦路者 | type INTRODUCE
+  allowed: #nk-6、#nk-7、#nk-8、#nk-9
+  already: #nk-1、#nk-2、#nk-3、#nk-4、#nk-5
+KEY 51914c240b23 | ch 5 用一场日落检验整条链 | type APPLY
+  allowed: #nk-17、#nk-18
+  already: #nk-1、#nk-2、#nk-3、#nk-4、#nk-5、#nk-6、#nk-7、#nk-8、#nk-9、#nk-10、#nk-11、#nk-12、#nk-13、#nk-14、#nk-15、#nk-16
+KEY 737554025179 | ch 3 天空的蓝色地图 | type CONTRAST
+  allowed: #nk-10、#nk-11、#nk-12
+  already: #nk-1、#nk-2、#nk-3、#nk-4、#nk-5、#nk-6、#nk-7、#nk-8、#nk-9
+KEY db64f3a6140a | ch 4 为什么不发紫 | type INTRODUCE
+  allowed: #nk-13、#nk-14、#nk-15、#nk-16
+  already: #nk-1、#nk-2、#nk-3、#nk-4、#nk-5、#nk-6、#nk-7、#nk-8、#nk-9、#nk-10、#nk-11、#nk-12
+KEY edf149cf8f18 | ch 1 白光里藏着什么 | type INTRODUCE
+  allowed: #nk-1、#nk-2、#nk-3、#nk-4、#nk-5
+  already: （无）

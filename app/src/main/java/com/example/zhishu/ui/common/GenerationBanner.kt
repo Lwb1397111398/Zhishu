@@ -25,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.zhishu.ui.viewmodel.GenerationUiState
@@ -208,12 +209,24 @@ private val CONFIG_ERROR_HINTS = listOf(
  * 与其假装可靠，不如把「这几处你该自己去核对」明确摆出来——
  * 这是无资料模式能被放心使用的前提。
  */
+/**
+ * [container] / [content] 非空时用这组色而不是主题色——阅读器章末的这张卡落在
+ * 纸面（含夜间）上，跟着主题走会在夜间纸上浮成一块白。阅读器传 palette，
+ * 其它地方不传、维持原样。
+ */
 @Composable
-fun UnverifiedClaimsCard(claims: List<String>, modifier: Modifier = Modifier) {
+fun UnverifiedClaimsCard(
+    claims: List<String>,
+    modifier: Modifier = Modifier,
+    container: Color? = null,
+    content: Color? = null,
+) {
     if (claims.isEmpty()) return
+    val bg = container ?: MaterialTheme.colorScheme.tertiaryContainer
+    val fg = content ?: MaterialTheme.colorScheme.onTertiaryContainer
     Surface(
-        color = MaterialTheme.colorScheme.tertiaryContainer,
-        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+        color = bg,
+        contentColor = fg,
         shape = MaterialTheme.shapes.medium,
         modifier = modifier.fillMaxWidth(),
     ) {

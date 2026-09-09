@@ -14,6 +14,7 @@ import com.example.zhishu.ai.outputs.ChapterContractOutput
 import com.example.zhishu.ai.outputs.ChapterOutput
 import com.example.zhishu.ai.outputs.ChapterPlanDto
 import com.example.zhishu.ai.outputs.ChapterType
+import com.example.zhishu.ai.outputs.canonicalNodeKey
 import com.example.zhishu.ai.outputs.ConflictDto
 import com.example.zhishu.ai.outputs.GapDto
 import com.example.zhishu.ai.outputs.ContractCodec
@@ -303,7 +304,7 @@ class PipelineService(
                 // 混入旧批次节点会匹配到错误目标；已展开摘要同理不该被旧地图污染
                 val nodes = knowledgeRepository.getByProjectAll(projectId)
                     .filter { it.batchId == batch.id }
-                val keyToNode = nodes.associateBy { it.nodeKey }
+                val keyToNode = nodes.associateBy { canonicalNodeKey(it.nodeKey) }
                 val titleToNode = nodes.associateBy { it.title.trim() }
                 val filledKeys = nodes
                     .filter { it.generateStatus == NodeGenerateStatus.COMPLETED.name }
@@ -410,7 +411,7 @@ class PipelineService(
                 // 抄写失误吞掉整个节点。已 COMPLETED 的共享节点跳过（先到先得）
                 var filledThisPass = 0
                 for (dto in valid) {
-                    val node = keyToNode[dto.nodeKey]
+                    val node = keyToNode[canonicalNodeKey(dto.nodeKey)]
                         ?: titleToNode[dto.title.trim()]
                         ?: continue
                     if (node.generateStatus == NodeGenerateStatus.COMPLETED.name) continue
@@ -622,7 +623,7 @@ class PipelineService(
         inheritedByTitle: Map<String, String>,
     ): List<KnowledgeGap> {
         val nodeTitles = nodes.map { it.title.trim() }.filter { it.isNotEmpty() }
-        val nodeByKey = nodes.associate { it.nodeKey to it.id }
+        val nodeByKey = nodes.associate { canonicalNodeKey(it.nodeKey) to it.id }
         val items = if (structured.isNotEmpty()) {
             structured.map { dto ->
                 GapItem(
@@ -1037,7 +1038,7 @@ class PipelineService(
                 decoder = jsonDecoder(VolumeOutlineOutput.serializer()),
             ).onFailure { lastError = it }.getOrNull() ?: return@repeat
 
-            val validKeys = volume.nodes.map { keyOf(it) }.toSet()
+            val validKeys = volume.nodes.map { canonicalNodeKey(keyOf(it)) }.toSet()
             val prepared = prepareOutline(raw, validKeys)
             if (prepared == null) {
                 lastError = ModelError.Invalid(
@@ -1050,7 +1051,7 @@ class PipelineService(
                 projectId = project.id,
                 volume = volume,
                 chapters = chapters,
-                keyToId = volume.nodes.associate { keyOf(it) to it.id },
+                keyToId = volume.nodes.associate { canonicalNodeKey(keyOf(it)) to it.id },
                 outline = raw.copy(
                     volumeTitle = raw.volumeTitle.ifBlank { "第一卷" },
                     chapters = chapters,
@@ -1089,11 +1090,18 @@ class PipelineService(
             .mapIndexed { index, chapter ->
                 if (chapter.order > 0) chapter else chapter.copy(order = index + 1)
             }
+            // 编号归一（#nk-3 ≡ nk-3）在这里一次做完：后面 keyToId 精确反解、
+            // computeIntroducedBy 的「谁在哪章首次引入」记账、契约白名单比对全都
+            // 吃同一份规范化结果，不必每处再各自 trim/去 #——漏一处就整章作废。
+            .map { chapter ->
+                chapter.copy(
+                    nodeKeys = chapter.nodeKeys.map(::canonicalNodeKey).filter { it.isNotEmpty() },
+                )
+            }
             .take(VOLUME_MAX_CHAPTERS)
         if (chapters.isEmpty()) return null
         val unknown = chapters
             .flatMap { it.nodeKeys }
-            .map { it.trim() }
             .filter { it.isNotBlank() && it !in validKeys }
             .distinct()
         if (unknown.isNotEmpty()) return null
@@ -1194,7 +1202,10 @@ class PipelineService(
         /** 非空时只补这一章（单章重试入口）。其余章节连 DONE 短路都不做 */
         targetPlanId: String? = null,
     ) {
-        val keyToNode = nodes.associateBy { nodeKeyLabel(it) }
+        // 契约回传的编号同样要归一，否则 `it.trim()` 精确查表会把 `nk-5` 这类少写 #
+        // 的输出判成「引用不存在的编号」，整章契约 FAILED、正文入口被拦死。
+        // keyByTitle 仍给 prompt 用（显示 #nk-N），不受影响。
+        val keyToNode = nodes.associateBy { canonicalNodeKey(nodeKeyLabel(it)) }
         val keyByTitle = NodeContext.keyByTitle(nodes) { nodeKeyLabel(it) }
         // 「谁在哪章首次引入」由程序推导，不采信模型声明——ContractIntroducedFix 的
         // 存在恰恰证明模型声明不可信
@@ -1216,7 +1227,7 @@ class PipelineService(
             // 那是因为目标章的 DONE 状态由调用方另行判断）
             if (targetPlanId != null && plan.id != targetPlanId) return@forEachIndexed
             val chapter = outline.chapters.getOrNull(index) ?: return@forEachIndexed
-            val chapterKeys = chapter.nodeKeys.map { it.trim() }.filter { it.isNotEmpty() }
+            val chapterKeys = chapter.nodeKeys.map { canonicalNodeKey(it) }.filter { it.isNotEmpty() }
             onProgress(GenerationProgress("正在定第 ${plan.order} 章的因果结构", 1 + index, total))
 
             // 更早章节已引入过的编号：这些不能再算「本章首次引入」
@@ -1382,6 +1393,13 @@ class PipelineService(
         keyByTitle: Map<String, String>,
     ): Result<ChapterContractOutput> {
         val chapterNodes = chapterKeys.mapNotNull { keyToNode[it] }
+        // 编号在内部一律归一为裸 nk-N（查表用），但「本章涉及的知识点」这一处要还原 `#`
+        // 前缀：nodeKeyLabel 的约定是 `#nk-3`（更易被模型当成编号原样抄回），且测试桩
+        // RouteStubs 的 KEY 正则也按 `#nk` 抓本章清单——归一化只该作用在匹配/查表层。
+        // canonicalNodeKey 已剥掉前导 #，这里的 key 必是裸的，直接补 # 不会出现 `##`。
+        // allowed / alreadyIntroduced 同样补 #：它们与本章清单一律同源（nodeKeyLabel 约定），
+        // 三处都喂 `#` 才能让模型把编号原样抄回，也才与 RouteStubs 桩的 `#nk` 正则一致。
+        val showKeys = { keys: Collection<String> -> keys.joinToString("、") { "#$it" } }
         val outlineText = buildString {
             appendLine("第 ${chapter.order} 章《${chapter.title}》")
             appendLine("章节类型：${chapter.chapterType}")
@@ -1394,18 +1412,18 @@ class PipelineService(
             }
             if (chapter.openingHook.isNotBlank()) appendLine("开场处境：${chapter.openingHook}")
             if (chapter.closingHook.isNotBlank()) appendLine("结尾留口：${chapter.closingHook}")
-            append("本章涉及的知识点：${chapterKeys.joinToString("、")}")
+            append("本章涉及的知识点：${showKeys(chapterKeys)}")
         }
         val prompt = prompts.load(PROMPT_CHAPTER_CONTRACT)
             .replace("{chapterOutline}", outlineText)
             .replace("{chapterType}", chapter.chapterType)
             .replace(
                 "{allowedNodeKeys}",
-                allowed.takeIf { it.isNotEmpty() }?.joinToString("、") ?: "（无：本章不引入新知识点）",
+                allowed.takeIf { it.isNotEmpty() }?.let(showKeys) ?: "（无：本章不引入新知识点）",
             )
             .replace(
                 "{alreadyIntroduced}",
-                alreadyIntroduced.takeIf { it.isNotEmpty() }?.joinToString("、") ?: "（无）",
+                alreadyIntroduced.takeIf { it.isNotEmpty() }?.let(showKeys) ?: "（无）",
             )
             .replace(
                 "{nodeDetails}",
@@ -1436,8 +1454,8 @@ class PipelineService(
         contract: ChapterContractDto,
         keyToNode: Map<String, KnowledgeNode>,
     ): ChapterContractDto = contract.copy(
-        introducedNodeTitles = contract.introducedNodeTitles.mapNotNull { keyToNode[it.trim()]?.title }.distinct(),
-        appliedNodeTitles = contract.appliedNodeTitles.mapNotNull { keyToNode[it.trim()]?.title }.distinct(),
+        introducedNodeTitles = contract.introducedNodeTitles.mapNotNull { keyToNode[canonicalNodeKey(it)]?.title }.distinct(),
+        appliedNodeTitles = contract.appliedNodeTitles.mapNotNull { keyToNode[canonicalNodeKey(it)]?.title }.distinct(),
     )
 
     /** 契约输出 DTO → 落库 DTO（节点字段此时还是编号） */
@@ -1446,8 +1464,8 @@ class PipelineService(
         priorIntuition = priorIntuition,
         obstacle = obstacle,
         knowledgeGap = knowledgeGap,
-        introducedNodeTitles = introducedNodeKeys.map { it.trim() }.filter { it.isNotEmpty() },
-        appliedNodeTitles = appliedNodeKeys.map { it.trim() }.filter { it.isNotEmpty() },
+        introducedNodeTitles = introducedNodeKeys.map { canonicalNodeKey(it) }.filter { it.isNotEmpty() },
+        appliedNodeTitles = appliedNodeKeys.map { canonicalNodeKey(it) }.filter { it.isNotEmpty() },
         requiredBeats = requiredBeats,
         resultingChange = resultingChange,
         bridgeToNext = bridgeToNext,
@@ -1511,7 +1529,8 @@ class PipelineService(
             val parts = entry.split(":")
             if (parts.size != 2) return@mapNotNull null
             val order = parts[1].toIntOrNull() ?: return@mapNotNull null
-            parts[0].trim() to order
+            // 键同样归一：老批次里存的可能是 `#nk-3:0`，与本章规范化后的 `nk-3` 必须是同一个键
+            canonicalNodeKey(parts[0]) to order
         }.toMap()
 
     /**

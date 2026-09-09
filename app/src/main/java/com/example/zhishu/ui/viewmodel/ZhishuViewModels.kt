@@ -1209,6 +1209,8 @@ class ReaderViewModel(
     val readerFontSizeIndex: StateFlow<Int> = container.learningPrefs.readerFontSize
     val readerPaper: StateFlow<com.example.zhishu.data.prefs.ReaderPaper> =
         container.learningPrefs.readerPaper
+    /** 正文衬线（宋体）/黑体切换 */
+    val readerSerif: StateFlow<Boolean> = container.learningPrefs.readerSerif
 
     fun setReaderMode(mode: com.example.zhishu.data.prefs.ReaderMode) {
         container.learningPrefs.setReaderMode(mode)
@@ -1220,6 +1222,10 @@ class ReaderViewModel(
 
     fun setPaper(paper: com.example.zhishu.data.prefs.ReaderPaper) {
         container.learningPrefs.setReaderPaper(paper)
+    }
+
+    fun setSerif(serif: Boolean) {
+        container.learningPrefs.setReaderSerif(serif)
     }
 
     /** 本章自测题数：0 时不显示「自测」按钮，但绝不阻塞继续读下一章。只数当前版本的题（3A） */

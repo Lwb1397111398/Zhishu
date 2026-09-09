@@ -43,9 +43,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.rememberTextMeasurer
-import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -54,13 +53,28 @@ import com.example.zhishu.data.prefs.ReaderPaper
 import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
-import com.example.zhishu.domain.model.ChapterStatus
+
+/**
+ * 一种卡片的配色：容器底 / 文字 / 左侧色条。
+ *
+ * 四类旁注卡（讲解 / 事实 / 类比 / 虚构）各有一套颜色，扫一眼就能分清
+ * 「这是讲解还是原话」——过去四种共用同一个米色容器，等于没有分类。
+ */
+data class CardTone(
+    val container: Color,
+    val content: Color,
+    val rule: Color,
+)
 
 /**
  * 阅读器的纸色调色板。
  *
  * 阅读区不跟主题走：米白纸感 / 纯白 / 夜间三种纸面各配一套固定的前景色，
  * 保证「打开就是一本纸质书」的观感，白天夜里都不需要用户再调主题。
+ *
+ * [chips] / [chipContent]：阅读器叠层（知识点 chip、来源入口）用的颜色。
+ * 阅读器里的组件一律吃这套色，不吃 MaterialTheme——否则「夜间纸」上
+ * 会浮出白底 chip，像贴了张便利贴。
  */
 data class ReaderPalette(
     val background: Color,
@@ -71,6 +85,14 @@ data class ReaderPalette(
     val accent: Color,
     val attention: Color,
     val menuScrim: Color,
+    val explanation: CardTone,
+    val fact: CardTone,
+    val analogy: CardTone,
+    val fiction: CardTone,
+    val chips: Color,
+    val chipContent: Color,
+    /** 卡片与纸面的分隔边框：纯白纸面上容器色几乎等于背景（1.03:1），全靠这条边才看得出卡 */
+    val cardBorder: Color,
 )
 
 fun readerPalette(paper: ReaderPaper): ReaderPalette = when (paper) {
@@ -82,18 +104,32 @@ fun readerPalette(paper: ReaderPaper): ReaderPalette = when (paper) {
         cardContent = Color(0xFF4A4238),
         accent = Color(0xFFD84315),
         attention = Color(0xFF44617B),
-        menuScrim = Color(0xF2FBF6EC),
+        menuScrim = Color(0xFFFBF6EC),
+        explanation = CardTone(Color(0xFFF1E8D4), Color(0xFF4A4238), Color(0xFF8A7145)),
+        fact = CardTone(Color(0xFFE8EDF2), Color(0xFF3D4A57), Color(0xFF5B7B99)),
+        analogy = CardTone(Color(0xFFEAEFE0), Color(0xFF44503A), Color(0xFF7A8B5A)),
+        fiction = CardTone(Color(0xFFF0E7F2), Color(0xFF4D3F55), Color(0xFF9070A0)),
+        chips = Color(0xFFEEE4CF),
+        chipContent = Color(0xFF4A4238),
+        cardBorder = Color(0x1A5A4A33),
     )
 
     ReaderPaper.WHITE -> ReaderPalette(
         background = Color(0xFFFFFFFF),
         text = Color(0xFF1C1B1F),
-        secondary = Color(0xFF79726A),
-        cardContainer = Color(0xFFF3F0EA),
+        secondary = Color(0xFF6E675F),
+        cardContainer = Color(0xFFEFEAE1),
         cardContent = Color(0xFF3A3630),
         accent = Color(0xFFD84315),
-        attention = Color(0xFF44617B),
-        menuScrim = Color(0xF2FFFFFF),
+        attention = Color(0xFF3D5A73),
+        menuScrim = Color(0xFFFFFFFF),
+        explanation = CardTone(Color(0xFFF1ECDF), Color(0xFF453F33), Color(0xFF8A7145)),
+        fact = CardTone(Color(0xFFE7ECF1), Color(0xFF39434D), Color(0xFF52718C)),
+        analogy = CardTone(Color(0xFFE9EEE0), Color(0xFF404B37), Color(0xFF6F8050)),
+        fiction = CardTone(Color(0xFFEFE6F2), Color(0xFF48394F), Color(0xFF87659A)),
+        chips = Color(0xFFEFEFEF),
+        chipContent = Color(0xFF3A3630),
+        cardBorder = Color(0x1F000000),
     )
 
     ReaderPaper.NIGHT -> ReaderPalette(
@@ -104,11 +140,147 @@ fun readerPalette(paper: ReaderPaper): ReaderPalette = when (paper) {
         cardContent = Color(0xFFCFC7B8),
         accent = Color(0xFFE5895B),
         attention = Color(0xFF8FB0CF),
-        menuScrim = Color(0xF2201D19),
+        menuScrim = Color(0xFF201D19),
+        explanation = CardTone(Color(0xFF2B2720), Color(0xFFCFC7B6), Color(0xFF9C8258)),
+        fact = CardTone(Color(0xFF252B31), Color(0xFFC6CDD4), Color(0xFF6E90AC)),
+        analogy = CardTone(Color(0xFF282D22), Color(0xFFC9D0BC), Color(0xFF8CA06A)),
+        fiction = CardTone(Color(0xFF2B2531), Color(0xFFD0C4D8), Color(0xFFA583B5)),
+        chips = Color(0xFF332F28),
+        chipContent = Color(0xFFCFC7B8),
+        cardBorder = Color(0x2EFFFFFF),
     )
 }
 
-/** 阅读器字号档位对应的正文字号（sp）：小 / 标准 / 大 / 特大 */
+/**
+ * 分页器与渲染层共用的间距常量——**唯一事实源**。
+ *
+ * 切页按这些数字量、渲染按同一批数字排，谁也不许再抄一份：
+ * 过去页宽/页高/间距在 ReaderScreen 与 PageMeasurer 各写一遍，
+ * 改一处漏一处，量出来的页和画出来的页对不上，内容就在页底被裁。
+ */
+internal object ReaderLayout {
+    /** 页内容左右边距 */
+    val horizontalMargin = 24.dp
+    /** 页顶部留白 */
+    val pageTopPadding = 20.dp
+    /** 页底部留给页码的区域 */
+    val footerZone = 26.dp
+    /** 防裁切余量：取整误差吸收，宁可页底留白 */
+    val slack = 10.dp
+    /** 块与块之间 */
+    val blockGap = 16.dp
+    /** 同一 STORY 块内相邻段落之间（≈半行高的段落呼吸） */
+    val paraGap = 14.dp
+    /** KEY_POINT 前后（让它站出来） */
+    val keyPointGap = 20.dp
+    /** 卡片内边距（上下合计进测量） */
+    val cardPadding = 14.dp
+    /** 卡片 label → 正文 */
+    val cardLabelGap = 6.dp
+    /** 章首头与正文的间距 */
+    val headerToBody = 18.dp
+    /** 通知条与其后内容的间距（通知条自身渲染 padding 10dp×2） */
+    val noticeGap = 12.dp
+    val noticePadding = 20.dp
+    /** 附件行（chip / 来源入口）与块正文的间距 */
+    val attachmentGap = 8.dp
+    /** 单行 chip 行高估算 */
+    val chipRowHeight = 34.dp
+    /** 来源入口一行高估算 */
+    val sourceRowHeight = 30.dp
+}
+
+/**
+ * 阅读器排版：字号 → 各文本角色的 [TextStyle]——**测量与渲染共用同一批样式实例**。
+ *
+ * 这是整个分页系统的合同：PageMeasurer 用哪个 style 量高度，BlockContent
+ * 就必须用同一个 style 画。以前两边各写各的 TextStyle，字体族/字距一漂，
+ * 页就在底部裁。样式对象从这里出，两边引用，物理上不可能发散。
+ *
+ * [serif]：宋体（衬线，默认——「像一本书」）/ 黑体。中文正文在主流阅读 App
+ * 里都是衬线，系统黑体是最不像书的一处。走 FontFamily.Serif，不打包字体文件。
+ */
+class ReaderTypography(
+    val bodyFontSizeSp: Int,
+    val serif: Boolean,
+) {
+    val family: FontFamily = if (serif) FontFamily.Serif else FontFamily.SansSerif
+    private val bodyLs = if (serif) 0.sp else 0.2.sp
+
+    val story = TextStyle(
+        fontFamily = family,
+        fontSize = bodyFontSizeSp.sp,
+        lineHeight = (bodyFontSizeSp * 1.75f).sp,
+        letterSpacing = bodyLs,
+    )
+
+    /** 推演落锤：比正文大 2 号、半粗 */
+    val keyPoint: TextStyle = run {
+        val fs = bodyFontSizeSp + 2
+        TextStyle(
+            fontFamily = family,
+            fontSize = fs.sp,
+            lineHeight = (fs * 1.6f).sp,
+            letterSpacing = bodyLs,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+
+    /** 卡片正文：比正文小 2 号（不低于 13） */
+    val cardBody: TextStyle = run {
+        val fs = (bodyFontSizeSp - 2).coerceAtLeast(13)
+        TextStyle(
+            fontFamily = family,
+            fontSize = fs.sp,
+            lineHeight = (fs * 1.55f).sp,
+            letterSpacing = bodyLs,
+        )
+    }
+
+    /** 卡片 label：固定 12sp 无衬线小标签 */
+    val cardLabel = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontSize = 12.sp,
+        lineHeight = 16.sp,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 0.5.sp,
+    )
+
+    /** 章首头三档：title / 「第 x 章」/ 通知条——PageMeasurer.header 与 ReaderPageHeader 都从这里取 */
+    val headerTitle = TextStyle(
+        fontFamily = family,
+        fontSize = 26.sp,
+        lineHeight = 36.sp,
+        fontWeight = FontWeight.Bold,
+    )
+    val headerOrder = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontSize = 13.sp,
+        lineHeight = 18.sp,
+        letterSpacing = 2.sp,
+    )
+    val notice = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontSize = 12.sp,
+        lineHeight = 17.sp,
+    )
+
+    override fun equals(other: Any?): Boolean =
+        other is ReaderTypography && other.bodyFontSizeSp == bodyFontSizeSp && other.serif == serif
+
+    override fun hashCode(): Int = bodyFontSizeSp * 31 + serif.hashCode()
+
+    companion object {
+        /** 首行缩进：两个全角空格。中文书籍靠缩进识别段落；
+         * 在文本层加，测量量到的就是画出来的，天然同构 */
+        const val INDENT = "　　"
+
+        fun indentFirst(text: String): String =
+            if (text.startsWith(INDENT)) text else INDENT + text
+    }
+}
+
+/** 字号档位 → 正文 sp：小 / 标准 / 大 / 特大 */
 fun readerFontSizeSp(index: Int): Int = when (index) {
     0 -> 15
     1 -> 17
@@ -118,7 +290,8 @@ fun readerFontSizeSp(index: Int): Int = when (index) {
 
 /**
  * 一页里的一段内容：KEY_POINT / 讲解卡片整块一段，STORY 块按段落切成多段。
- * [text] 是这一段真正渲染的文本；卡片与关键结论不拆段，恒为整块文本。
+ * [text] 是这一段真正渲染的文本（已含首行缩进——渲染的就是测量的那份文本）；
+ * 卡片与关键结论不拆段，恒为整块文本。
  */
 data class PageSegment(
     val block: ChapterBlock,
@@ -128,53 +301,151 @@ data class PageSegment(
 )
 
 /**
+ * 每个块在渲染层挂的「附件」高度清单（键 = block.id）。
+ *
+ * 知识点 chip 行和「这一段从哪来」入口是渲染在块后面的，以前**从来没人量过它们**：
+ * 带附件的块实际比测量值高一行到两行，页底被裁的全是这类块。
+ * 由 ReaderScreen 在切页前按当前 dense/来源状态算好传进来，
+ * 只在块的最后一段（渲染层 showAttachments 的同一条件）累加一次。
+ */
+class AttachmentHeights(
+    private val byBlock: Map<String, Int>,
+) {
+    fun of(blockId: String): Int = byBlock[blockId] ?: 0
+}
+
+/**
+ * FlowRow 换行高度估算：把一组条目宽度按容器宽打包成若干行，返回总高。
+ *
+ * 切页时无法真的跑一遍 FlowRow 布局，只能按「每个条目一行放不下就换行」估算。
+ * 纯函数（给宽度就出高度）——换行规则可单测，宽度估算放调用方。
+ */
+internal fun estimateFlowRowHeightPx(
+    itemWidthsPx: List<Int>,
+    rowHeightPx: Int,
+    verticalGapPx: Int,
+    horizontalGapPx: Int,
+    containerWidthPx: Int,
+): Int {
+    var rows = 0
+    var usedInRow = 0
+    for (w in itemWidthsPx) {
+        if (w <= 0) continue
+        if (usedInRow == 0) {
+            if (rows == 0) rows = 1
+            usedInRow = w
+        } else if (usedInRow + horizontalGapPx + w <= containerWidthPx) {
+            usedInRow += horizontalGapPx + w
+        } else {
+            rows++
+            usedInRow = w
+        }
+    }
+    if (rows == 0) return 0
+    return rows * rowHeightPx + (rows - 1) * verticalGapPx
+}
+
+/**
+ * 算每个块的附件（知识点 chip 行 + 来源入口）占多高，喂给切页器。
+ *
+ * 附件只在 dense 出 chip、来源入口按渲染层同一判据（[hasSourceEntry] 由调用方用
+ * sourceSummary 的 hasAnything / deservesAttention 算好传进来）——两边条件必须一致，
+ * 否则要么白留一段空高、要么又裁掉。chip 宽度用「字符数 × 字宽」粗估：宁可估宽
+ * （多算一行）也别估窄，估窄才会裁。
+ *
+ * [fontPx] 取正文像素字号（比 chip 实际用的 labelMedium 略大 → 估算偏宽，偏安全）。
+ */
+internal fun buildAttachmentHeights(
+    blocks: List<ChapterBlock>,
+    dense: Boolean,
+    nodeTitles: (ChapterBlock) -> List<String>,
+    hasSourceEntry: (ChapterBlock) -> Boolean,
+    density: Density,
+    fontPx: Int,
+    pageWidthPx: Int,
+): AttachmentHeights {
+    fun dp(v: androidx.compose.ui.unit.Dp): Int = with(density) { v.roundToPx() }
+    val chipRowH = dp(ReaderLayout.chipRowHeight)
+    val chipHGap = dp(6.dp)
+    val chipVGap = dp(6.dp)
+    val sourceRowH = dp(ReaderLayout.sourceRowHeight)
+    val gapAbove = dp(ReaderLayout.attachmentGap)
+    val map = HashMap<String, Int>()
+    for (block in blocks) {
+        val titles = if (dense) nodeTitles(block) else emptyList()
+        // 每个 chip 文本前挂了一个图标+内边距，按 4 字符 + 24dp 宽补进去
+        val chipWidths = titles.map { (it.length + 4) * fontPx + dp(24.dp) }
+        val chipH = estimateFlowRowHeightPx(
+            chipWidths, chipRowH, chipVGap, chipHGap, pageWidthPx,
+        )
+        val sourceH = if (hasSourceEntry(block)) sourceRowH else 0
+        val total = when {
+            chipH > 0 && sourceH > 0 -> gapAbove + chipH + dp(4.dp) + sourceH
+            chipH > 0 -> gapAbove + chipH
+            sourceH > 0 -> gapAbove + sourceH
+            else -> 0
+        }
+        if (total > 0) map[block.id] = total
+    }
+    return AttachmentHeights(map)
+}
+
+/**
  * 翻页分页测量器。
  *
  * 分页的核心是「先量高度、再切页」：用 [androidx.compose.ui.text.TextMeasurer]
- * 在固定页宽下量出每个渲染单元的真实高度，再按页高累积切页。估算口径与
- * ReaderScreen 里 [BlockContent] 的实际渲染样式保持一致（同一字号体系），
- * 另留出余量吸收取整误差——宁可页底留一点白，也不能裁掉最后一行。
+ * 在固定页宽下量出每个渲染单元的真实高度，再按页高累积切页。
+ *
+ * 关键约定：所有样式取自 [typography]——渲染层用的是**同一批 TextStyle 实例**，
+ * 字号/行高/字距/字体族不可能发散；所有间距取自 [ReaderLayout]，
+ * 渲染层的 Spacer 读的是同一份数字。以前两边各抄一份常量，抄漏一处就裁切。
  */
 internal class PageMeasurer(
     private val measure: (String, TextStyle) -> Int,
     private val density: Density,
+    val typography: ReaderTypography,
 ) {
-    private fun dp(v: Int): Int = with(density) { v.dp.roundToPx() }
+    /** dp → px：切页引擎与渲染层共用的换算入口（ReaderLayout 的 Dp 常量经它进像素域） */
+    fun dpOf(v: androidx.compose.ui.unit.Dp): Int = with(density) { v.roundToPx() }
 
-    /** STORY 正文段：fontSize / 1.7 倍行高，与渲染处完全一致 */
-    fun story(text: String, fontSp: Int): Int =
-        measure(
-            text,
-            TextStyle(fontSize = fontSp.sp, lineHeight = (fontSp * 1.7f).sp),
-        )
+    /** STORY 正文段 */
+    fun story(text: String): Int = measure(text, typography.story)
 
-    /** KEY_POINT：比正文大 2sp、1.55 倍行高、半粗 */
-    fun keyPoint(text: String, fontSp: Int): Int {
-        val fs = fontSp + 2
-        return measure(
-            text,
-            TextStyle(fontSize = fs.sp, lineHeight = (fs * 1.55f).sp, fontWeight = FontWeight.SemiBold),
-        )
+    /** 关键结论 */
+    fun keyPoint(text: String): Int = measure(text, typography.keyPoint)
+
+    /** 旁注卡片：label 一行 + labelGap + 正文 + 上下 padding + 1dp 边框余量 */
+    fun card(text: String): Int {
+        val label = measure("知识讲解", typography.cardLabel)
+        val body = measure(text, typography.cardBody)
+        return label + dpOf(ReaderLayout.cardLabelGap) + body +
+            dpOf(ReaderLayout.cardPadding) * 2 + dpOf(1.dp)
     }
 
-    /** 讲解卡片：label 一行 + 6dp + 正文(小 2 号) + 上下 padding 28dp */
-    fun card(text: String, fontSp: Int): Int {
-        val fs = (fontSp - 2).coerceAtLeast(13)
-        val label = measure("知识讲解", TextStyle(fontSize = 12.sp, lineHeight = 16.sp))
-        val body = measure(text, TextStyle(fontSize = fs.sp, lineHeight = (fs * 1.55f).sp))
-        return label + dp(6) + body + dp(28)
-    }
-
-    /** 章首头（仅第一页）：章名 + 「第 x 章」 + 可选的通知条，尾部含与正文的间距（渲染 16dp + 余量） */
+    /** 章首头（仅第一页）：章名 + 「第 x 章」 + 通知条 + 与正文的间距 */
     fun header(title: String, order: String, notices: List<String>): Int {
-        var h = measure(title, TextStyle(fontSize = 24.sp, lineHeight = 32.sp, fontWeight = FontWeight.Bold))
-        h += dp(4) + measure(order, TextStyle(fontSize = 12.sp, lineHeight = 16.sp))
+        var h = measure(title, typography.headerTitle)
+        h += dpOf(6.dp) + measure(order, typography.headerOrder)
         notices.forEach { n ->
-            h += dp(12) + measure(n, TextStyle(fontSize = 12.sp, lineHeight = 17.sp)) + dp(20)
+            h += dpOf(ReaderLayout.noticeGap) +
+                measure(n, typography.notice) +
+                dpOf(ReaderLayout.noticePadding)
         }
-        return h + dp(28)
+        return h + dpOf(ReaderLayout.headerToBody)
     }
 }
+
+/**
+ * 切页结果：正文页 + 需要滚动兜底的页下标集合。
+ *
+ * 独占一页的单元（比一页还高的超长卡片/段落）没法靠切页解决——渲染层读到
+ * [overflowPages] 后给那一页开 verticalScroll，否则它必然裁掉页底。
+ * 这个信号只能由测量阶段给出：渲染层不知道单元多高。
+ */
+internal class ReaderPaging(
+    val pages: List<List<PageSegment>>,
+    val overflowPages: Set<Int>,
+)
 
 /** 单元切页时的中间表示 */
 private data class PageUnit(val segment: PageSegment, val heightPx: Int, val gapPx: Int)
@@ -185,82 +456,76 @@ private data class PageUnit(val segment: PageSegment, val heightPx: Int, val gap
  * 切页规则：
  * - STORY 段落是最小单元，可以跨页；讲解卡片 / 关键结论整块不拆，
  *   放不下就整体挪到下一页（读起来像卡片被拦腰斩断是硬伤）；
- * - 单元本身比一页还高（超长卡片）就独占一页，页内由渲染层兜底滚动；
- * - 同一 STORY 块的相邻段落之间留小间距，块与块之间留一段呼吸空隙，
- *   关键结论（KEY_POINT）前后再宽一点。
+ * - 单元本身比一页还高（超长卡片）就独占一页并记进 [ReaderPaging.overflowPages]——
+ *   渲染层给这些页启用兜底滚动，不再像以前那样直接裁掉页底；
+ * - 附件（chip 行 / 来源入口）的高度在 [attachments] 里，按块累加进该块最后一段
+ *   ——渲染层同样只在最后一段画附件（showAttachments），两边条件一致；
+ * - STORY 段落的首行缩进在切段时就写进 segment.text，测量量到的字符串与渲染一字不差。
  *
  * [pageHeightPx] 必须是已扣除页码区与余量的净高。
- * 三个间距必须与 ReaderScreen 渲染层的 Spacer 一致（测量与渲染同源）。
  */
 internal fun buildReaderPages(
     visibleBlocks: List<ChapterBlock>,
     measurer: PageMeasurer,
-    fontSp: Int,
     pageHeightPx: Int,
-    /** 块与块之间的间距 */
-    gapPx: Int,
-    /** 同一 STORY 块内相邻段落的间距 */
-    paraGapPx: Int = 0,
-    /** KEY_POINT 前后的间距（比普通块更宽） */
-    keyPointGapPx: Int = gapPx,
     /** 第一页顶部章首头（章名/章序/通知条）的高度，第一页的可用空间要扣掉它 */
     headerHeightPx: Int = 0,
-): List<List<PageSegment>> {
-    if (visibleBlocks.isEmpty()) return emptyList()
+    attachments: AttachmentHeights = AttachmentHeights(emptyMap()),
+): ReaderPaging {
+    if (visibleBlocks.isEmpty()) return ReaderPaging(emptyList(), emptySet())
     val units = mutableListOf<PageUnit>()
     visibleBlocks.forEach { block ->
         when (block.blockType) {
             BlockType.STORY -> {
-                val paragraphs = block.text.split('\n').map { it.trim() }.filter { it.isNotEmpty() }
-                if (paragraphs.isEmpty()) {
+                val rawParagraphs = block.text.split('\n').map { it.trim() }.filter { it.isNotEmpty() }
+                val paragraphs = if (rawParagraphs.isEmpty()) listOf(block.text) else rawParagraphs
+                paragraphs.forEachIndexed { i, p ->
+                    val rendered = ReaderTypography.indentFirst(p)
+                    val lastOfBlock = i == paragraphs.lastIndex
+                    var h = measurer.story(rendered)
+                    if (lastOfBlock) h += attachments.of(block.id)
                     units += PageUnit(
-                        PageSegment(block, block.text, firstOfBlock = true, lastOfBlock = true),
-                        measurer.story(block.text, fontSp),
-                        gapPx,
+                        PageSegment(
+                            block, rendered,
+                            firstOfBlock = i == 0,
+                            lastOfBlock = lastOfBlock,
+                        ),
+                        h,
+                        if (i == 0) measurer.dpOf(ReaderLayout.blockGap) else measurer.dpOf(ReaderLayout.paraGap),
                     )
-                } else {
-                    paragraphs.forEachIndexed { i, p ->
-                        units += PageUnit(
-                            PageSegment(
-                                block, p,
-                                firstOfBlock = i == 0,
-                                lastOfBlock = i == paragraphs.lastIndex,
-                            ),
-                            measurer.story(p, fontSp),
-                            if (i == 0) gapPx else paraGapPx,
-                        )
-                    }
                 }
             }
 
+            // KEY_POINT 不缩进——左侧竖条已经把它和正文分开，再缩进会歪
             BlockType.KEY_POINT -> units += PageUnit(
                 PageSegment(block, block.text, true, true),
-                measurer.keyPoint(block.text, fontSp),
-                keyPointGapPx,
+                measurer.keyPoint(block.text) + attachments.of(block.id),
+                measurer.dpOf(ReaderLayout.keyPointGap),
             )
 
             else -> units += PageUnit(
                 PageSegment(block, block.text, true, true),
-                measurer.card(block.text, fontSp),
-                gapPx,
+                measurer.card(block.text) + attachments.of(block.id),
+                measurer.dpOf(ReaderLayout.blockGap),
             )
         }
     }
 
     val pages = mutableListOf<List<PageSegment>>()
+    val overflow = mutableSetOf<Int>()
     var current = mutableListOf<PageSegment>()
     var used = headerHeightPx // 第一页的章首头先占掉一块空间
     units.forEach { unit ->
-        val overflow = unit.heightPx > pageHeightPx // 超页高的单元（超长卡片）只能独占一页
         // 页首单元不带块间间距（页面顶部不需要空隙）
         val needed = if (current.isEmpty()) unit.heightPx else unit.gapPx + unit.heightPx
         when {
-            overflow -> {
+            unit.heightPx > pageHeightPx -> {
                 if (current.isNotEmpty()) {
                     pages += current
                     current = mutableListOf()
                 }
                 pages += mutableListOf(unit.segment)
+                overflow += pages.lastIndex // 这一页内容比页高——渲染层启用滚动兜底
                 used = 0
             }
 
@@ -270,7 +535,10 @@ internal fun buildReaderPages(
             }
 
             else -> {
-                // 扉页：章首头占了空间、正文从下一页开始（used>0 且页里还没有正文段）
+                // 章首头占了整页的空间而页里还没有正文：交出一张扉页（header 渲染在
+                // 第一页上，所以它不是空白页）。以前这里连同「正文一页都放不下」的
+                // 情况一起吞 current，页码照算、内容却没了——只有超页分支能造成空白页，
+                // 那条已经在上面标了 overflow。
                 if (current.isNotEmpty() || used > 0) pages += current
                 current = mutableListOf(unit.segment)
                 used = unit.heightPx
@@ -278,7 +546,7 @@ internal fun buildReaderPages(
         }
     }
     if (current.isNotEmpty()) pages += current
-    return pages
+    return ReaderPaging(pages, overflow)
 }
 
 /**
@@ -302,10 +570,12 @@ internal fun PagedReaderBody(
             Column(Modifier.fillMaxSize()) {
                 pageContent(pageIndex)
             }
+            // 页码是这一页唯一的全局信息，0.7 alpha 在米白纸面上只有 ~2.2:1
+            // 对比度——半透明「看起来像水印」不等于「不干扰阅读」，直接实色
             Text(
                 "${pageIndex + 1} / $pageCount",
                 style = MaterialTheme.typography.labelSmall,
-                color = palette.secondary.copy(alpha = 0.7f),
+                color = palette.secondary,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 6.dp),
@@ -414,6 +684,8 @@ internal fun BookTocSheet(
 internal fun ReaderSettingsSheet(
     fontIndex: Int,
     onFont: (Int) -> Unit,
+    serif: Boolean,
+    onSerif: (Boolean) -> Unit,
     paper: ReaderPaper,
     onPaper: (ReaderPaper) -> Unit,
     mode: ReaderMode,
@@ -430,6 +702,41 @@ internal fun ReaderSettingsSheet(
             Text("阅读设置", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(16.dp))
 
+            Text("字体", style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                // 用每种字体本身预览「宋体/黑体」，所见即所得
+                listOf(true to "宋体", false to "黑体").forEach { (serifOption, label) ->
+                    val selected = serifOption == serif
+                    Surface(
+                        color = if (selected) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surfaceVariant
+                        },
+                        shape = MaterialTheme.shapes.medium,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { onSerif(serifOption) },
+                    ) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 10.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                label,
+                                fontFamily = if (serifOption) FontFamily.Serif else FontFamily.SansSerif,
+                                fontSize = 17.sp,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
             Text("字号", style = MaterialTheme.typography.labelLarge)
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {

@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Warning
@@ -42,9 +43,11 @@ fun EmptyState(
     onAction: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
+    // 不再 fillMaxSize：调用点给的是固定 height()，大字号下副标题会被裁掉。
+    // 现在内容多高就多高，调用点用 heightIn(min=…) 保底一个像样的空态区
     Column(
         modifier = modifier
-            .fillMaxSize()
+            .fillMaxWidth()
             .padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
@@ -155,17 +158,21 @@ fun SourceKindChip(kind: SourceKind) {
 
 @Composable
 fun InfoRow(label: String, value: String) {
-    Row(modifier = Modifier.padding(vertical = 4.dp)) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Text(
             text = label,
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.width(84.dp),
+            // 固定宽在大字号下会把值挤到下一列错位；给个上限并允许标签自身换行
+            modifier = Modifier.widthIn(max = 96.dp),
         )
+        Spacer(Modifier.width(8.dp))
+        // 值是用户/模型给的长文本：吃剩余宽度、允许换行，绝不撑爆行
         Text(
             text = value.ifBlank { "—" },
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.Medium,
+            modifier = Modifier.weight(1f),
         )
     }
 }
