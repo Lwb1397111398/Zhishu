@@ -1667,6 +1667,14 @@ class SettingsViewModel(app: Application) : ZhishuViewModel(app) {
         container.learningPrefs.setSpacedReviewEnabled(enabled)
     }
 
+    /** 自动生成总开关（默认开）：点一次「继续」是否一路写到主线讲完 */
+    val generationAutoAdvance: StateFlow<Boolean> =
+        container.learningPrefs.generationAutoAdvance
+
+    fun setGenerationAutoAdvance(enabled: Boolean) {
+        container.learningPrefs.setGenerationAutoAdvance(enabled)
+    }
+
     init { load() }
 
     fun load() {

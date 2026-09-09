@@ -8,10 +8,12 @@ import kotlinx.coroutines.flow.asStateFlow
 /**
  * 学习方式偏好。
  *
- * 目前只有一项：间隔复习是否开启，**默认关闭**。
- * 这个 App 的主线是「像读小说一样一路读下去」，复习和测验是可选辅助——
- * 默认开启会让每章结束都变成一个待办任务，把阅读节奏打断。
+ * 两项影响行为的开关：
+ * - 间隔复习（[spacedReviewEnabled]）**默认关**——主线是「像读小说一样一路读下去」，
+ *   默认开会把每章结尾变成一个待办任务，打断节奏；
+ * - 自动生成（[generationAutoAdvance]）**默认开**——用户要的「点一次继续就写到主线讲完」。
  *
+ * 其余是阅读器外观偏好（翻页/字号/纸色/衬线），改了立即生效且记住。
  * 关闭时：章节发布后不再自动建 [com.example.zhishu.domain.model.ReviewItem]，
  * 首页也不显示「今日复习」。已有的复习数据一律保留，随时打开就能接着用。
  */
@@ -28,6 +30,26 @@ class LearningPrefs(context: Context) {
     fun setSpacedReviewEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_SPACED_REVIEW, enabled).apply()
         _spacedReviewEnabled.value = enabled
+    }
+
+    /**
+     * 自动生成总开关（默认**开**）。
+     *
+     * 开启后点一次「继续」会自动跑完整条主线：逐章生成、本卷写完自动规划下一卷、
+     * 梳理完自动补上 actionable 的漏知识点、待复核不阻断续卷，直到知识主干
+     * 全部讲到才停。关闭则回到每步手动确认（一次一键开讲只出一章）。
+     *
+     * 与 [spacedReviewEnabled] 默认关相反，这里默认开——用户明确要「默认允许」。
+     * 随时可在设置页关掉；关掉后已在链上的当前章写完为止，下一个 ADVANCE 起不再追加。
+     */
+    private val _generationAutoAdvance =
+        MutableStateFlow(prefs.getBoolean(KEY_AUTO_ADVANCE, DEFAULT_AUTO_ADVANCE))
+
+    val generationAutoAdvance: StateFlow<Boolean> = _generationAutoAdvance.asStateFlow()
+
+    fun setGenerationAutoAdvance(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_AUTO_ADVANCE, enabled).apply()
+        _generationAutoAdvance.value = enabled
     }
 
     // --- 阅读器偏好（小说模式）。三项都记住，下次打开还是用户自己的习惯 ---
@@ -86,12 +108,14 @@ class LearningPrefs(context: Context) {
 
     companion object {
         const val DEFAULT_SPACED_REVIEW = false
+        const val DEFAULT_AUTO_ADVANCE = true
         val DEFAULT_READER_MODE = ReaderMode.PAGER
         const val DEFAULT_FONT_INDEX = 1
         val DEFAULT_READER_PAPER = ReaderPaper.CREAM
         const val DEFAULT_READER_SERIF = true
         private const val PREFS_NAME = "zhishu_learning_prefs"
         private const val KEY_SPACED_REVIEW = "spaced_review_enabled"
+        private const val KEY_AUTO_ADVANCE = "generation_auto_advance"
         private const val KEY_READER_MODE = "reader_mode"
         private const val KEY_READER_FONT = "reader_font_size"
         private const val KEY_READER_PAPER = "reader_paper"
