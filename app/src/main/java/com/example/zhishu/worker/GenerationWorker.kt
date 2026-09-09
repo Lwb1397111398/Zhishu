@@ -103,6 +103,18 @@ class GenerationWorker(
                     report(text, completed, projectTitle, total)
                     done = progress.completed
                 }.getOrThrow()
+                // 审计完成、gap 已落库：开自动时把 actionable 的漏知识点补上（成本护栏 10 条）。
+                // 只认 FULL——SKELETON/NEXT_CHAIN 是用户明确要「先看结构再决定」的节奏，
+                // 地图还没定稿就自动补节点，等于越过用户做主。
+                // 补漏失败不推翻地图：单条 gap 留 OPEN，下次点「继续」再补（generateKnowledgeMapPatch 已保证）。
+                if (mapMode == KnowledgeMapMode.FULL &&
+                    container.learningPrefs.generationAutoAdvance.value
+                ) {
+                    val n = container.pipeline.autoResolveGaps(projectId)
+                    if (n > 0) {
+                        report("已自动补上 $n 个漏掉的知识点", unitsBefore + done, projectTitle)
+                    }
+                }
                 report(stage.label, unitsBefore + done, projectTitle)
             }
 
@@ -132,10 +144,12 @@ class GenerationWorker(
             // 留一支只为 when 穷尽——真走到了说明短路位置被挪错，直接抛错暴露问题。
             GenerationStage.ADVANCE -> throw IllegalStateException("ADVANCE 应在 doWork 顶层短路")
 
-            // 真实执行在 Task 7 补：调 generateNextVolume 规划下一卷。
-            // 现在先占位为「什么都不做但成功」，保证入队（Task 6）能独立编译测试；
-            // 在 Task 7 落地前，没有任何代码路径会排 PLAN_NEXT_VOLUME（appendVolumePlan 尚无调用方）。
-            GenerationStage.PLAN_NEXT_VOLUME -> Unit
+            GenerationStage.PLAN_NEXT_VOLUME -> {
+                // 规划下一卷：一次模型调用，append-only（只往后加章节，已发布的一字不改）。
+                // 失败即本阶段失败，走 WorkManager 退避重试；重试耗尽停链给可读原因。
+                container.pipeline.generateNextVolume(projectId).getOrThrow()
+                report(stage.label, unitsBefore + 1, projectTitle)
+            }
         }
         return Result.success()
     }
