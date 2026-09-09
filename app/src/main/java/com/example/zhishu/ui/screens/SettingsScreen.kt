@@ -90,6 +90,7 @@ fun SettingsScreen(onOpenReview: () -> Unit = {}) {
     val testResults by vm.testResults.collectAsState()
     val modelLists by vm.modelLists.collectAsState()
     val spacedReview by vm.spacedReviewEnabled.collectAsState()
+    val autoAdvance by vm.generationAutoAdvance.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val container = (app as ZhishuApp).container
@@ -179,6 +180,35 @@ fun SettingsScreen(onOpenReview: () -> Unit = {}) {
                         )
                         Spacer(Modifier.height(8.dp))
                         OutlinedButton(onClick = onOpenReview) { Text("打开复习中心") }
+                    }
+                }
+            }
+            item {
+                Card {
+                    Column(Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("自动写到主线讲完", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "默认开启。点一次「继续」后会自动：补齐没写的每一章、本卷写完自动规划下一卷、" +
+                                        "梳理完自动补上漏掉的知识点，直到知识主干全部讲到才停。中途可随时取消。",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Switch(
+                                checked = autoAdvance,
+                                onCheckedChange = { vm.setGenerationAutoAdvance(it) },
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "关闭后回到每步手动确认：一次「继续」只推进到下一章，续卷和补漏都要你点。" +
+                                "自动补漏知识点每批最多 10 条，避免一次烧太多额度。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
             }

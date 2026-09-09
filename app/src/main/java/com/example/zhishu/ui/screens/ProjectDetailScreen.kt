@@ -350,6 +350,7 @@ private fun SourcesTab(
                 project = project,
                 ready = modelKnowledge || sources.isNotEmpty(),
                 hasNodes = hasNodes,
+                autoAdvance = vm.generationAutoAdvance,
                 onStart = { vm.enqueueOneTap() },
                 onGoMap = onGoMap,
             )
@@ -554,12 +555,14 @@ private fun ModeOption(
     }
 }
 
-/** 一键开讲（问题4）：原来要在三个 Tab 之间来回点四五次，现在一次点完 */
+/** 一键开讲（问题4）：原来要在三个 Tab 之间来回点四五次，现在一次点完。开自动时一路写到主线讲完 */
 @Composable
 private fun OneTapCard(
     project: com.example.zhishu.domain.model.Project?,
     ready: Boolean,
     hasNodes: Boolean,
+    /** 总开关：开启时一次点击会一路写到主线讲完，文案要如实说清这一点 */
+    autoAdvance: Boolean = false,
     onStart: () -> Unit,
     onGoMap: () -> Unit,
 ) {
@@ -577,10 +580,18 @@ private fun OneTapCard(
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                if (hasNodes) {
-                    "会接着把还没做完的步骤补齐，然后生成下一章。"
-                } else {
-                    "依次完成三步：梳理知识主干 → 规划讲述路线 → 写出第一章。全程后台进行。"
+                when {
+                    // 文案必须如实：开自动时点一次不是一章，会一路写到主线讲完。
+                    // 说小了，用户在错误的时间去点取消；没开还讲「一路」，是骗人。
+                    autoAdvance && hasNodes ->
+                        "会自动一卷一卷写到主线讲完：补齐每一章、本卷写完自动续下一卷、" +
+                            "顺带补上漏掉的知识点。全程后台进行，随时可取消。"
+                    autoAdvance ->
+                        "梳理知识主干 → 规划讲述路线 → 逐章写下去，一直写到主线讲完才停。" +
+                            "全程后台进行，随时可取消。"
+                    hasNodes -> "会接着把还没做完的步骤补齐，然后生成下一章。"
+                    else ->
+                        "依次完成三步：梳理知识主干 → 规划讲述路线 → 写出第一章。全程后台进行。"
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSecondaryContainer,

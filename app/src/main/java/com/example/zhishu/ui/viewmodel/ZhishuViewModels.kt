@@ -702,6 +702,14 @@ class ProjectDetailViewModel(
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message
 
+    /**
+     * 自动生成总开关（默认开）。「一键开讲 / 继续」按钮的副标题文案据此联动，
+     * 点击时同样按它决定是否在链尾挂 ADVANCE。读 getter 即可——文案在下次进入资料 Tab
+     * 时刷新就够，不值得为它多一路订阅（开关改动是低频操作）。
+     */
+    val generationAutoAdvance: Boolean
+        get() = container.learningPrefs.generationAutoAdvance.value
+
     fun consumeMessage() {
         _message.value = null
     }
@@ -921,9 +929,19 @@ class ProjectDetailViewModel(
         }
     }
 
-    /** 一键开讲：知识地图 → 讲述路线 → 首章，一次点完（问题4）。知识地图走 FULL 全自动展开 */
+    /**
+     * 一键开讲 / 继续（自动化闭环）：知识地图 → 讲述路线 → 首章；
+     * 总开关开启时链尾挂 ADVANCE，一路自动写到主线讲完（可随时取消）。
+     */
     fun enqueueOneTap() {
-        launchEnqueue("已开始，将依次完成知识梳理、路线规划和第一章") {
+        val auto = container.learningPrefs.generationAutoAdvance.value
+        launchEnqueue(
+            if (auto) {
+                "已开始：会自动写到主线讲完——逐章生成、自动续卷、自动补漏知识点，可随时取消"
+            } else {
+                "已开始，将依次完成知识梳理、路线规划和第一章"
+            },
+        ) {
             // needsMap 不只看节点是否为空：分步生成可能停在「骨架完成、链未展开」，
             // 那些占位节点没有内容，讲述路线等不了——批次没完成就得把地图跑完
             val mapIncomplete = container.knowledgeRepository.getLatestBatch(projectId)
@@ -933,6 +951,7 @@ class ProjectDetailViewModel(
                 projectId = projectId,
                 needsMap = mapIncomplete || container.knowledgeRepository.getByProject(projectId).isEmpty(),
                 needsBible = container.chapterRepository.getPlans(projectId).isEmpty(),
+                autoAdvance = auto,
             )
         }
     }
