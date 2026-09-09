@@ -158,6 +158,8 @@ object GenerationEnqueuer {
         projectId: String,
         needsMap: Boolean,
         needsBible: Boolean,
+        /** 自动闭环：为 true 时链尾挂一个 ADVANCE，一路写到主线讲完（总开关开启才传 true） */
+        autoAdvance: Boolean = false,
     ): EnqueueResult {
         val total = (if (needsMap) UNITS_SIMPLE_STAGE else 0) +
             (if (needsBible) UNITS_SIMPLE_STAGE else 0) +
@@ -185,8 +187,69 @@ object GenerationEnqueuer {
                     ),
                 )
                 add(summaryRequest(projectId, session, total))
+                // 自动闭环：收尾之后挂一个 ADVANCE。它不烧模型，modelStages 不加计。
+                // 挂同一条唯一链尾部 → 一次 cancelUniqueWork 连它一起清掉；isActive 认它是「还在生成」。
+                if (autoAdvance) {
+                    add(
+                        simpleRequest(projectId, GenerationStage.ADVANCE, session, total, total),
+                    )
+                }
             }
         }
+    }
+
+    /**
+     * 自动闭环续订：把「若干章节 → 收尾 → 下一个 ADVANCE」APPEND 到项目唯一链尾部。
+     *
+     * 与 [enqueueChain]（用户发起，KEEP）不同，这里是当前会话链的自我延长：
+     * 用 APPEND_OR_REPLACE——链还在（前面步骤没跑完）就接到末尾；万一唯一名下无残留链
+     * （竞态窗口），替换而非丢弃，避免续订丢失导致静默停摆。仍共用同一唯一名，
+     * 所以取消（一次 cancelUniqueWork）与活跃判定原样生效。
+     *
+     * [session] 由调用方 Worker 从 inputData 透传，保证链上会话 tag 一致，UI 不把它当「另一次生成」。
+     */
+    suspend fun appendAutoChunk(
+        context: Context,
+        projectId: String,
+        session: String,
+        chapterIds: List<String>,
+        chapterLabels: List<String>,
+        unitsTotal: Int,
+    ) {
+        if (chapterIds.isEmpty()) return
+        val manager = WorkManager.getInstance(context)
+        var continuation: WorkContinuation? = null
+        chapterIds.forEachIndexed { index, id ->
+            val req = chapterRequest(
+                projectId = projectId,
+                chapterId = id,
+                label = chapterLabels.getOrElse(index) { "" },
+                session = session,
+                unitsBefore = index * ChapterPhase.UNITS_PER_CHAPTER,
+                unitsTotal = unitsTotal,
+            )
+            continuation = continuation?.then(req)
+                ?: manager.beginUniqueWork(
+                    GenerationWorker.uniqueWorkName(projectId),
+                    ExistingWorkPolicy.APPEND_OR_REPLACE,
+                    req,
+                )
+        }
+        val summary = summaryRequest(projectId, session, unitsTotal)
+        val advance = simpleRequest(projectId, GenerationStage.ADVANCE, session, unitsTotal, unitsTotal)
+        continuation = continuation?.then(summary)?.then(advance)
+        continuation?.enqueue()?.result?.await()
+    }
+
+    /** 决策为 PlanNextVolume 时：挂「规划下一卷 → 下一个 ADVANCE」。规划阶段会调模型、可退避重试 */
+    suspend fun appendVolumePlan(context: Context, projectId: String, session: String) {
+        val plan = simpleRequest(projectId, GenerationStage.PLAN_NEXT_VOLUME, session, 0, 0)
+        val advance = simpleRequest(projectId, GenerationStage.ADVANCE, session, 0, 0)
+        WorkManager.getInstance(context).beginUniqueWork(
+            GenerationWorker.uniqueWorkName(projectId),
+            ExistingWorkPolicy.APPEND_OR_REPLACE,
+            plan,
+        ).then(advance).enqueue().result.await()
     }
 
     /**

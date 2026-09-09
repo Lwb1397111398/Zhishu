@@ -8,6 +8,7 @@ import com.example.zhishu.ZhishuApp
 import com.example.zhishu.ai.GenerationLog
 import com.example.zhishu.ai.pipeline.ChapterPhase
 import com.example.zhishu.ai.pipeline.KnowledgeMapMode
+import com.example.zhishu.ai.pipeline.NextVolumeAvailability
 import com.example.zhishu.di.AppContainer
 import kotlinx.coroutines.CancellationException
 
@@ -56,6 +57,10 @@ class GenerationWorker(
                 ?: return Result.failure(workDataOf(KEY_ERROR to "项目不存在"))
 
             if (stage == GenerationStage.SUMMARY) return summarize(project.title)
+            // ADVANCE 只查库 + 续订，不调模型：在 missingRoles 检查之前顶层短路。
+            // 它不该进 runStage（那里是每个 WorkRequest 做一次模型工作的地方），
+            // 所以也不给它占一个 when 分支——短路即最清楚的边界。
+            if (stage == GenerationStage.ADVANCE) return advance()
 
             // 缺配置就直接给出可读原因，不要等模型调用失败后静默结束（问题1）。
             // 检查的角色按本阶段实际要用的算，不再无条件要求三样齐全。
@@ -122,6 +127,15 @@ class GenerationWorker(
                 runChapter(stage, projectTitle)
 
             GenerationStage.SUMMARY -> Unit
+
+            // 永不进到这里：ADVANCE 在 doWork 顶层就短路成 advance() 了。
+            // 留一支只为 when 穷尽——真走到了说明短路位置被挪错，直接抛错暴露问题。
+            GenerationStage.ADVANCE -> throw IllegalStateException("ADVANCE 应在 doWork 顶层短路")
+
+            // 真实执行在 Task 7 补：调 generateNextVolume 规划下一卷。
+            // 现在先占位为「什么都不做但成功」，保证入队（Task 6）能独立编译测试；
+            // 在 Task 7 落地前，没有任何代码路径会排 PLAN_NEXT_VOLUME（appendVolumePlan 尚无调用方）。
+            GenerationStage.PLAN_NEXT_VOLUME -> Unit
         }
         return Result.success()
     }
@@ -178,6 +192,81 @@ class GenerationWorker(
         )
         GenerationNotifier.clearProgress(applicationContext)
         return Result.success(workDataOf(KEY_OUTCOME to GenerationOutcome.COMPLETED.name))
+    }
+
+    /**
+     * 自动闭环的一步（Task 6 的 `doWork` 顶层短路到这里）：查库 → [decideAdvance] → 续订或刹车。
+     *
+     * 全程只读库 + 调 WorkManager 续订，**不调模型**——模型调用在它 APPEND 出去的
+     * 新 WorkRequest 里，各自带 WorkManager 的退避重试。这里失败（读库抛异常）即
+     * ADVANCE 失败，链停；用户点「继续」按总开关从断点恢复整个循环。
+     *
+     * 判据用 isVolumeBlocking（Task 1）而不是 !isReadable：待复核的章正文已可读，
+     * 用 isReadable 会让它永久堵死续卷——那正是用户「老是在第一卷」的头号病根。
+     */
+    private suspend fun advance(): Result {
+        val autoOn = container.learningPrefs.generationAutoAdvance.value
+        val plans = container.chapterRepository.getPlans(projectId)
+        val currentVolume = if (plans.isEmpty()) 0 else plans.maxOf { it.volumeIndex }
+        val volumePlans = plans.filter { it.volumeIndex == currentVolume }
+        val blocking = volumePlans.count { it.status.isVolumeBlocking }
+        // 与批量入口同一条选择规则：排除已发布、排除契约未生成的章（Task 7 之前 targets 恒含 QUEUED 章）
+        val targets = selectChaptersToGenerate(volumePlans, includeNeedsReview = false)
+        val session = inputData.getString(KEY_SESSION).orEmpty()
+        val projectTitle = container.projectRepository.get(projectId)?.title.orEmpty()
+
+        // pending 从 nextVolumeAvailability 拿——它已经算过 coverageReport，这里不重复查一遍
+        val pendingCount = when (val av = container.pipeline.nextVolumeAvailability(projectId)) {
+            is NextVolumeAvailability.CanContinue -> av.pendingCount
+            NextVolumeAvailability.MainLineDone -> 0
+            // NoPlanYet / CurrentVolumeUnfinished：一定还有 blocking 或根本没有章，交给 blocking 分支定
+            else -> Int.MAX_VALUE
+        }
+
+        report(GenerationStage.ADVANCE.label, unitsBefore, projectTitle)
+        when (decideAdvance(autoOn, blocking, targets.size, pendingCount)) {
+            AdvanceDecision.StoppedBySwitch -> {
+                // 关开关不是一种「结果」，不发通知——用户没要求停，只是不要求继续。
+                // 进度条该收掉，不然界面永远挂着一条「正在推进下一步」。
+                GenerationNotifier.clearProgress(applicationContext)
+            }
+
+            AdvanceDecision.ContinueCurrentVolume -> GenerationEnqueuer.appendAutoChunk(
+                context = applicationContext,
+                projectId = projectId,
+                session = session,
+                chapterIds = targets.map { it.id },
+                chapterLabels = targets.map { "第 ${it.order} 章" },
+                unitsTotal = targets.size * ChapterPhase.UNITS_PER_CHAPTER,
+            )
+
+            AdvanceDecision.PlanNextVolume -> GenerationEnqueuer.appendVolumePlan(
+                context = applicationContext, projectId = projectId, session = session,
+            )
+
+            AdvanceDecision.PausedForUser -> {
+                GenerationNotifier.notifyOutcome(
+                    context = applicationContext, projectId = projectId,
+                    projectTitle = projectTitle,
+                    outcome = GenerationOutcome.PARTIAL,
+                    detail = "自动停在第 ${currentVolume + 1} 卷：剩下的章节因果契约还没生成，" +
+                        "不能凭空写正文。到「讲述路线」逐章点「重试契约」后再点「继续」。",
+                )
+                GenerationNotifier.clearProgress(applicationContext)
+            }
+
+            AdvanceDecision.MainLineDone -> {
+                GenerationNotifier.notifyOutcome(
+                    context = applicationContext, projectId = projectId,
+                    projectTitle = projectTitle,
+                    outcome = GenerationOutcome.COMPLETED,
+                    detail = "主线讲完了：知识主干上的知识点都已安排进章节并写完。" +
+                        "想再读可在「讲述路线」点「扩展阅读」另起一卷。",
+                )
+                GenerationNotifier.clearProgress(applicationContext)
+            }
+        }
+        return Result.success()
     }
 
     /**

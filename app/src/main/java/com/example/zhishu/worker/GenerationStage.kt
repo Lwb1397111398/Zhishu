@@ -28,6 +28,19 @@ enum class GenerationStage {
      */
     FIRST_CHAPTER,
 
+    /**
+     * 自动闭环的驱动步（`GenerationWorker.advance()` 实现）：查库决定下一步，
+     * 把后续工作 APPEND 到同一条唯一链尾部。本身不调模型。
+     */
+    ADVANCE,
+
+    /**
+     * 自动续卷：调一次 generateNextVolume 规划下一卷。会烧钱、会失败，
+     * 所以做成独立阶段，才能拿 WorkManager 的退避重试与「失败即停链」，
+     * 与其余调模型步骤一致（而不是在 ADVANCE 里同步调）。
+     */
+    PLAN_NEXT_VOLUME,
+
     /** 链尾总结：只发一条会话级结果通知，不调模型 */
     SUMMARY,
     ;
@@ -37,6 +50,8 @@ enum class GenerationStage {
             KNOWLEDGE_MAP -> "正在梳理知识主干"
             STORY_BIBLE -> "正在规划讲述路线"
             SINGLE_CHAPTER, FIRST_CHAPTER -> "正在生成本章"
+            ADVANCE -> "正在推进下一步"
+            PLAN_NEXT_VOLUME -> "正在规划下一卷"
             SUMMARY -> "正在收尾"
         }
 
@@ -52,6 +67,9 @@ enum class GenerationStage {
             STORY_BIBLE -> listOf(ModelRole.STORY)
             // 正文用 STORY 写、VERIFY 核验并出题，与 FAST 无关
             SINGLE_CHAPTER, FIRST_CHAPTER -> listOf(ModelRole.STORY, ModelRole.VERIFY)
+            // ADVANCE 只查库 + 续订，不调模型；缺配置由它 APPEND 出的 PLAN_NEXT_VOLUME 自己判
+            ADVANCE -> emptyList()
+            PLAN_NEXT_VOLUME -> listOf(ModelRole.STORY)
             SUMMARY -> emptyList()
         }
 }
