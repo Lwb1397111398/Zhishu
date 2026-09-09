@@ -52,3 +52,7 @@ samples/probes/
 .codegraph/
 .test-shots/
 .zcode/
+
+# e2e mock 服务器的运行时产物（请求转储与日志），不入库
+_claude_e2e/req/
+_claude_e2e/server.log
