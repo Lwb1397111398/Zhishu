@@ -303,10 +303,44 @@ fun ReaderScreen(
         }
     }
 
+    // 点击手势挂在内容的父容器上，而不是盖在内容之上的透明层：
+    // 同级（sibling）不互相传递指针事件——顶层覆盖层会把 chip、来源入口、
+    // 章末按钮的点按全部吞掉（ReaderTapOverlayTest 复现过）。
+    // 父容器则只在子项不消费点按时才收到：正文空白处点按照常呼出菜单/翻页，
+    // 可交互子项（chip、按钮）自己消费掉，点哪开哪。detectTapGestures 只认点按，
+    // 滑动被 pager / LazyColumn 消费，翻页与滚动都不受影响。
     Box(
         Modifier
             .fillMaxSize()
-            .background(palette.background),
+            .background(palette.background)
+            .pointerInput(readerMode, menuShown) {
+                detectTapGestures { offset ->
+                    when {
+                        menuShown -> {
+                            // 菜单展开时点空白收起；菜单上的按钮自己消费，不会走到这里
+                            menuShown = false
+                        }
+
+                        readerMode == ReaderMode.PAGER && offset.x < size.width / 3f ->
+                            scope.launch {
+                                if (pagerState.currentPage > 0) {
+                                    pagerState.animateScrollToPage(pagerState.currentPage - 1)
+                                }
+                            }
+
+                        readerMode == ReaderMode.PAGER &&
+                            offset.x > size.width * 2f / 3f ->
+                            scope.launch {
+                                val last = pages.size + footerPageCount - 1
+                                if (pagerState.currentPage < last) {
+                                    pagerState.animateScrollToPage(pagerState.currentPage + 1)
+                                }
+                            }
+
+                        else -> menuShown = true
+                    }
+                }
+            },
     ) {
         if (blocks.isEmpty()) {
             // 空状态：保留返回手段，其他信息照旧，只是换成纸面配色
@@ -583,38 +617,8 @@ fun ReaderScreen(
             }
         }
 
-        // 点击手势层：翻页模式点左/右 1/3 翻页，中间呼出菜单；滚动模式任意点按呼出菜单。
-        // detectTapGestures 只消费点按，不干扰翻页滑动与滚动
-        Box(
-            Modifier
-                .fillMaxSize()
-                .pointerInput(readerMode) {
-                    detectTapGestures { offset ->
-                        when {
-                            readerMode == ReaderMode.PAGER && offset.x < size.width / 3f ->
-                                scope.launch {
-                                    if (pagerState.currentPage > 0) {
-                                        pagerState.animateScrollToPage(pagerState.currentPage - 1)
-                                    }
-                                }
-
-                            readerMode == ReaderMode.PAGER &&
-                                offset.x > size.width * 2f / 3f ->
-                                scope.launch {
-                                    val last = pages.size + footerPageCount - 1
-                                    if (pagerState.currentPage < last) {
-                                        pagerState.animateScrollToPage(pagerState.currentPage + 1)
-                                    }
-                                }
-
-                            else -> menuShown = !menuShown
-                        }
-                    }
-                },
-        )
-
         // 呼出菜单：顶部（返回/书名章节/带讲解/来源/导览）与底部（目录/翻章/进度/设置）。
-        // 菜单是覆盖层，点菜单外的空白处会再触发一次 toggle 收起
+        // 菜单是覆盖层，点菜单外的空白处会经父容器的点按手势收起
         AnimatedVisibility(
             visible = menuShown,
             modifier = Modifier.align(Alignment.TopStart),
