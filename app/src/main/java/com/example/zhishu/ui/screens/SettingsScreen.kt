@@ -46,7 +46,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -83,20 +83,20 @@ import kotlinx.coroutines.withContext
 fun SettingsScreen(onOpenReview: () -> Unit = {}) {
     val app = LocalContext.current.applicationContext as Application
     val vm: SettingsViewModel = rememberZhishuViewModel(key = "settings") { SettingsViewModel(app) }
-    val profiles by vm.profiles.collectAsState()
-    val assignments by vm.assignments.collectAsState()
-    val editingProfileId by vm.editingProfileId.collectAsState()
-    val busy by vm.busy.collectAsState()
-    val testResults by vm.testResults.collectAsState()
-    val modelLists by vm.modelLists.collectAsState()
-    val spacedReview by vm.spacedReviewEnabled.collectAsState()
-    val autoAdvance by vm.generationAutoAdvance.collectAsState()
+    val profiles by vm.profiles.collectAsStateWithLifecycle()
+    val assignments by vm.assignments.collectAsStateWithLifecycle()
+    val editingProfileId by vm.editingProfileId.collectAsStateWithLifecycle()
+    val busy by vm.busy.collectAsStateWithLifecycle()
+    val testResults by vm.testResults.collectAsStateWithLifecycle()
+    val modelLists by vm.modelLists.collectAsStateWithLifecycle()
+    val spacedReview by vm.spacedReviewEnabled.collectAsStateWithLifecycle()
+    val autoAdvance by vm.generationAutoAdvance.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val container = (app as ZhishuApp).container
     // 弹窗可见性跟着 ViewModel 走：它不能随卡片滑出屏幕被回收，
     // 否则滑回来时会用「搜索结果还在」这件事再弹一次（用户反馈的滑动自动弹窗）
-    val pickerProfiles by vm.pickerProfiles.collectAsState()
+    val pickerProfiles by vm.pickerProfiles.collectAsStateWithLifecycle()
     // 删除确认 / 三档分配选择这两个弹窗是页面级一次性事件，页面局部状态即可
     var deleteTarget by remember { mutableStateOf<ApiProfile?>(null) }
     var assignmentTarget by remember { mutableStateOf<AssignmentTarget?>(null) }

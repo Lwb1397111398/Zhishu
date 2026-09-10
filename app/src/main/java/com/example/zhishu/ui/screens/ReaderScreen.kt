@@ -59,7 +59,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -87,15 +87,13 @@ import com.example.zhishu.domain.model.KnowledgeNode
 import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.ui.common.InfoRow
 import com.example.zhishu.ui.common.UnverifiedClaimsCard
+import com.example.zhishu.ui.common.formatDay
 import com.example.zhishu.ui.common.rememberZhishuViewModel
 import com.example.zhishu.ui.viewmodel.BlockSource
 import com.example.zhishu.ui.viewmodel.BlockSourceSummary
 import com.example.zhishu.ui.viewmodel.ChapterTrustSummary
 import com.example.zhishu.ui.viewmodel.ReaderViewModel
 import com.example.zhishu.ui.viewmodel.SourceTrustState
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
@@ -127,25 +125,25 @@ fun ReaderScreen(
     val vm: ReaderViewModel = rememberZhishuViewModel(key = "reader_$chapterId") {
         ReaderViewModel(app, chapterId)
     }
-    val chapter by vm.chapter.collectAsState()
-    val project by vm.project.collectAsState()
-    val blocks by vm.blocks.collectAsState()
-    val nodes by vm.nodes.collectAsState()
-    val dense by vm.denseMode.collectAsState()
-    val prevChapterId by vm.prevChapterId.collectAsState()
-    val nextChapterId by vm.nextChapterId.collectAsState()
-    val savedAnchor by vm.savedAnchor.collectAsState()
-    val quizCount by vm.quizCount.collectAsState()
-    val bodyUpdatedNotice by vm.bodyUpdatedNotice.collectAsState()
-    val blockSources by vm.blockSources.collectAsState()
-    val chapterTrust by vm.chapterTrust.collectAsState()
-    val staleTargetNotice by vm.staleTargetNotice.collectAsState()
+    val chapter by vm.chapter.collectAsStateWithLifecycle()
+    val project by vm.project.collectAsStateWithLifecycle()
+    val blocks by vm.blocks.collectAsStateWithLifecycle()
+    val nodes by vm.nodes.collectAsStateWithLifecycle()
+    val dense by vm.denseMode.collectAsStateWithLifecycle()
+    val prevChapterId by vm.prevChapterId.collectAsStateWithLifecycle()
+    val nextChapterId by vm.nextChapterId.collectAsStateWithLifecycle()
+    val savedAnchor by vm.savedAnchor.collectAsStateWithLifecycle()
+    val quizCount by vm.quizCount.collectAsStateWithLifecycle()
+    val bodyUpdatedNotice by vm.bodyUpdatedNotice.collectAsStateWithLifecycle()
+    val blockSources by vm.blockSources.collectAsStateWithLifecycle()
+    val chapterTrust by vm.chapterTrust.collectAsStateWithLifecycle()
+    val staleTargetNotice by vm.staleTargetNotice.collectAsStateWithLifecycle()
     // 阅读偏好（小说模式）：翻页/滚动、字号、纸色——都持久化，改了立即生效
-    val readerMode by vm.readerMode.collectAsState()
-    val fontIndex by vm.readerFontSizeIndex.collectAsState()
-    val paper by vm.readerPaper.collectAsState()
-    val serifBody by vm.readerSerif.collectAsState()
-    val allPlans by vm.allPlans.collectAsState()
+    val readerMode by vm.readerMode.collectAsStateWithLifecycle()
+    val fontIndex by vm.readerFontSizeIndex.collectAsStateWithLifecycle()
+    val paper by vm.readerPaper.collectAsStateWithLifecycle()
+    val serifBody by vm.readerSerif.collectAsStateWithLifecycle()
+    val allPlans by vm.allPlans.collectAsStateWithLifecycle()
 
     var selectedNode by remember { mutableStateOf<KnowledgeNode?>(null) }
     var showOutline by remember { mutableStateOf(false) }
@@ -1003,7 +1001,7 @@ private fun SourceEntry(
             }
             source.document?.let { document ->
                 Text(
-                    "${sourceOriginLabel(document)} · 取得于 ${formatSourceDay(document.fetchedAt)}",
+                    "${sourceOriginLabel(document)} · 取得于 ${formatDay(document.fetchedAt)}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1168,9 +1166,6 @@ private fun sourceOriginLabel(document: SourceDocument): String = when {
     !document.url.isNullOrBlank() -> "你抓取的网页：${document.url}"
     else -> "你粘贴的文本"
 }
-
-private fun formatSourceDay(ts: Long): String =
-    SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(ts))
 
 /** 来源面板里原文摘录的长度上限。够核对就行，不必把整个片段搬过来 */
 private const val SOURCE_EXCERPT_CHARS = 600

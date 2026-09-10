@@ -31,7 +31,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -58,12 +58,12 @@ fun QuizScreen(
     val vm: QuizViewModel = rememberZhishuViewModel(key = "quiz_$chapterId") {
         QuizViewModel(app, chapterId)
     }
-    val chapter by vm.chapter.collectAsState()
-    val quizzes by vm.quizzes.collectAsState()
-    val selections by vm.selections.collectAsState()
+    val chapter by vm.chapter.collectAsStateWithLifecycle()
+    val quizzes by vm.quizzes.collectAsStateWithLifecycle()
+    val selections by vm.selections.collectAsStateWithLifecycle()
     // 订阅答题状态，提交后结果与按钮可靠重组（N1）
-    val answers by vm.answers.collectAsState()
-    val message by vm.message.collectAsState()
+    val answers by vm.answers.collectAsStateWithLifecycle()
+    val message by vm.message.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(message) {

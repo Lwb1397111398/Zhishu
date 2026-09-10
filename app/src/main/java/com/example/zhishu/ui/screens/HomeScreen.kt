@@ -53,7 +53,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -138,12 +138,12 @@ fun HomeScreen(
 ) {
     val app = LocalContext.current.applicationContext as Application
     val vm: HomeViewModel = rememberZhishuViewModel { HomeViewModel(app) }
-    val projects by vm.projects.collectAsState()
-    val dueCount by vm.dueCount.collectAsState()
-    val continueEntry by vm.continueEntry.collectAsState()
-    val reviewEnabled by vm.spacedReviewEnabled.collectAsState()
-    val bookStats by vm.bookStats.collectAsState()
-    val weekReadCount by vm.weekReadCount.collectAsState()
+    val projects by vm.projects.collectAsStateWithLifecycle()
+    val dueCount by vm.dueCount.collectAsStateWithLifecycle()
+    val continueEntry by vm.continueEntry.collectAsStateWithLifecycle()
+    val reviewEnabled by vm.spacedReviewEnabled.collectAsStateWithLifecycle()
+    val bookStats by vm.bookStats.collectAsStateWithLifecycle()
+    val weekReadCount by vm.weekReadCount.collectAsStateWithLifecycle()
     var deleteTarget by remember { mutableStateOf<Project?>(null) }
 
     // 每次回到书架都刷新阅读统计：点书直读靠它找「上次读到的章」，
@@ -592,12 +592,12 @@ fun KnowledgeHubScreen(
 ) {
     val app = LocalContext.current.applicationContext as Application
     val vm: HomeViewModel = rememberZhishuViewModel(key = "knowledge_hub") { HomeViewModel(app) }
-    val projects by vm.projects.collectAsState()
-    val continueEntry by vm.continueEntry.collectAsState()
-    val dueCount by vm.dueCount.collectAsState()
-    val reviewEnabled by vm.spacedReviewEnabled.collectAsState()
-    val weekReadCount by vm.weekReadCount.collectAsState()
-    val knowledgeStats by vm.knowledgeStats.collectAsState()
+    val projects by vm.projects.collectAsStateWithLifecycle()
+    val continueEntry by vm.continueEntry.collectAsStateWithLifecycle()
+    val dueCount by vm.dueCount.collectAsStateWithLifecycle()
+    val reviewEnabled by vm.spacedReviewEnabled.collectAsStateWithLifecycle()
+    val weekReadCount by vm.weekReadCount.collectAsStateWithLifecycle()
+    val knowledgeStats by vm.knowledgeStats.collectAsStateWithLifecycle()
 
     // 排序与书架完全一致：最近在读的那本置顶，其余按更新时间——
     // 「书怎么排，知识就怎么排」，两页来回切换时位置感是连续的
@@ -805,9 +805,9 @@ fun ReviewScreen(
 ) {
     val app = LocalContext.current.applicationContext as Application
     val vm: ReviewViewModel = rememberZhishuViewModel { ReviewViewModel(app) }
-    val items by vm.items.collectAsState()
-    val projects by vm.projects.collectAsState()
-    val nodes by vm.nodes.collectAsState()
+    val items by vm.items.collectAsStateWithLifecycle()
+    val projects by vm.projects.collectAsStateWithLifecycle()
+    val nodes by vm.nodes.collectAsStateWithLifecycle()
 
     Scaffold(
         topBar = {

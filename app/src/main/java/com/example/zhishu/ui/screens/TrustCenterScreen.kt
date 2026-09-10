@@ -30,7 +30,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -64,9 +64,9 @@ fun TrustCenterScreen(
     val vm: TrustCenterViewModel = rememberZhishuViewModel(key = "trust_$projectId") {
         TrustCenterViewModel(app, projectId)
     }
-    val entries by vm.entries.collectAsState()
-    val loading by vm.loading.collectAsState()
-    val filter by vm.filter.collectAsState()
+    val entries by vm.entries.collectAsStateWithLifecycle()
+    val loading by vm.loading.collectAsStateWithLifecycle()
+    val filter by vm.filter.collectAsStateWithLifecycle()
 
     val visible = if (filter == null) entries else entries.filter { it.kind == filter }
 

@@ -27,7 +27,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,12 +39,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.zhishu.domain.model.SourceChunk
 import com.example.zhishu.domain.model.SourceDocument
+import com.example.zhishu.ui.common.formatDay
 import com.example.zhishu.ui.common.rememberZhishuViewModel
 import com.example.zhishu.ui.viewmodel.CitingBlock
 import com.example.zhishu.ui.viewmodel.SourceDetailViewModel
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import kotlinx.coroutines.delay
 
 /** 列表里片段前面的固定项数（资料信息头），片段索引 = 列表索引 - 这个数 */
@@ -72,9 +70,9 @@ fun SourceDetailScreen(
     val vm: SourceDetailViewModel = rememberZhishuViewModel(key = "source_$sourceId") {
         SourceDetailViewModel(app, sourceId)
     }
-    val source by vm.source.collectAsState()
-    val chunks by vm.chunks.collectAsState()
-    val citingBlocks by vm.citingBlocks.collectAsState()
+    val source by vm.source.collectAsStateWithLifecycle()
+    val chunks by vm.chunks.collectAsStateWithLifecycle()
+    val citingBlocks by vm.citingBlocks.collectAsStateWithLifecycle()
 
     val listState = rememberLazyListState()
     var highlightChunkId by remember { mutableStateOf(targetChunkId) }
@@ -167,7 +165,7 @@ private fun SourceHeader(source: SourceDocument?, missingTarget: Boolean) {
         }
         Text(origin, style = MaterialTheme.typography.bodySmall)
         Text(
-            "取得于 ${formatSourceDetailDay(source.fetchedAt)}",
+            "取得于 ${formatDay(source.fetchedAt)}",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -311,6 +309,3 @@ private fun ChunkCard(
         }
     }
 }
-
-private fun formatSourceDetailDay(ts: Long): String =
-    SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(ts))

@@ -64,7 +64,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -111,12 +111,10 @@ import com.example.zhishu.ui.common.SourceKindChip
 import com.example.zhishu.ui.common.SourceTextDialog
 import com.example.zhishu.ui.common.SourceUrlDialog
 import com.example.zhishu.ui.common.StatusChip
+import com.example.zhishu.ui.common.formatDay
 import com.example.zhishu.ui.common.readSourceFile
 import com.example.zhishu.ui.common.rememberZhishuViewModel
 import com.example.zhishu.ui.viewmodel.ProjectDetailViewModel
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -143,16 +141,16 @@ fun ProjectDetailScreen(
     val vm: ProjectDetailViewModel = rememberZhishuViewModel(key = "detail_$projectId") {
         ProjectDetailViewModel(app, projectId)
     }
-    val project by vm.project.collectAsState()
-    val sources by vm.sources.collectAsState()
-    val nodes by vm.nodes.collectAsState()
-    val gaps by vm.gaps.collectAsState()
-    val conflicts by vm.conflicts.collectAsState()
-    val plans by vm.plans.collectAsState()
-    val bible by vm.bible.collectAsState()
-    val generation by vm.generation.collectAsState()
-    val message by vm.message.collectAsState()
-    val nodeAnchors by vm.nodeAnchors.collectAsState()
+    val project by vm.project.collectAsStateWithLifecycle()
+    val sources by vm.sources.collectAsStateWithLifecycle()
+    val nodes by vm.nodes.collectAsStateWithLifecycle()
+    val gaps by vm.gaps.collectAsStateWithLifecycle()
+    val conflicts by vm.conflicts.collectAsStateWithLifecycle()
+    val plans by vm.plans.collectAsStateWithLifecycle()
+    val bible by vm.bible.collectAsStateWithLifecycle()
+    val generation by vm.generation.collectAsStateWithLifecycle()
+    val message by vm.message.collectAsStateWithLifecycle()
+    val nodeAnchors by vm.nodeAnchors.collectAsStateWithLifecycle()
 
     // 带 focusNodeId 进来就是「从正文回看知识地图」，直接停在知识主干页；
     // focusNodeId 为空时按路由给的 initialTab 落地（知识页「查看地图」直达 tab 1）
@@ -307,8 +305,8 @@ private fun SourcesTab(
     var pendingSourceMode by remember { mutableStateOf<SourceMode?>(null) }
     val scope = rememberCoroutineScope()
     val modelKnowledge = project?.usesModelKnowledge == true
-    val unconfirmed by vm.unconfirmedCitationCount.collectAsState()
-    val issues by vm.issues.collectAsState()
+    val unconfirmed by vm.unconfirmedCitationCount.collectAsStateWithLifecycle()
+    val issues by vm.issues.collectAsStateWithLifecycle()
     val openIssueCount = issues.values.sumOf { list -> list.count { it.resolution.isOpen } }
 
     LazyColumn(
@@ -838,8 +836,8 @@ private fun MapTab(
         } else {
             // 分步生成：批次未完成时给「继续」入口，和「重新梳理」（开新批次）分开——
             // 部分链失败后点继续只补没做完的链，不把已经花钱展开的内容作废重来
-            val batch = vm.mapBatch.collectAsState().value
-            val busy = vm.generation.collectAsState().value.busy
+            val batch = vm.mapBatch.collectAsStateWithLifecycle().value
+            val busy = vm.generation.collectAsStateWithLifecycle().value.busy
             val unfinished = batch?.takeIf { it.skeletonDone && !it.completed }
             if (unfinished != null) {
                 val statuses = remember(unfinished) { unfinished.chainStatusList() }
@@ -897,7 +895,7 @@ private fun MapTab(
             val handledGaps = remember(gaps) { gaps.filter { it.gapStatus != GapStatus.OPEN } }
             val openConflicts = remember(conflicts) { conflicts.filter { it.conflictStatus == GapStatus.OPEN } }
             val handledConflicts = remember(conflicts) { conflicts.filter { it.conflictStatus != GapStatus.OPEN } }
-            val patchingGaps by vm.patchingGaps.collectAsState()
+            val patchingGaps by vm.patchingGaps.collectAsStateWithLifecycle()
             LazyColumn {
                 if (openGaps.isNotEmpty() || handledGaps.isNotEmpty() || openConflicts.isNotEmpty() || handledConflicts.isNotEmpty()) {
                     item {
@@ -1382,17 +1380,17 @@ private fun OutlineTab(
     // 正在查看问题清单的章节（4B）
     var issuePlan by remember { mutableStateOf<ChapterPlan?>(null) }
     // 重新生成失败的说明按章节取，绑在新版本上而不是覆盖当前正文的核验说明（3A）
-    val failedRegenerations by vm.failedRegenerations.collectAsState()
+    val failedRegenerations by vm.failedRegenerations.collectAsStateWithLifecycle()
     // 当前正文的核验问题，按章节分组（4B）
-    val issues by vm.issues.collectAsState()
-    val issueBlocks by vm.issueBlocks.collectAsState()
-    val rewriting by vm.rewriting.collectAsState()
-    val retryingContracts by vm.retryingContracts.collectAsState()
-    val reverifying by vm.reverifying.collectAsState()
+    val issues by vm.issues.collectAsStateWithLifecycle()
+    val issueBlocks by vm.issueBlocks.collectAsStateWithLifecycle()
+    val rewriting by vm.rewriting.collectAsStateWithLifecycle()
+    val retryingContracts by vm.retryingContracts.collectAsStateWithLifecycle()
+    val reverifying by vm.reverifying.collectAsStateWithLifecycle()
     // 「继续下一卷」的入口状态（3C）
-    val nextVolume by vm.nextVolume.collectAsState()
+    val nextVolume by vm.nextVolume.collectAsStateWithLifecycle()
     // 统计只数当前版本正文（3D）
-    val stats by vm.stats.collectAsState()
+    val stats by vm.stats.collectAsStateWithLifecycle()
     val volumeCount = plans.map { it.volumeIndex }.distinct().size
     // 进度按「正文可读」算，不因为缺自测题就少算一章
     val published = plans.count { it.isReadable }
@@ -2345,6 +2343,3 @@ private fun EditChapterDialog(
         },
     )
 }
-
-private fun formatDay(ts: Long): String =
-    SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(ts))

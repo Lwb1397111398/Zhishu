@@ -35,7 +35,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -73,11 +73,11 @@ fun SearchScreen(
     LaunchedEffect(initialProjectId) {
         vm.applyInitialProject(initialProjectId)
     }
-    val projects by vm.projects.collectAsState()
-    val selectedProjectId by vm.selectedProjectId.collectAsState()
-    val query by vm.query.collectAsState()
-    val results by vm.results.collectAsState()
-    val searching by vm.searching.collectAsState()
+    val projects by vm.projects.collectAsStateWithLifecycle()
+    val selectedProjectId by vm.selectedProjectId.collectAsStateWithLifecycle()
+    val query by vm.query.collectAsStateWithLifecycle()
+    val results by vm.results.collectAsStateWithLifecycle()
+    val searching by vm.searching.collectAsStateWithLifecycle()
 
     val projectTitle = projects.firstOrNull { it.id == selectedProjectId }?.title ?: "选择项目"
 

@@ -45,7 +45,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,11 +90,11 @@ fun CreateProjectScreen(
 ) {
     val app = LocalContext.current.applicationContext as Application
     val vm: CreateProjectViewModel = rememberZhishuViewModel { CreateProjectViewModel(app) }
-    val sources by vm.sources.collectAsState()
-    val creating by vm.creating.collectAsState()
-    val topic by vm.topic.collectAsState()
-    val learningGoal by vm.learningGoal.collectAsState()
-    val sourceMode by vm.sourceMode.collectAsState()
+    val sources by vm.sources.collectAsStateWithLifecycle()
+    val creating by vm.creating.collectAsStateWithLifecycle()
+    val topic by vm.topic.collectAsStateWithLifecycle()
+    val learningGoal by vm.learningGoal.collectAsStateWithLifecycle()
+    val sourceMode by vm.sourceMode.collectAsStateWithLifecycle()
 
     var showMore by remember { mutableStateOf(false) }
     var showTextDialog by remember { mutableStateOf(false) }
@@ -329,12 +329,12 @@ private fun SourceRow(source: PendingSource, onRemove: () -> Unit) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun MoreSettings(vm: CreateProjectViewModel) {
-    val baseline by vm.baseline.collectAsState()
-    val depth by vm.depth.collectAsState()
-    val genre by vm.genre.collectAsState()
-    val dailyMinutes by vm.dailyMinutes.collectAsState()
-    val learnerIdentity by vm.learnerIdentity.collectAsState()
-    val learningPurpose by vm.learningPurpose.collectAsState()
+    val baseline by vm.baseline.collectAsStateWithLifecycle()
+    val depth by vm.depth.collectAsStateWithLifecycle()
+    val genre by vm.genre.collectAsStateWithLifecycle()
+    val dailyMinutes by vm.dailyMinutes.collectAsStateWithLifecycle()
+    val learnerIdentity by vm.learnerIdentity.collectAsStateWithLifecycle()
+    val learningPurpose by vm.learningPurpose.collectAsStateWithLifecycle()
 
     Column(Modifier.padding(top = 8.dp)) {
         // 身份与目的决定知识主干怎么切：同样学民法，研究生深化 / 非专业自学 /
