@@ -15,9 +15,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Book
-import androidx.compose.material.icons.filled.MenuBook
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.School
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Card
@@ -27,6 +27,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -86,7 +87,7 @@ fun SearchScreen(
             TopAppBar(
                 title = { Text("知识搜索") },
                 navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "返回") }
+                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回") }
                 },
             )
         },
@@ -198,7 +199,7 @@ private fun ProjectDropdown(
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
             modifier = Modifier
                 .fillMaxWidth()
-                .menuAnchor(),
+                .menuAnchor(MenuAnchorType.PrimaryNotEditable),
         )
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             projects.forEach { project ->
@@ -223,7 +224,7 @@ private fun SearchResultCard(
     val (icon, kindLabel, tint) = when (hit.kind) {
         SearchHitKind.NODE_EXACT -> Triple(Icons.Default.School, "知识点（精确）", MaterialTheme.colorScheme.primary)
         SearchHitKind.NODE_FUZZY -> Triple(Icons.Default.School, "知识点", MaterialTheme.colorScheme.primary)
-        SearchHitKind.CHAPTER_BLOCK -> Triple(Icons.Default.MenuBook, "章节", MaterialTheme.colorScheme.tertiary)
+        SearchHitKind.CHAPTER_BLOCK -> Triple(Icons.AutoMirrored.Filled.MenuBook, "章节", MaterialTheme.colorScheme.tertiary)
         SearchHitKind.SOURCE_CHUNK -> Triple(Icons.Default.Book, "资料", MaterialTheme.colorScheme.outline)
     }
     Card(modifier = Modifier.padding(vertical = 6.dp)) {

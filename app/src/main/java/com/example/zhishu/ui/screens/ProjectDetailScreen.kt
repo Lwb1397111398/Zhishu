@@ -24,14 +24,14 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.NoteAdd
+import androidx.compose.material.icons.automirrored.filled.NoteAdd
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -193,7 +193,7 @@ fun ProjectDetailScreen(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "返回") }
+                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回") }
                 },
                 actions = {
                     IconButton(onClick = { onOpenSearch(projectId) }) {
@@ -359,7 +359,7 @@ private fun SourcesTab(
                 // FlowRow：大字号下三个来源按钮不会挤成一条裁掉「文件」，放不下的自动换行
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = { showText = true }) {
-                        Icon(Icons.Default.NoteAdd, contentDescription = null)
+                        Icon(Icons.AutoMirrored.Filled.NoteAdd, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
                         Text("粘贴文本")
                     }
@@ -378,7 +378,7 @@ private fun SourcesTab(
             if (sources.isEmpty()) {
                 item {
                     EmptyState(
-                        icon = Icons.Default.NoteAdd,
+                        icon = Icons.AutoMirrored.Filled.NoteAdd,
                         title = "还没有资料",
                         subtitle = "添加教材、讲义、法条或网页内容；或者切换到上面的「AI 自备知识」，让 AI 自己组织这门学科。",
                         // min 而不是定值：定高在大字号下会把副标题裁掉

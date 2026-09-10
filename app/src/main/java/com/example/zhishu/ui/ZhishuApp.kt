@@ -3,7 +3,7 @@ package com.example.zhishu.ui
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
@@ -87,7 +87,7 @@ private data class TabItem(val route: String, val label: String, val icon: Image
  */
 private val topTabs = listOf(
     TabItem(Routes.HOME, "学习", Icons.Default.Home),
-    TabItem(Routes.KNOWLEDGE, "知识", Icons.Default.List),
+    TabItem(Routes.KNOWLEDGE, "知识", Icons.AutoMirrored.Filled.List),
     TabItem(Routes.SETTINGS, "我的", Icons.Default.Settings),
 )
 

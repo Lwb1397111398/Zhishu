@@ -39,9 +39,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.School
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material3.AssistChip
@@ -319,7 +318,7 @@ fun ReaderScreen(
                     .padding(32.dp),
             ) {
                 IconButton(onClick = onBack) {
-                    Icon(Icons.Default.ArrowBack, contentDescription = "返回", tint = palette.text)
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回", tint = palette.text)
                 }
                 Spacer(Modifier.height(80.dp))
                 Text(

@@ -24,11 +24,13 @@ private data class TestPayload(
     val ok: Boolean,
 )
 
+private val LenientJson = Json { ignoreUnknownKeys = true }
+
 class DefaultModelRouterTest {
 
     private val decoder = object : JsonDecoder<TestPayload> {
         override fun decode(text: String): TestPayload =
-            Json { ignoreUnknownKeys = true }.decodeFromString(TestPayload.serializer(), text)
+            LenientJson.decodeFromString(TestPayload.serializer(), text)
     }
 
     private fun request(): ModelRequest = ModelRequest(

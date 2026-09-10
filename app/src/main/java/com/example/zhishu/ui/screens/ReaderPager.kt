@@ -23,9 +23,9 @@ import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.MenuBook
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -878,7 +878,7 @@ internal fun ReaderTopMenu(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 IconButton(onClick = onBack) {
-                    Icon(Icons.Default.ArrowBack, "返回", tint = palette.text)
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = palette.text)
                 }
                 Column(Modifier.weight(1f)) {
                     Text(
@@ -955,7 +955,7 @@ internal fun ReaderBottomMenu(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 IconButton(onClick = onToc) {
-                    Icon(Icons.Default.List, "全书目录", tint = palette.text)
+                    Icon(Icons.AutoMirrored.Filled.List, "全书目录", tint = palette.text)
                 }
                 TextButton(onClick = onPrev, enabled = hasPrev) {
                     Text(if (hasPrev) "上一章" else "第一章", color = if (hasPrev) palette.text else palette.secondary)
