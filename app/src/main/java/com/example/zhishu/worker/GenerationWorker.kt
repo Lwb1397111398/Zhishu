@@ -154,19 +154,27 @@ class GenerationWorker(
         return Result.success()
     }
 
-    /** 生成一章。FIRST_CHAPTER 现查「第一个还没写的章节」，不依赖入队时的快照。 */
+    /** 生成一章。FIRST_CHAPTER 现查「第一个需要写的章节」，不依赖入队时的快照。 */
     private suspend fun runChapter(stage: GenerationStage, projectTitle: String) {
-        val chapterId = when (stage) {
-            GenerationStage.FIRST_CHAPTER -> container.chapterRepository.getPlans(projectId)
-                .sortedBy { it.order }
-                .firstOrNull { !it.status.isReadable }
-                ?.id
-                // 章节都写完了不算失败，一键开讲到这里就算达成目的
-                ?: return
-            else -> inputData.getString(KEY_CHAPTER_ID)
-                ?: throw IllegalStateException("未指定章节")
+        val chapterId: String
+        val label: String
+        when (stage) {
+            GenerationStage.FIRST_CHAPTER -> {
+                val plan = selectFirstChapterToWrite(
+                    container.chapterRepository.getPlans(projectId),
+                )
+                    // 章节都写完了不算失败，一键开讲到这里就算达成目的
+                    ?: return
+                chapterId = plan.id
+                // 入队时不知道会选哪章，运行时按实际章号报告进度
+                label = "第 ${plan.order} 章"
+            }
+            else -> {
+                chapterId = inputData.getString(KEY_CHAPTER_ID)
+                    ?: throw IllegalStateException("未指定章节")
+                label = inputData.getString(KEY_CHAPTER_LABEL).orEmpty()
+            }
         }
-        val label = inputData.getString(KEY_CHAPTER_LABEL).orEmpty()
         var done = 0
         container.pipeline.generateChapter(projectId, chapterId) { phase ->
             val text = if (label.isBlank()) phase.label else "$label · ${phase.label}"

@@ -515,6 +515,68 @@ class GenerationTest {
         assertNotNull(db.chapterPlanDao().getById(plan.id))
     }
 
+    /**
+     * 待复核章（正文已发布、只等用户确认）重写失败：状态必须保持待复核、
+     * activeVersionId 原样——旧判据（isReadable）把它当「没有正文」，
+     * 失败后翻成 FAILED，阅读入口全部关闭，正文明明还在库里。
+     */
+    @Test
+    fun regenerate_needsReviewChapter_failedAttemptKeepsReadableBody() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        RouteStubs.outlineChapterCount = 1
+        pipeline.generateStoryBible("p-1")
+        val plan = db.chapterPlanDao().getByProject("p-1").first()
+        pipeline.generateChapter("p-1", plan.id)
+        // 模拟「带问题发布」：核验挑出问题、自动修复没修干净时正文照常发布但停在待复核
+        db.chapterPlanDao().updateStatus(plan.id, ChapterStatus.NEEDS_REVIEW, "核验发现问题")
+        val bodyBefore = db.chapterPlanDao().getById(plan.id)?.activeVersionId
+        assertNotNull(bodyBefore)
+
+        fakeRouter.failChapterBody = true
+        val result = pipeline.generateChapter("p-1", plan.id)
+        assertTrue(result.isFailure)
+        val after = db.chapterPlanDao().getById(plan.id)!!
+        assertEquals(ChapterStatus.NEEDS_REVIEW, after.status)
+        assertEquals(bodyBefore, after.activeVersionId)
+        assertFalse(db.chapterBlockDao().getActiveBlocks(plan.id).isEmpty())
+    }
+
+    /**
+     * 整本书都停在待复核（正文可读）时，整本重规划必须被闸门拦下——
+     * 旧判据（isReadable）会把这种书判成「没有正文」，重规划直接清掉全书可读内容。
+     */
+    @Test
+    fun replan_gate_blocksWhenOnlyNeedsReviewWithBody() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        RouteStubs.outlineChapterCount = 1
+        pipeline.generateStoryBible("p-1")
+        val plan = db.chapterPlanDao().getByProject("p-1").first()
+        pipeline.generateChapter("p-1", plan.id)
+        db.chapterPlanDao().updateStatus(plan.id, ChapterStatus.NEEDS_REVIEW, "核验发现问题")
+
+        val result = pipeline.generateStoryBible("p-1")
+        assertTrue(result.isFailure)
+        // 拦下来的同时正文一个块都不能少
+        assertFalse(db.chapterBlockDao().getActiveBlocks(plan.id).isEmpty())
+    }
+
+    /** 待复核不是「在生成」：项目徽章不该永远挂在「正在生成…」 */
+    @Test
+    fun refreshProjectStatus_needsReviewIsNotGenerating() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        RouteStubs.outlineChapterCount = 1
+        pipeline.generateStoryBible("p-1")
+        val plan = db.chapterPlanDao().getByProject("p-1").first()
+        pipeline.generateChapter("p-1", plan.id)
+        assertEquals(ProjectStatus.READY, db.projectDao().getById("p-1")?.status)
+        db.chapterPlanDao().updateStatus(plan.id, ChapterStatus.NEEDS_REVIEW, "核验发现问题")
+        pipeline.refreshProjectStatus("p-1")
+        assertEquals(ProjectStatus.READY, db.projectDao().getById("p-1")?.status)
+    }
+
     private fun project(status: ProjectStatus = ProjectStatus.DRAFT) = Project(
         id = "p-1",
         title = "民法基础",
@@ -599,6 +661,9 @@ class GenerationTest {
         var quizRole: ModelRole? = null
         var storyBibleCalls: Int = 0
 
+        /** 置 true 时正文生成返回失败，用于验证重写失败的收尾不动旧正文 */
+        var failChapterBody: Boolean = false
+
         override suspend fun <T> generate(
             role: ModelRole,
             request: ModelRequest,
@@ -633,6 +698,9 @@ class GenerationTest {
                     quizRole = role; quizJson
                 }
                 else -> error("没有匹配的测试数据: ${request.user.take(40)}")
+            }
+            if (failChapterBody && request.user.contains("[[CHAPTER]]")) {
+                return Result.failure(ModelError.Server("注入的正文生成失败"))
             }
             return try {
                 Result.success(decoder.decode(text))

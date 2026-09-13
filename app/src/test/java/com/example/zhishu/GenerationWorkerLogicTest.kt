@@ -9,6 +9,7 @@ import com.example.zhishu.worker.isPermanentConfigFailure
 import com.example.zhishu.worker.failureReason
 import com.example.zhishu.worker.isRetryableFailure
 import com.example.zhishu.worker.selectChaptersToGenerate
+import com.example.zhishu.worker.selectFirstChapterToWrite
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertEquals
@@ -120,6 +121,68 @@ class GenerationWorkerLogicTest {
             plan("c5", 5, ChapterStatus.QUEUED),
         )
         assertEquals(listOf(2, 5, 9), selectChaptersToGenerate(plans, false).map { it.order })
+    }
+
+    /**
+     * 一键开讲链尾选章：第一章带问题发布（正文可读、停在待复核）不算没写，
+     * 「继续 / 重试」必须接着写第二章，而不是把第一章整章重写。
+     */
+    @Test
+    fun firstChapter_needsReviewWithBodyIsSkipped() {
+        val plans = listOf(
+            plan("c1", 1, ChapterStatus.NEEDS_REVIEW, activeVersionId = "v-1"),
+            plan("c2", 2, ChapterStatus.QUEUED),
+        )
+        assertEquals("c2", selectFirstChapterToWrite(plans)?.id)
+    }
+
+    /** 待复核但没有任何正文（中断留下的空壳）＝ 没写完，仍会选中它补写 */
+    @Test
+    fun firstChapter_needsReviewWithoutBodyIsStillSelected() {
+        val plans = listOf(
+            plan("c1", 1, ChapterStatus.NEEDS_REVIEW, activeVersionId = null),
+            plan("c2", 2, ChapterStatus.QUEUED),
+        )
+        assertEquals("c1", selectFirstChapterToWrite(plans)?.id)
+    }
+
+    /** 契约停在 PENDING（规划被中断）的章也不能直接写正文——闸门只认 DONE */
+    @Test
+    fun selectChapters_skipsPendingContract() {
+        val plans = listOf(
+            plan("c1", 1, ChapterStatus.QUEUED).copy(contractStatus = "PENDING"),
+            plan("c2", 2, ChapterStatus.QUEUED),
+        )
+        assertEquals(listOf("c2"), selectChaptersToGenerate(plans, false).map { it.id })
+    }
+
+    /**
+     * 阅读入口统一判据：项目页卡片、全书目录、首页「继续阅读」必须同一个口径。
+     * 分歧点正是「待复核但有正文」——目录按旧判据不放行，用户在两个入口
+     * 得到相反的答案；空壳（没有任何正文）则不该有「阅读」入口。
+     */
+    @Test
+    fun openableInReader_unifiesReaderEntries() {
+        // 带问题发布（正文在）：能读
+        assertTrue(plan("c1", 1, ChapterStatus.NEEDS_REVIEW, activeVersionId = "v-1").openableInReader)
+        // 待复核空壳（版本作废，没有任何正文）：不能当「阅读」入口
+        assertFalse(plan("c2", 2, ChapterStatus.NEEDS_REVIEW, activeVersionId = null).openableInReader)
+        // 已发布：能读
+        assertTrue(plan("c3", 3, ChapterStatus.PUBLISHED, activeVersionId = "v-3").openableInReader)
+        // 旧库 QUIZ_FAILED：正文是通过核验的，能读
+        assertTrue(plan("c4", 4, ChapterStatus.QUIZ_FAILED, activeVersionId = "v-4").openableInReader)
+        // 失败且无正文：不能读
+        assertFalse(plan("c5", 5, ChapterStatus.FAILED, activeVersionId = null).openableInReader)
+    }
+
+    /** 全部写完时返回 null：链照常走到收尾通知，不算失败 */
+    @Test
+    fun firstChapter_allReadableReturnsNull() {
+        val plans = listOf(
+            plan("c1", 1, ChapterStatus.PUBLISHED, activeVersionId = "v-1"),
+            plan("c2", 2, ChapterStatus.QUIZ_FAILED, activeVersionId = "v-2"),
+        )
+        assertEquals(null, selectFirstChapterToWrite(plans))
     }
 
     /** 协程取消绝不能被当成可重试的业务失败（B4） */

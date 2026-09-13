@@ -187,6 +187,23 @@ data class ChapterPlan(
 ) {
     /** 正文是否已可阅读。测验状态一概不参与判断。 */
     val isReadable: Boolean get() = status.isReadable
+
+    /**
+     * 这一章现在能不能在阅读器里打开读。
+     *
+     * 比 [isReadable] 宽一档：带问题发布的章（NEEDS_REVIEW）正文就在
+     * [activeVersionId] 指着的版本里，项目页、全书目录、首页「继续阅读」
+     * 必须用同一个口径——目录不放行、项目页放行，用户会在两个入口
+     * 得到相反的答案（实测：目录里连正在读的章都点不了）。
+     * 空壳除外：activeVersionId 为 null 说明没有任何可读正文
+     * （版本作废的残留），这种章的主按钮不该是「阅读」。
+     */
+    val openableInReader: Boolean
+        get() = status.isReadable ||
+            (
+                (status == ChapterStatus.NEEDS_REVIEW || status == ChapterStatus.DRAFT) &&
+                    activeVersionId != null
+                )
 }
 
 @Serializable

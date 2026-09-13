@@ -211,12 +211,10 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
                     lastReadAt = progress?.updatedAt ?: 0L,
                     readingChapterId = progress?.chapterId?.takeIf { id ->
                         // 与项目页章节卡 canRead 同口径：待复核但有正文的章也能读
-                        plans.any {
-                            it.id == id && (it.isReadable || it.status == ChapterStatus.NEEDS_REVIEW)
-                        }
+                        plans.any { it.id == id && it.openableInReader }
                     },
                     firstReadableChapterId = plans
-                        .firstOrNull { it.isReadable || it.status == ChapterStatus.NEEDS_REVIEW }
+                        .firstOrNull { it.openableInReader }
                         ?.id,
                 )
                 nodeCounts[project.id] = container.knowledgeRepository.getByProject(project.id).size
@@ -540,10 +538,32 @@ class ProjectDetailViewModel(
      *
      * 只有「我看过了，不改」这一个选项，没有「标记为已修」——那得由
      * 「重写 → 重新核验 → 问题没再出现」推出来（见 IssueResolution）。
+     *
+     * 本章的问题全部处理完（都点了「不用改」，或此前已重写修掉）时，
+     * 顺手把章节从「待复核」翻回「已发布」：否则红色「待复核」提示永远挂着，
+     * 一直诱导用户去点「全部重写」整章重花一遍额度。
      */
     fun acceptIssue(issueId: String) {
         viewModelScope.launch {
+            // accept 之前先记下这条问题属于哪一章（accept 后 active 列表里它就不是 OPEN 了）
+            val chapterId = issues.value.values.flatten()
+                .firstOrNull { it.id == issueId }?.chapterId
             container.issueRepository.accept(issueId)
+            if (chapterId != null &&
+                container.issueRepository.countActiveOpen(chapterId) == 0
+            ) {
+                val flipped = container.chapterRepository.updateStatusIfIn(
+                    id = chapterId,
+                    status = ChapterStatus.PUBLISHED,
+                    note = "核验问题已逐条确认，均不需要修改。",
+                    // 只收拾还停在待复核的章：并发中的生成结果别踩
+                    onlyIf = listOf(ChapterStatus.NEEDS_REVIEW),
+                )
+                if (flipped) {
+                    _message.value = "问题都确认过了，这一章复核完成。"
+                    return@launch
+                }
+            }
             _message.value = "已标记为「不需要修改」，正文没有改动。"
         }
     }
@@ -615,9 +635,10 @@ class ProjectDetailViewModel(
     private suspend fun buildFailedRegenerationNotes(
         plans: List<ChapterPlan>,
     ): Map<String, String> {
-        // 只对「有可读正文」的章节报。没有可读正文时问题已经写在章节的核验说明里了，
-        // 再报一遍等于同一件事说两次
-        val readable = plans.filter { it.isReadable && it.activeVersionId != null }
+        // 只对「有正文」的章节报：判据看 activeVersionId 而不是 isReadable——
+        // 待复核的章正文也在，重生成失败同样该有「正文仍是此前那一版」的兜底说明。
+        // 没有正文时问题已经写在章节的核验说明里了，再报一遍等于同一件事说两次
+        val readable = plans.filter { it.activeVersionId != null }
         if (readable.isEmpty()) return emptyMap()
         val versions = container.chapterRepository.getVersionsByProject(projectId)
         return readable.mapNotNull { plan ->
@@ -934,25 +955,38 @@ class ProjectDetailViewModel(
      * 总开关开启时链尾挂 ADVANCE，一路自动写到主线讲完（可随时取消）。
      */
     fun enqueueOneTap() {
-        val auto = container.learningPrefs.generationAutoAdvance.value
-        launchEnqueue(
-            if (auto) {
-                "已开始：会自动写到主线讲完——逐章生成、自动续卷、自动补漏知识点，可随时取消"
-            } else {
-                "已开始，将依次完成知识梳理、路线规划和第一章"
-            },
-        ) {
+        viewModelScope.launch {
+            val auto = container.learningPrefs.generationAutoAdvance.value
             // needsMap 不只看节点是否为空：分步生成可能停在「骨架完成、链未展开」，
             // 那些占位节点没有内容，讲述路线等不了——批次没完成就得把地图跑完
             val mapIncomplete = container.knowledgeRepository.getLatestBatch(projectId)
                 ?.let { !it.completed } == true
-            GenerationEnqueuer.oneTap(
-                context = getApplication(),
-                projectId = projectId,
-                needsMap = mapIncomplete || container.knowledgeRepository.getByProject(projectId).isEmpty(),
-                needsBible = container.chapterRepository.getPlans(projectId).isEmpty(),
-                autoAdvance = auto,
-            )
+            val needsMap = mapIncomplete || container.knowledgeRepository.getByProject(projectId).isEmpty()
+            val plans = container.chapterRepository.getPlans(projectId)
+            val needsBible = plans.isEmpty()
+            // 提示语按这条链**实际**会跑的步骤拼：失败横幅的重试、批量失败后的续写
+            // 多半两步都不需要，照抄「依次完成知识梳理、路线规划」会让用户白等两个大阶段
+            val steps = buildList {
+                if (needsMap) add("知识梳理")
+                if (needsBible) add("路线规划")
+                add("从未写完的章节继续")
+            }
+            launchEnqueue(
+                if (auto) {
+                    "已开始：会自动写到主线讲完——逐章生成、自动续卷、自动补漏知识点，可随时取消"
+                } else {
+                    "已开始：${steps.joinToString("、")}（需要网络）"
+                },
+            ) {
+                GenerationEnqueuer.oneTap(
+                    context = getApplication(),
+                    projectId = projectId,
+                    needsMap = needsMap,
+                    needsBible = needsBible,
+                    autoAdvance = auto,
+                    plans = plans,
+                )
+            }
         }
     }
 
@@ -1014,8 +1048,9 @@ class ProjectDetailViewModel(
                 _message.value = "已改为「$genre」。到「讲述路线」页点「重新规划」后生效"
                 return@launch
             }
-            val hasReadable = container.chapterRepository.getPlans(projectId).any { it.isReadable }
-            if (hasReadable) {
+            // 判据看「有已发布版本」而不是 isReadable：整本书都待复核时正文也是可读的
+            val hasPublishedBody = container.chapterRepository.getPlans(projectId).any { it.activeVersionId != null }
+            if (hasPublishedBody) {
                 _message.value = "已改为「$genre」。这本书已有正文，新讲法从「继续下一卷」开始生效"
                 return@launch
             }

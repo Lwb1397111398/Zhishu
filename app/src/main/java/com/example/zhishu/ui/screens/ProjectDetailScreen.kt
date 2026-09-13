@@ -1373,10 +1373,14 @@ private fun OutlineTab(
 ) {
     var editPlan by remember { mutableStateOf<ChapterPlan?>(null) }
     var showGenre by remember { mutableStateOf(false) }
-    // 重新规划讲述路线（换讲法/换知识主干后需要）。已有可读正文时不允许整本重规划（3C 底线）
-    val hasReadable = plans.any { it.isReadable }
+    // 重新规划讲述路线（换讲法/换知识主干后需要）。已有写好的正文时不允许整本重规划（3C 底线）。
+    // 判据看「有已发布版本」而不是 isReadable：整本书都待复核时正文也是可读的，
+    // 按 isReadable 判空会让重规划把全书正文清掉
+    val hasPublishedBody = plans.any { it.activeVersionId != null }
     var showReplanConfirm by remember { mutableStateOf(false) }
     var showReplanDenied by remember { mutableStateOf(false) }
+    // 「全部重写」要二次确认：它不是重新检查，是把这几章正文整章推倒重来（费钱且替换现有版本）
+    var showRetryAllConfirm by remember { mutableStateOf(false) }
     // 正在查看问题清单的章节（4B）
     var issuePlan by remember { mutableStateOf<ChapterPlan?>(null) }
     // 重新生成失败的说明按章节取，绑在新版本上而不是覆盖当前正文的核验说明（3A）
@@ -1449,13 +1453,15 @@ private fun OutlineTab(
                             .padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        // needsAttention 只数待复核章（正文可读、等逐条确认），
+                        // 缺自测题的章不在此列，也别提「补测验」误导用户点整章重写
                         Text(
-                            "有 $needsAttention 章需要复核或补测验",
+                            "有 $needsAttention 章待复核（正文可读，进章节逐条处理）",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onErrorContainer,
                             modifier = Modifier.weight(1f),
                         )
-                        TextButton(onClick = { vm.retryNeedsReview() }) { Text("全部重试") }
+                        TextButton(onClick = { showRetryAllConfirm = true }) { Text("全部重写") }
                     }
                 }
             }
@@ -1487,7 +1493,7 @@ private fun OutlineTab(
                             project = project,
                             chapterCount = plans.size,
                             onChangeGenre = { showGenre = true },
-                            onReplan = { if (hasReadable) showReplanDenied = true else showReplanConfirm = true },
+                            onReplan = { if (hasPublishedBody) showReplanDenied = true else showReplanConfirm = true },
                         )
                         Spacer(Modifier.height(8.dp))
                     }
@@ -1536,7 +1542,7 @@ private fun OutlineTab(
     if (showGenre) {
         GenrePickerDialog(
             current = project?.genre.orEmpty(),
-            canReplan = !hasReadable,
+            canReplan = !hasPublishedBody,
             onPick = { genre, replan ->
                 vm.setGenre(genre, replan)
                 showGenre = false
@@ -1553,6 +1559,18 @@ private fun OutlineTab(
             confirmLabel = "重新规划",
             onConfirm = { vm.enqueueStoryBible() },
             onDismiss = { showReplanConfirm = false },
+        )
+    }
+
+    if (showRetryAllConfirm) {
+        ConfirmDialog(
+            title = "全部重写这 $needsAttention 章？",
+            message = "「全部重写」不是重新检查：这 $needsAttention 章的正文会整章重新生成" +
+                "（每章约 3 次模型调用），现有正文会被新版本替换，你已做过的复核决定随之作废。\n\n" +
+                "只想处理核验发现的问题，请进对应章节，逐条选择「修改」或「不用改」，不花正文的额度。",
+            confirmLabel = "全部重写",
+            onConfirm = { vm.retryNeedsReview() },
+            onDismiss = { showRetryAllConfirm = false },
         )
     }
 
@@ -1851,22 +1869,24 @@ private fun ChapterPlanCard(
     /** 核验正在补 */
     reverifying: Boolean = false,
 ) {
-    // 可读性只看正文状态。QUIZ_FAILED 是旧库里的值，正文其实是通过核验的
-    val canRead = plan.isReadable ||
-        plan.status == ChapterStatus.NEEDS_REVIEW ||
-        plan.status == ChapterStatus.DRAFT
+    // 可读性只看正文状态。QUIZ_FAILED 是旧库里的值，正文其实是通过核验的。
+    // openableInReader 与全书目录、首页「继续阅读」同一口径，且空壳章（没有任何正文）
+    // 不再显示「阅读」——那会点开一个空白页，真正的入口是「重新生成」
+    val canRead = plan.openableInReader
     val canQuiz = plan.isReadable && plan.quizState == QuizState.READY
     // 补题不该走「重新生成章节」，那会连正文一起重写
     val quizMissing = plan.isReadable && plan.quizState == QuizState.FAILED
     val needsRetry = plan.status == ChapterStatus.NEEDS_REVIEW ||
         plan.status == ChapterStatus.FAILED
     /**
-     * 契约没生成：这一章还不能写正文。
+     * 契约没就绪：这一章还不能写正文。
      *
      * 三段式之后契约是逐章生成的，一章失败只影响一章。这里必须如实标出来，
      * 否则用户点「生成」会撞上一句看不懂的报错，而且不知道有单独重试这条路。
+     * PENDING（规划中途被中断）同样拦：契约是半成品，硬写正文只会
+     * 与讲述路线脱节——入口统一走「补契约」。
      */
-    val contractFailed = plan.contractStatus == ContractStatus.FAILED.name
+    val contractNotReady = plan.contractStatus != ContractStatus.DONE.name
     // 还没处理的问题。已接受和已修的不再计数——那两种都已经有结论了（4B）
     val openIssues = issues.filter { it.resolution.isOpen }
     Card(modifier = Modifier.padding(vertical = 6.dp)) {
@@ -1935,7 +1955,7 @@ private fun ChapterPlanCard(
             // 契约没生成就说清楚：这一章暂时写不了正文，而且可以只补这一章。
             // 不标出来的话，用户只会看到「生成」按钮点了报错，
             // 却不知道整卷其他章都好着呢、也不用重新规划整卷
-            if (contractFailed) {
+            if (contractNotReady) {
                 Spacer(Modifier.height(6.dp))
                 Surface(
                     color = MaterialTheme.colorScheme.tertiaryContainer,
@@ -1943,8 +1963,13 @@ private fun ChapterPlanCard(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
-                        "这一章的因果契约没生成成功，暂时不能写正文。" +
-                            "可以只补这一章，不影响其他章节。",
+                        if (plan.contractStatus == ContractStatus.FAILED.name) {
+                            "这一章的因果契约没生成成功，暂时不能写正文。" +
+                                "可以只补这一章，不影响其他章节。"
+                        } else {
+                            "这一章的因果契约还没生成完（上次规划被中断），暂时不能写正文。" +
+                                "点「补契约」只补这一章，不影响其他章节。"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onTertiaryContainer,
                         modifier = Modifier.padding(8.dp),
@@ -2007,8 +2032,8 @@ private fun ChapterPlanCard(
             // 按钮收敛：主操作（阅读/生成/补契约按优先级）留在卡面上，
             // 其余动作（编辑/测验/补题/逐条处理/重新生成）收进「更多」菜单——
             // 原先 7 个按钮挤一行是整个讲述路线页最乱的地方，但一个功能都没少
-            val mainIsContract = contractFailed
-            val mainIsRead = !contractFailed && canRead
+            val mainIsContract = contractNotReady
+            val mainIsRead = !contractNotReady && canRead
             var menuExpanded by remember(plan.id) { mutableStateOf(false) }
             Row(
                 Modifier.padding(top = 4.dp),
@@ -2024,9 +2049,9 @@ private fun ChapterPlanCard(
 
                     else -> TextButton(
                         onClick = onGenerate,
-                        // 契约没生成的章禁止写正文——点击后会在 pipeline 里被拦下，
+                        // 契约没就绪的章禁止写正文——点击后会在 pipeline 里被拦下，
                         // 这里直接禁用，省得用户白点一次再读一句报错
-                        enabled = !rewriting && !contractFailed,
+                        enabled = !rewriting && !contractNotReady,
                     ) { Text(if (needsRetry) "重新生成" else "生成") }
                 }
                 Spacer(Modifier.weight(1f))
@@ -2104,7 +2129,7 @@ private fun ChapterPlanCard(
                                 menuExpanded = false
                                 onGenerate()
                             },
-                            enabled = !rewriting && !contractFailed,
+                            enabled = !rewriting && !contractNotReady,
                         )
                     }
                 }

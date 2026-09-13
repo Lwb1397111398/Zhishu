@@ -911,14 +911,18 @@ class PipelineService(
         val nodes = ensureNodeKeys(knowledgeRepository.getByProject(projectId))
         if (nodes.isEmpty()) return Result.failure(IllegalStateException("知识地图为空"))
 
-        // 已经有可读正文时不允许整本重新规划（第三阶段 3C）。
+        // 已经有写好的正文时不允许整本重新规划（第三阶段 3C）。
         //
         // 原来这里直接 clearBlocksForProject + clearPlansForProject，
         // 用户在知识地图页点一下「重新生成」就把读过的章节全删了。
         // 已发布内容不会因为重新规划而丢失——这是第三阶段的底线，
         // 所以这条路直接堵死，改由「继续下一卷」往后接。
+        //
+        // 判据是「存在已发布版本」（activeVersionId 非空），不看 isReadable：
+        // 整本书都停在待复核（NEEDS_REVIEW）时正文本本可读，若按 isReadable
+        // 判空，重规划会把全书正文清掉——那是数据丢失，不是重新规划。
         val existing = chapterRepository.getPlans(projectId)
-        if (existing.any { it.isReadable }) {
+        if (existing.any { it.activeVersionId != null }) {
             return Result.failure(
                 IllegalStateException(
                     "这个项目已经有写好的章节了，不能整本重新规划（那会删掉你读过的内容）。" +
@@ -1401,8 +1405,8 @@ class PipelineService(
         } else {
             Result.failure(
                 IllegalStateException(
-                    "第 ${plan.order} 章的契约这次也没通过，可以再试一次；" +
-                        "一直不通过的话重新规划这一卷会换一批章节安排。",
+                    "第 ${plan.order} 章的契约这次也没通过，可以稍后再点一次「补契约」。" +
+                        "其他章节不受影响，可以先写先读；反复失败时再考虑重新规划讲述路线。",
                 ),
             )
         }
@@ -1795,16 +1799,23 @@ class PipelineService(
     ): Result<Unit> {
         val plan = chapterRepository.getPlan(planId)
             ?: return Result.failure(IllegalStateException("章节不存在"))
-        // 契约没生成的章不能写正文（三段式）。正文按契约的拍子写、核验也按它逐项查，
+        // 契约没就绪的章不能写正文（三段式）。正文按契约的拍子写、核验也按它逐项查，
         // 契约缺失会产出没有因果结构且无法核验的正文。
         //
         // 这里必须拦：selectChaptersToGenerate 只挡住批量生成，用户从章节列表
         // 点「重新生成」走的是这个单章入口，不拦就等于留个绕过口子。
-        if (plan.contractStatus == ContractStatus.FAILED.name) {
+        // 判据是 != DONE 而不是 == FAILED：规划中途被杀会留下 PENDING 契约，
+        // 按 FAILED 拦不住它们，「有正文必有契约」就被打穿了。
+        if (plan.contractStatus != ContractStatus.DONE.name) {
+            val reason = if (plan.contractStatus == ContractStatus.FAILED.name) {
+                "没生成成功"
+            } else {
+                "还没生成完（上次规划被中断）"
+            }
             return Result.failure(
                 IllegalStateException(
-                    "第 ${plan.order} 章的因果契约没生成成功，不能写正文。" +
-                        "请在讲述路线里单独重试这一章的契约。",
+                    "第 ${plan.order} 章的因果契约$reason，不能写正文。" +
+                        "请在讲述路线里点这一章的「补契约」，只补这一章。",
                 ),
             )
         }
@@ -1842,9 +1853,16 @@ class PipelineService(
         /** 新版本是否已经发布并成为 activeVersion */
         var published: Boolean = false
 
-        /** 进来之前就有可读正文（重新生成场景） */
+        /**
+         * 进来之前就有已发布正文（重新生成场景）。
+         *
+         * 判据是 activeVersionId 非空，而不是 originalStatus.isReadable：
+         * NEEDS_REVIEW（带问题发布）的章正文就在 activeVersionId 指着的版本里，
+         * 若按 isReadable 算成「没有正文」，重写失败会被翻成 FAILED、
+         * 取消会翻回 QUEUED，阅读入口随之全部关闭——正文明明还在库里。
+         */
         val hadReadableBody: Boolean
-            get() = originalActiveVersionId != null && originalStatus.isReadable
+            get() = originalActiveVersionId != null
     }
 
     private suspend fun runChapter(
@@ -2920,10 +2938,12 @@ class PipelineService(
         val project = projectRepository.get(projectId) ?: return
         val plans = chapterRepository.getPlans(projectId)
         if (plans.isEmpty()) return
-        // 用 isReadable 而不是 == PUBLISHED：旧库里的 QUIZ_FAILED 正文其实是可读的，
-        // 不该因为缺几道自测题就让整个项目永远显示「生成中」
-        val allPublished = plans.all { it.status.isReadable }
-        val target = if (allPublished) ProjectStatus.READY else ProjectStatus.GENERATING
+        // 「生成中」= 还有章节停在生成流程里（排队/写正文/核验，见 isVolumeBlocking）。
+        // 原判据是「所有章都 isReadable」：只要有一章停在待复核（正文可读、等用户逐条
+        // 确认）或失败（链已断、等用户点重试），项目就永远挂着「正在生成…」，
+        // 哪怕此刻没有任何 Worker 在跑。失败/待复核都不是「在生成」。
+        val generating = plans.any { it.status.isVolumeBlocking }
+        val target = if (generating) ProjectStatus.GENERATING else ProjectStatus.READY
         if (project.status != target) {
             projectRepository.update(project.copy(status = target, updatedAt = clock()))
         }

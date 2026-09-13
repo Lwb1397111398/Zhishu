@@ -81,18 +81,21 @@ enum class GenerationStage {
  * 只是缺几道自测题，重排一次等于白花一遍正文的钱。
  * NEEDS_REVIEW 只在用户显式重试时纳入。
  *
- * **契约没生成的章节一律跳过**（三段式改造）：契约是正文的因果骨架，
+ * **契约没就绪的章节一律跳过**（三段式改造）：契约是正文的因果骨架，
  * 没有契约就写正文等于让模型凭空发挥，写出来的东西既无法核验、
- * 也和「讲述路线」的目标脱节。这类章节在界面上标「契约未生成」，
+ * 也和「讲述路线」的目标脱节。这类章节在界面上标「补契约」，
  * 由用户单独重试契约，而不是在这里被悄悄当成「待写正文」。
  *
+ * 判据是 `== DONE`（只放行契约已就绪的章），而不是旧的 `!= FAILED`：
+ * 规划中途被系统杀死会留下 PENDING（大纲已落库、契约循环没跑完）的章，
+ * 按旧判据它们会被当成待写正文直接开写——绕过了「有正文必有契约」的底线。
  * 默认 `contractStatus = DONE`：老数据已有契约（或明确无契约），不会被误跳过。
  */
 internal fun selectChaptersToGenerate(
     plans: List<ChapterPlan>,
     includeNeedsReview: Boolean,
 ): List<ChapterPlan> = plans
-    .filter { plan -> plan.contractStatus != ContractStatus.FAILED.name }
+    .filter { plan -> plan.contractStatus == ContractStatus.DONE.name }
     .filter { plan ->
         when {
             plan.status.isReadable -> false
@@ -105,6 +108,16 @@ internal fun selectChaptersToGenerate(
         }
     }
     .sortedBy { it.order }
+
+/**
+ * 一键开讲链尾（FIRST_CHAPTER）运行时选章：取「第一个需要写的章节」。
+ *
+ * 必须与批量共用 [selectChaptersToGenerate] 的判据。若只看 `!isReadable`，
+ * 停在待复核的第一章（正文已发布、可读）会被当成没写完——「继续 / 重试」
+ * 每次都从第一章整章重来，写多少遍都跳不过去。
+ */
+internal fun selectFirstChapterToWrite(plans: List<ChapterPlan>): ChapterPlan? =
+    selectChaptersToGenerate(plans, includeNeedsReview = false).firstOrNull()
 
 /**
  * 该异常是否值得让 WorkManager 重试（B4）。

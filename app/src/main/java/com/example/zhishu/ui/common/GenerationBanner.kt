@@ -23,6 +23,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -45,12 +48,18 @@ fun GenerationBanner(
     onCancel: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
-    AnimatedVisibility(visible = state.busy || state.hasError) {
-        if (state.hasError) {
+    // 错误横幅可手动收起（会话级）：记住已读的那条错误，同一条不再弹出；
+    // 新原因的错误来了重新显示。没有这个出口，用户不想立刻重试时就只能
+    // 让横幅一直挂着，或靠一次付费运行把它冲掉。
+    var dismissedError by remember { mutableStateOf<String?>(null) }
+    val showError = state.hasError && dismissedError != state.error
+    AnimatedVisibility(visible = state.busy || showError) {
+        if (state.hasError && showError) {
             ErrorBanner(
                 message = state.error.orEmpty(),
                 onRetry = onRetry,
                 onOpenSettings = onOpenSettings,
+                onDismiss = { dismissedError = state.error },
                 modifier = modifier,
             )
         } else {
@@ -145,6 +154,7 @@ private fun ErrorBanner(
     message: String,
     onRetry: (() -> Unit)?,
     onOpenSettings: (() -> Unit)?,
+    onDismiss: () -> Unit,
     modifier: Modifier,
 ) {
     // 缺配置是最高频的失败原因，命中时把"去配置"按钮顶到前面。
@@ -185,8 +195,11 @@ private fun ErrorBanner(
                     }
                 }
                 if (onRetry != null) {
-                    TextButton(onClick = onRetry) { Text("重试") }
+                    // 不叫「重试」：它从第一个没完成的步骤接着跑（可能是重跑失败那步，
+                    // 也可能是跳过它继续往下写），按实际行为称呼
+                    TextButton(onClick = onRetry) { Text("继续生成") }
                 }
+                TextButton(onClick = onDismiss) { Text("知道了") }
             }
         }
     }

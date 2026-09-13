@@ -609,7 +609,8 @@ internal fun BookTocSheet(
             Text("全书目录", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(4.dp))
             Text(
-                "共 ${plans.count { it.isReadable }} 章已写好 / 全书 ${plans.size} 章",
+                // 与章节卡、首页「继续阅读」同口径：待复核但有正文的章也算「已写好」
+                "共 ${plans.count { it.openableInReader }} 章已写好 / 全书 ${plans.size} 章",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -626,7 +627,9 @@ internal fun BookTocSheet(
                         )
                     }
                     items(chapters, key = { it.id }) { plan ->
-                        val readable = plan.isReadable
+                        // 与章节卡 canRead 同口径：待复核但有正文的章目录里也能点。
+                        // 原来这里只认 isReadable，待复核章在项目页能读、目录里却是灰的
+                        val readable = plan.openableInReader
                         val isCurrent = plan.id == currentChapterId
                         Row(
                             Modifier

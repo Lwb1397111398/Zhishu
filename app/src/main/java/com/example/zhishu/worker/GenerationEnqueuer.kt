@@ -15,6 +15,7 @@ import androidx.work.workDataOf
 import com.example.zhishu.ai.pipeline.ChapterPhase
 import com.example.zhishu.ai.pipeline.KnowledgeMapMode
 import com.example.zhishu.domain.model.ChapterPlan
+import com.example.zhishu.domain.model.ContractStatus
 import com.google.common.util.concurrent.ListenableFuture
 import java.util.UUID
 import java.util.concurrent.ExecutionException
@@ -152,6 +153,11 @@ object GenerationEnqueuer {
      *
      * 首章用 FIRST_CHAPTER（运行时现查），因为入队这一刻讲述路线还没生成，
      * 章节 ID 根本还不存在。
+     *
+     * [plans] 是调用方已查好的章节列表（通常就是刚才判 needsBible 用的那份），
+     * 用于入队前预检：不需要梳理/规划、又没有任何可生成的章节时，直接给用户
+     * 一句准话，而不是排一条静默结束的链——那会让「重试」看起来跑完了，
+     * 实际什么都没做，还发一条「已完成 0 章」的假成功通知。
      */
     suspend fun oneTap(
         context: Context,
@@ -160,7 +166,21 @@ object GenerationEnqueuer {
         needsBible: Boolean,
         /** 自动闭环：为 true 时链尾挂一个 ADVANCE，一路写到主线讲完（总开关开启才传 true） */
         autoAdvance: Boolean = false,
+        plans: List<ChapterPlan>? = null,
     ): EnqueueResult {
+        if (!needsMap && !needsBible && plans != null &&
+            selectFirstChapterToWrite(plans) == null
+        ) {
+            val contractFailed = plans.count { it.contractStatus == ContractStatus.FAILED.name }
+            return EnqueueResult.Nothing(
+                if (contractFailed > 0) {
+                    "没有需要生成的章节。有 $contractFailed 章的因果契约没生成成功，" +
+                        "先在讲述路线页点它们的「补契约」，之后就能继续写了。"
+                } else {
+                    "没有需要生成的章节，所有章节都已完成"
+                },
+            )
+        }
         val total = (if (needsMap) UNITS_SIMPLE_STAGE else 0) +
             (if (needsBible) UNITS_SIMPLE_STAGE else 0) +
             ChapterPhase.UNITS_PER_CHAPTER
@@ -180,7 +200,8 @@ object GenerationEnqueuer {
                     chapterRequest(
                         projectId = projectId,
                         chapterId = null,
-                        label = "第一章",
+                        // 写到哪一章只有运行时知道，由 Worker 按实际章号标「第 N 章」
+                        label = "",
                         session = session,
                         unitsBefore = before,
                         unitsTotal = total,
