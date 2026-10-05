@@ -60,3 +60,7 @@ samples/probes/
 # e2e mock 服务器的运行时产物（请求转储与日志），不入库
 _claude_e2e/req/
 _claude_e2e/server.log
+
+# 旧机器（前使用者）路径残留：内容含他人本机绝对路径，被隐私扫描拦截，不入库
+_claude_e2e/run_e2e.sh
+docs/superpowers/plans/2026-09-09-自动化闭环.md

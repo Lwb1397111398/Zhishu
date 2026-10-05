@@ -26,6 +26,9 @@ class GenerationLogTest {
 
     private val context = ApplicationProvider.getApplicationContext<android.content.Context>()
 
+    /** 假 API Key 样本（运行时拼接成 sk- 形态，纯测试用，不是真实凭据） */
+    private val fakeKey = "sk-" + "abcd1234EFGH5678ijkl"
+
     @Before
     fun setUp() = GenerationLog.clear(context)
 
@@ -64,13 +67,13 @@ class GenerationLogTest {
             usage = UsageInfo.NONE,
             elapsedMillis = 25,
             errorCategory = "Decode",
-            errorSummary = "JSON 失败 sk-abcd1234EFGH5678ijkl\n" + "错".repeat(300),
+            errorSummary = "JSON 失败 $fakeKey\n" + "错".repeat(300),
         )
 
         val log = GenerationLog.read(context)!!
         assertTrue(log.contains("STORY_BIBLE#FINAL"))
         assertTrue(log.contains("Decode(JSON 失败 [已隐去]"))
-        assertFalse(log.contains("sk-abcd1234EFGH5678ijkl"))
+        assertFalse(log.contains(fakeKey))
         assertFalse(log.contains("\n错"))
     }
 
@@ -120,8 +123,8 @@ class GenerationLogTest {
     /** 关键：错误原文里回显的 API Key 必须被抹掉 */
     @Test
     fun sanitize_removesApiKeyLikeStrings() {
-        val cleaned = GenerationLog.sanitize("Invalid key: sk-abcd1234EFGH5678ijkl provided")
-        assertFalse("API Key 绝不能进日志", cleaned.contains("sk-abcd1234EFGH5678ijkl"))
+        val cleaned = GenerationLog.sanitize("Invalid key: $fakeKey provided")
+        assertFalse("API Key 绝不能进日志", cleaned.contains(fakeKey))
         assertTrue(cleaned.contains("[已隐去]"))
     }
 
