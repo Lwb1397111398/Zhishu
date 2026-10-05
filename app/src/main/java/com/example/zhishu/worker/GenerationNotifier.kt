@@ -40,6 +40,15 @@ internal object GenerationNotifier {
     /** 前台通知固定用这个 ID，多章串行时复用同一条，不会堆一屏 */
     private const val NOTIFICATION_ID_PROGRESS = 4101
 
+    /**
+     * 保活服务（[GenerationKeeperService]）的前台通知 ID。
+     *
+     * 与进度通知分开：两者可能同时存在（Worker 前台化成功 + 保活服务还在），
+     * 共用 ID 会互相覆盖——Worker 结束时 WorkManager 撤通知会把保活服务的
+     * 通知一起撤掉，前台服务却没有通知可显示。
+     */
+    const val NOTIFICATION_ID_KEEPER = 4102
+
     /** 结果通知按项目分配 ID，不同项目的结果不互相覆盖 */
     private const val NOTIFICATION_ID_RESULT_BASE = 4200
 
@@ -76,6 +85,21 @@ internal object GenerationNotifier {
         total: Int,
     ): ForegroundInfo {
         ensureChannels(context)
+        return foregroundInfo(
+            NOTIFICATION_ID_PROGRESS,
+            progressBuilder(context, projectId, projectTitle, stageText, completed, total).build(),
+        )
+    }
+
+    /** 进度通知与保活通知共用的骨架：同样的渠道、同样的取消按钮、同样的进度条 */
+    private fun progressBuilder(
+        context: Context,
+        projectId: String,
+        projectTitle: String,
+        stageText: String,
+        completed: Int,
+        total: Int,
+    ): NotificationCompat.Builder {
         val builder = NotificationCompat.Builder(context, CHANNEL_PROGRESS)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle(projectTitle.ifBlank { "正在生成" })
@@ -93,7 +117,53 @@ internal object GenerationNotifier {
         } else {
             builder.setProgress(0, 0, true)
         }
-        return foregroundInfo(NOTIFICATION_ID_PROGRESS, builder.build())
+        return builder
+    }
+
+    /**
+     * 保活服务的常驻通知（入队即挂，整条会话期间存在）。
+     *
+     * [stageText] 为空（还没有 Worker 上报进度）时给一句泛化文案。
+     */
+    fun keeperNotification(
+        context: Context,
+        projectId: String,
+        stageText: String?,
+        completed: Int,
+        total: Int,
+    ): Notification {
+        ensureChannels(context)
+        return progressBuilder(
+            context = context,
+            projectId = projectId,
+            projectTitle = "正在生成",
+            stageText = stageText.orEmpty(),
+            completed = completed,
+            total = total,
+        ).build()
+    }
+
+    /**
+     * 刷新保活通知的内容（服务存活期间 Worker 每到阶段边界上报一次）。
+     * 只是内容刷新，不改变通知的前台身份；通知权限被拒时安静跳过。
+     */
+    // 权限在下面第一行就用 canPostNotifications 检查过了；lint 不做跨函数分析所以看不见。
+    // 即便如此 notify 仍然包在 runCatching 里，被系统拒掉也不会把生成拖崩。
+    @SuppressLint("MissingPermission")
+    fun notifyKeeper(
+        context: Context,
+        projectId: String,
+        stageText: String?,
+        completed: Int,
+        total: Int,
+    ) {
+        if (!canPostNotifications(context)) return
+        runCatching {
+            NotificationManagerCompat.from(context).notify(
+                NOTIFICATION_ID_KEEPER,
+                keeperNotification(context, projectId, stageText, completed, total),
+            )
+        }
     }
 
     /** targetSdk 35 上前台服务必须声明类型，dataSync 对应「代替用户完成一段网络工作」 */

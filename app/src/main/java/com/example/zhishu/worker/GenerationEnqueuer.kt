@@ -303,6 +303,11 @@ object GenerationEnqueuer {
         )
         requests.drop(1).forEach { continuation = continuation.then(it) }
         continuation.enqueue().result.await()
+        // 入队成功立刻建保活前台服务。必须趁用户还在前台（点按钮的那一刻）做：
+        // Android 12+ 后台启动不了前台服务，错过这个时机，链上后续 Worker 在后台
+        // 就只能裸奔（10 分钟窗口 + 进程冻结风险），表现就是「调入后台没工作」。
+        // 启动失败不阻断生成，按失败留痕后走 Worker 自己 setForeground 的原路。
+        GenerationKeeperService.start(context, projectId)
         return EnqueueResult.Started(modelStages)
     }
 

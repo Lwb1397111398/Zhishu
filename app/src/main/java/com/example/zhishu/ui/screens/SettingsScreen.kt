@@ -80,7 +80,7 @@ import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(onOpenReview: () -> Unit = {}) {
+fun SettingsScreen(onOpenReview: () -> Unit = {}, updateVm: UpdateViewModel? = null) {
     val app = LocalContext.current.applicationContext as Application
     val vm: SettingsViewModel = rememberZhishuViewModel(key = "settings") { SettingsViewModel(app) }
     val profiles by vm.profiles.collectAsStateWithLifecycle()
@@ -91,6 +91,7 @@ fun SettingsScreen(onOpenReview: () -> Unit = {}) {
     val modelLists by vm.modelLists.collectAsStateWithLifecycle()
     val spacedReview by vm.spacedReviewEnabled.collectAsStateWithLifecycle()
     val autoAdvance by vm.generationAutoAdvance.collectAsStateWithLifecycle()
+    val autoHandleIssues by vm.autoHandleIssues.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val container = (app as ZhishuApp).container
@@ -109,6 +110,10 @@ fun SettingsScreen(onOpenReview: () -> Unit = {}) {
                 vm.setBusy(true)
                 val result = withContext(Dispatchers.IO) { container.transfer.export(app, uri) }
                 vm.setBusy(false)
+                // 导出成功即记下时间：书架的「该备份了」提醒据此归零（3.3）
+                result.onSuccess {
+                    container.learningPrefs.setLastBackupAt(System.currentTimeMillis())
+                }
                 snackbarHostState.showSnackbar(result.getOrElse { "导出失败：${it.message}" })
             }
         }
@@ -153,6 +158,7 @@ fun SettingsScreen(onOpenReview: () -> Unit = {}) {
                     }
                 }
             }
+            updateVm?.let { uvm -> item { AppUpdateSection(uvm) } }
             item { SectionTitle("学习方式") }
             item {
                 Card {
@@ -206,6 +212,35 @@ fun SettingsScreen(onOpenReview: () -> Unit = {}) {
                         Text(
                             "关闭后回到每步手动确认：一次「继续」只推进到下一章，续卷和补漏都要你点。" +
                                 "自动补漏知识点每批最多 10 条，避免一次烧太多额度。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            item {
+                Card {
+                    Column(Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("自动处理核验问题", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "默认开启。核验发现的问题会自动重写涉及的段落（最多两轮，会多花少量额度），" +
+                                        "修不掉的「文风类」问题自动标记不用改；事实类问题（资料不支持、矛盾、编造……）" +
+                                        "一定保留给你看，不会替你做主。",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Switch(
+                                checked = autoHandleIssues,
+                                onCheckedChange = { vm.setAutoHandleIssues(it) },
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "关闭后回到手动确认：自动重写只试一轮，剩下的每一条都等你决定。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -1083,4 +1118,47 @@ private fun ProfilePickerDialog(
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
+}
+
+/**
+ * 应用自更新（设置页「关于知述」下方）：当前版本 + 检查更新按钮 + 自动检查开关。
+ * 状态与弹窗都由顶层的 [UpdateViewModel] 持有：发现新版本时弹窗在任何页面都能弹。
+ */
+@Composable
+private fun AppUpdateSection(vm: UpdateViewModel) {
+    Card {
+        Column(Modifier.padding(14.dp)) {
+            Text("当前版本 v${vm.currentVersion}", style = MaterialTheme.typography.titleSmall)
+            Text(
+                "检查更新会联网查询 GitHub 上的最新发布，有新版本时弹出下载与安装。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Button(
+                    onClick = { vm.checkNow() },
+                    enabled = !vm.checking && !vm.downloading,
+                ) {
+                    if (vm.checking) {
+                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(6.dp))
+                    }
+                    Text(if (vm.checking) "正在检查…" else "检查更新")
+                }
+                Spacer(Modifier.width(16.dp))
+                Text("启动时自动检查", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.width(4.dp))
+                Switch(checked = vm.autoCheck, onCheckedChange = { vm.changeAutoCheck(it) })
+            }
+            vm.status?.let { status ->
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    status,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (vm.statusError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
 }

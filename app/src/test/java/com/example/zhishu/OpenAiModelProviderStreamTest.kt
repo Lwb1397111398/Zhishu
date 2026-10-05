@@ -38,7 +38,10 @@ class OpenAiModelProviderStreamTest {
         server.shutdown()
     }
 
-    private fun provider(firstTokenTimeoutMillis: Long = 90_000): OpenAiModelProvider {
+    private fun provider(
+        firstTokenTimeoutMillis: Long = 90_000,
+        bodyStallHardTimeoutMillis: Long = 10 * 60_000,
+    ): OpenAiModelProvider {
         val profile = ApiProfile(
             name = "test",
             baseUrl = server.url("/v1").toString().trimEnd('/'),
@@ -51,6 +54,7 @@ class OpenAiModelProviderStreamTest {
             apiKey = "test-key",
             requireHttps = false,
             firstTokenTimeoutMillis = firstTokenTimeoutMillis,
+            bodyStallHardTimeoutMillis = bodyStallHardTimeoutMillis,
         )
     }
 
@@ -120,5 +124,85 @@ class OpenAiModelProviderStreamTest {
         // 两次 HTTP：流式 + 非流式，不多不少
         server.takeRequest(2, TimeUnit.SECONDS)
         server.takeRequest(2, TimeUnit.SECONDS)
+    }
+
+    /**
+     * 心跳保活绕过首字超时（2026-09 用户实测「正在写正文」无限卡死的根因）：
+     * 中转站排队时按固定间隔吐 SSE 注释行（`: keep-alive`）——字节一直在来，
+     * OkHttp readTimeout 永不触发；但没有一条是正文。必须在「正文硬超时」
+     * （距上一条正文数据的时长，注释行不算）按期放弃，并降级非流式重发成功。
+     *
+     * 节流节奏 120 字节/100ms ≈ 一行心跳每 100ms：比首字超时（5 秒）密得多，
+     * readTimeout 不会触发；比正文硬超时（500ms）密，注释行持续流入——
+     * 唯一能让这条流退场的就是正文硬超时本身。
+     */
+    @Test
+    fun heartbeatOnlyStream_bodyStallHardTimeout_fallsBackToNonStream(): Unit = runBlocking {
+        // 第一次（流式）：200 后持续吐注释行心跳、永远不吐正文
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody(": keep-alive\n".repeat(60))
+                .throttleBody(120, 100, TimeUnit.MILLISECONDS),
+        )
+        // 第二次（降级为非流式）：正常返回
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"choices":[{"message":{"content":"{\"ok\":true}","finish_reason":"stop"}}]}""",
+            ),
+        )
+        val startedAt = System.currentTimeMillis()
+        val result = provider(
+            firstTokenTimeoutMillis = 5_000,
+            bodyStallHardTimeoutMillis = 500,
+        ).complete(request())
+        val elapsed = System.currentTimeMillis() - startedAt
+        assertTrue(
+            "只吐心跳的流式应在正文硬超时后降级非流式并成功，实际：${result.exceptionOrNull()?.message}",
+            result.isSuccess,
+        )
+        assertTrue(
+            "降级应在秒级完成、而不是等心跳把连接拖满（实际 ${elapsed}ms）",
+            elapsed < 5_000,
+        )
+        assertEquals("{\"ok\":true}", result.getOrThrow())
+
+        val first = server.takeRequest(2, TimeUnit.SECONDS)?.body?.readUtf8()
+        val second = server.takeRequest(2, TimeUnit.SECONDS)?.body?.readUtf8()
+        assertTrue("第一次应请求流式", first?.contains("\"stream\":true") == true)
+        assertTrue("降级后第二次应为非流式", second?.contains("\"stream\":false") == true)
+    }
+
+    /**
+     * 正文数据持续在吐的慢流**不能**被正文硬超时误杀：计时随每条正文数据清零，
+     * 只要 delta 一直在来，流就能跑到自然结束。节流 120 字节/100ms，
+     * 整个响应约 2 秒——远超 500ms 的硬超时，但因为每行都是正文，必须成功。
+     */
+    @Test
+    fun slowButFlowingStream_survivesBodyStallHardTimeout(): Unit = runBlocking {
+        val chunks = sequenceOf("Hello", " ", "world").joinToString("") { piece ->
+            "data: {\"choices\":[{\"delta\":{\"content\":\"$piece\"}}]}\n\n"
+        } +
+            // 结束标记要带 finish_reason，否则 readStreamResponse 会按
+            // 「连接断掉且没收到完成标记」判 StreamFallback（那测的就不是本逻辑了）
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+            "data: [DONE]\n\n"
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody(chunks)
+                .throttleBody(120, 100, TimeUnit.MILLISECONDS),
+        )
+        val result = provider(
+            firstTokenTimeoutMillis = 5_000,
+            bodyStallHardTimeoutMillis = 500,
+        ).complete(request())
+        assertTrue(
+            "正文持续在吐的慢流不应被硬超时误杀，实际：${result.exceptionOrNull()?.message}",
+            result.isSuccess,
+        )
+        assertEquals("Hello world", result.getOrThrow())
     }
 }

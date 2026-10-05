@@ -11,6 +11,18 @@ ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
 }
 
+// 版本号跟 git 提交数走：每推送一次自动 +1，手机端据此判断有没有新版本（应用自更新）
+val commitCount: Int = runCatching {
+    providers.exec {
+        workingDir(rootDir)
+        commandLine("git", "rev-list", "--count", "HEAD")
+    }.standardOutput.asText.get().trim().toInt()
+}.getOrDefault(1)
+
+// 签名固定用仓库内这把钥匙（本机调试钥匙的副本）：手机上已装的包与云端构建的包
+// 签名一致，覆盖安装不需要卸载（个人应用，风险可控）
+val appKeystore = rootProject.file("keystore/app.keystore")
+
 android {
     namespace = "com.example.zhishu"
     compileSdk = 35
@@ -19,15 +31,31 @@ android {
         applicationId = "com.example.zhishu"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = commitCount
+        versionName = "0.1.$commitCount"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        if (appKeystore.exists()) {
+            create("app") {
+                storeFile = appKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.findByName("app")
+        }
+        debug {
+            // debug 也锁同一把钥匙：换电脑/CI 构建的调试包签名不变，仍可互相覆盖安装
+            signingConfig = signingConfigs.findByName("app")
         }
     }
 
@@ -42,6 +70,8 @@ android {
 
     buildFeatures {
         compose = true
+        // 应用自更新：设置页读 BuildConfig.VERSION_CODE/NAME 做版本比较
+        buildConfig = true
     }
 
     packaging {

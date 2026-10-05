@@ -5,6 +5,10 @@ import com.example.zhishu.domain.model.SourceDocument
 import com.example.zhishu.domain.model.SourceKind
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.Charset
+import java.nio.charset.CodingErrorAction
 import java.util.UUID
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -98,7 +102,7 @@ class ParserServiceImpl(
             }
 
             else -> {
-                val text = String(input.bytes, Charsets.UTF_8)
+                val text = decodeText(input.bytes)
                 SourceDocument(
                     id = UUID.randomUUID().toString(),
                     projectId = projectId,
@@ -110,6 +114,24 @@ class ParserServiceImpl(
                     parseStatus = if (text.isBlank()) ParseStatus.FAILED else ParseStatus.PARSED,
                 ) to onePage(text)
             }
+        }
+    }
+
+    /**
+     * 文本解码：先按 UTF-8 严格解码（坏字节直接报错而不是吞成替换符），
+     * 失败再回退 GB18030。网上下载的中文资料很多是 GBK/GB18030 编码，
+     * `String(bytes, UTF_8)` 的默认替换解码会把整篇文字变成 U+FFFD 乱码，
+     * 用户只会看到「导入成功了但全是问号」——宁可明确走兜底路径。
+     */
+    private fun decodeText(bytes: ByteArray): String {
+        return try {
+            Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes))
+                .toString()
+        } catch (e: CharacterCodingException) {
+            String(bytes, Charset.forName("GB18030"))
         }
     }
 

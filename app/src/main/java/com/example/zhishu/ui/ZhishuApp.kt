@@ -1,5 +1,6 @@
 package com.example.zhishu.ui
 
+import android.app.Application
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
@@ -15,6 +16,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -23,6 +25,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.example.zhishu.ui.common.rememberZhishuViewModel
 import com.example.zhishu.ui.screens.CreateProjectScreen
 import com.example.zhishu.ui.screens.HomeScreen
 import com.example.zhishu.ui.screens.KnowledgeHubScreen
@@ -34,6 +37,8 @@ import com.example.zhishu.ui.screens.SearchScreen
 import com.example.zhishu.ui.screens.SettingsScreen
 import com.example.zhishu.ui.screens.SourceDetailScreen
 import com.example.zhishu.ui.screens.TrustCenterScreen
+import com.example.zhishu.ui.screens.UpdateDialog
+import com.example.zhishu.ui.screens.UpdateViewModel
 
 object Routes {
     const val HOME = "home"
@@ -107,6 +112,11 @@ fun ZhishuRoot(
     val currentRoute = backStackEntry?.destination?.route
     val showBottomBar = topTabs.any { it.route == currentRoute }
 
+    // 应用自更新：顶层持有同一个 UpdateViewModel——启动静默检查 + 弹窗在任何页面都能弹
+    val app = LocalContext.current.applicationContext as Application
+    val updateVm: UpdateViewModel = rememberZhishuViewModel(key = "update") { UpdateViewModel(app) }
+    LaunchedEffect(updateVm) { updateVm.autoCheckIfNeeded() }
+
     // 只在这一次进入时跳一次，之后用户自己怎么导航就不再干预。
     // launchSingleTop：配置变更（旋转等）会重建组合、LaunchedEffect 重跑，
     // 不加这道锁会把同一个项目页重复压进返回栈。
@@ -138,6 +148,7 @@ fun ZhishuRoot(
                         navController.navigate(Routes.reader(chapterId, blockId))
                     },
                     onGoReview = { navController.navigate(Routes.REVIEW) },
+                    onGoSettings = { navController.navigate(Routes.SETTINGS) },
                 )
             }
             composable(Routes.KNOWLEDGE) {
@@ -154,7 +165,10 @@ fun ZhishuRoot(
                 )
             }
             composable(Routes.SETTINGS) {
-                SettingsScreen(onOpenReview = { navController.navigate(Routes.REVIEW) })
+                SettingsScreen(
+                    onOpenReview = { navController.navigate(Routes.REVIEW) },
+                    updateVm = updateVm,
+                )
             }
             composable(Routes.CREATE) {
                 CreateProjectScreen(
@@ -164,6 +178,7 @@ fun ZhishuRoot(
                             popUpTo(Routes.HOME)
                         }
                     },
+                    onGoSettings = { navController.navigate(Routes.SETTINGS) },
                 )
             }
             composable(
@@ -222,6 +237,10 @@ fun ZhishuRoot(
                         navController.navigate(Routes.source(sourceId, chunkId))
                     },
                     onOpenTrustCenter = { navController.navigate(Routes.trust(it)) },
+                    onOpenProject = { pid ->
+                        // 卷末「规划下一卷」直达讲述路线 tab（扩展阅读/规划下一卷在那里）
+                        navController.navigate(Routes.project(pid, tab = 2))
+                    },
                 )
             }
             composable(
@@ -284,6 +303,9 @@ fun ZhishuRoot(
             }
         }
     }
+
+    // 应用自更新弹窗：放在 Scaffold 之外，任何页面发现新版本都能弹
+    UpdateDialog(updateVm)
 }
 
 @Composable

@@ -29,6 +29,7 @@ import com.example.zhishu.ai.outputs.RouteAuditIssue
 import com.example.zhishu.ai.outputs.StoryBibleOutput
 import com.example.zhishu.ai.outputs.VerificationOutput
 import com.example.zhishu.ai.outputs.VolumeOutlineOutput
+import com.example.zhishu.domain.model.BlockType
 import com.example.zhishu.domain.model.ChapterBlock
 import com.example.zhishu.domain.model.ChapterPlan
 import com.example.zhishu.domain.model.ChapterStatus
@@ -39,6 +40,7 @@ import com.example.zhishu.domain.model.ContractStatus
 import com.example.zhishu.domain.model.KnowledgeConflict
 import com.example.zhishu.domain.model.GapStatus
 import com.example.zhishu.domain.model.GapType
+import com.example.zhishu.domain.model.IssueType
 import com.example.zhishu.domain.model.KnowledgeGap
 import com.example.zhishu.domain.model.KnowledgeMapBatch
 import com.example.zhishu.domain.model.KnowledgeMapChainStatus
@@ -107,6 +109,12 @@ class PipelineService(
      * 阅读不会变成待办任务；已有复习数据不受影响。
      */
     private val spacedReviewEnabled: () -> Boolean = { false },
+    /**
+     * 核验问题自动处理是否开启（默认开）。开启时自动局部重写最多
+     * [AUTO_REPAIR_ROUNDS] 轮，修不掉的 STYLE 类问题自动标记不用改；
+     * 关闭时回到旧行为（一轮重写，其余全部留给用户）。
+     */
+    private val autoHandleIssues: () -> Boolean = { true },
     private val idFactory: () -> String = { UUID.randomUUID().toString() },
     private val clock: () -> Long = { System.currentTimeMillis() },
     /**
@@ -117,12 +125,6 @@ class PipelineService(
      * 事实/推导/引用核验照常，不因契约缺失失败、不补写虚假契约。
      */
     private val requireChapterContracts: () -> Boolean = { true },
-    /**
-     * 正文是否强制讲解段落关联既有知识点（批次 B 样本）。生产默认 true；
-     * 样本运行器传 false 以容忍部分模型（如 doubao-seed）正文块不填
-     * knowledgeNodeTitles——该质量问题作为样本发现记录，不改变生产默认。
-     */
-    private val requireBlockNodeLinks: () -> Boolean = { true },
     /**
      * 路线软审计结果出口（第二轮 P1-5）。
      *
@@ -992,18 +994,26 @@ class PipelineService(
             ),
         )
 
-        // 保存全局设定，同时把滚动记忆清零重新开始（问题5）
+        // 保存全局设定，同时把滚动记忆清零重新开始（问题5）。
+        //
+        // 舞台/人物/叙事载体来自本次大纲（2026-09 文风修复）：正文逐章单独生成，
+        // 唯一能看到的故事设定就是这里存的东西。三段式刚上线时大纲只出章节计划，
+        // 这三个槽全是空的，正文只能写成无名「他」或「你」的推理独白。
+        // 大纲没给（旧输出/解码缺字段）时退回旧值或占位文案，行为与原来一致。
         storyBibleRepository.save(
             StoryBible(
                 projectId = projectId,
                 world = ContextBudget.clamp(
-                    (bible?.world).orEmpty().ifBlank { "（讲述路线按知识演进编排，未设定故事舞台）" },
+                    outline.world.ifBlank {
+                        (bible?.world).orEmpty()
+                            .ifBlank { "（讲述路线按知识演进编排，未设定故事舞台）" }
+                    },
                     ContextBudget.WORLD_LIMIT,
                 ),
                 conflict = bible?.conflict.orEmpty().ifBlank { outline.volumeGoal },
-                style = bible?.style.orEmpty(),
-                approach = bible?.approach.orEmpty(),
-                characters = bible?.characters.orEmpty(),
+                style = outline.approach.ifBlank { bible?.style.orEmpty() },
+                approach = outline.approach.ifBlank { bible?.approach.orEmpty() },
+                characters = outline.characters.ifEmpty { bible?.characters.orEmpty() },
                 throughLine = (bible?.throughLine).orEmpty().ifEmpty {
                     chains.map { "${it.theme.ifBlank { "演进链" }}：${it.nodeTitles.joinToString(" → ")}" }
                 },
@@ -1237,6 +1247,8 @@ class PipelineService(
         // keyByTitle 仍给 prompt 用（显示 #nk-N），不受影响。
         val keyToNode = nodes.associateBy { canonicalNodeKey(nodeKeyLabel(it)) }
         val keyByTitle = NodeContext.keyByTitle(nodes) { nodeKeyLabel(it) }
+        // 标题 → 节点：契约 DONE 落库时把契约引用的节点并进本章 nodeIds 用
+        val nodesByTitle = nodes.associateBy { it.title.trim() }
         // 「谁在哪章首次引入」由程序推导，不采信模型声明——ContractIntroducedFix 的
         // 存在恰恰证明模型声明不可信
         val introducedOrder = decodeIntroducedOrder(batch.introducedKeysJson)
@@ -1317,6 +1329,14 @@ class PipelineService(
 
             // 落库前把编号反解回标题：契约是给正文/核验模型看的，它们按标题工作
             val resolved = resolveContractKeys(contract!!, keyToNode)
+            // 契约引用的节点并进本章 nodeIds。大纲阶段允许一章不带编号（只拦「清单外
+            // 的编号」），而契约校验的白名单是「本章 ∪ 已学」——APPLY / REVIEW 章的
+            // 契约可以只引用前面章节的节点。不并进来的话，这一章正文生成的校验白名单
+            // 就是空的，模型写得再对也会被「没有关联到任何既有知识点」拒收，
+            // 每次生成都整章作废（2026-09-14 实测死循环）。
+            val contractNodeIds = (resolved.introducedNodeTitles + resolved.appliedNodeTitles)
+                .mapNotNull { title -> nodesByTitle[title.trim()]?.id }
+                .distinct()
             statuses[index] = ContractStatus.DONE
             chapterRepository.upsertPlans(
                 listOf(
@@ -1324,6 +1344,7 @@ class PipelineService(
                         chapterType = chapter.chapterType,
                         contractJson = ContractCodec.encode(resolved),
                         contractStatus = ContractStatus.DONE.name,
+                        nodeIds = (plan.nodeIds + contractNodeIds).distinct(),
                     ),
                 )
             )
@@ -1766,6 +1787,22 @@ class PipelineService(
         ContractCodec.decode(plan.contractJson, plan.chapterType)
 
     /**
+     * 从本章契约反解它引用的知识点（[runChapter] 对「计划没挂节点」的兜底路径）。
+     *
+     * 契约落库前编号已反解成标题（[resolveContractKeys]），而编号本身来自地图白名单，
+     * 所以标题一定来自真实节点，按标题精确对回即可；契约不可用（None / Corrupt /
+     * MissingAfterType）返回空列表，交回调用方按「没有任何知识点」处理。
+     */
+    private fun nodesFromContract(plan: ChapterPlan, allNodes: List<KnowledgeNode>): List<KnowledgeNode> {
+        val contract = (chapterContractState(plan) as? ContractCodec.State.Valid)?.contract
+            ?: return emptyList()
+        val byTitle = allNodes.associateBy { it.title.trim() }
+        return (contract.introducedNodeTitles + contract.appliedNodeTitles)
+            .mapNotNull { byTitle[it.trim()] }
+            .distinctBy { it.id }
+    }
+
+    /**
      * 还没被任何章节安排到、也没有讲过的知识点（3D 起按 nodeId 判断）。
      *
      * 「安排过但还没写」也算已安排，否则续卷会把当前卷正要讲的东西再排一遍。
@@ -1898,7 +1935,35 @@ class PipelineService(
 
         val modelKnowledge = project.usesModelKnowledge
         val allNodes = knowledgeRepository.getByProject(projectId)
-        val nodes = plan.nodeIds.mapNotNull { id -> allNodes.firstOrNull { it.id == id } }
+        var nodes = plan.nodeIds.mapNotNull { id -> allNodes.firstOrNull { it.id == id } }
+        // 本章没挂知识点的兜底（2026-09-14 实测「生成没有完成」死循环的直接原因）：
+        // 存量计划里可能有一章 nodeIds 为空——大纲阶段只拦「清单外的编号」，不拦
+        // 「一章零编号」；契约校验的白名单又是「本章 ∪ 已学」，APPLY / REVIEW 章
+        // 可以只引用前面章节的节点，DONE 落库时也不回填 nodeIds。这样的章一旦生成：
+        // 提示词里「本章知识点」整节是空的，校验白名单也是空的，正文写得再对都
+        // 会被「讲解段落没有关联到任何既有知识点」整章拒收，重试一万次结果一样。
+        // 契约引用的节点经过 learnedKeys 白名单校验、编号反解自地图，就是本章
+        // 真正要讲的知识点，拿它兜底。
+        if (nodes.isEmpty()) {
+            nodes = nodesFromContract(plan, allNodes)
+            if (nodes.isNotEmpty()) {
+                // 回填落库：出题与记忆链都以 plan.nodeIds 兜底，不写回去
+                // 下一次生成还得重新自愈一遍
+                chapterRepository.upsertPlans(
+                    listOf(plan.copy(nodeIds = nodes.map { it.id }.distinct())),
+                )
+            } else {
+                // 契约也拿不出节点：写出来的正文必然过不了校验，在烧模型调用之前
+                // 就失败。这是规划数据问题，重试不改变结果，晚失败只是白扔上万 token
+                failAttempt(planId, attempt, "第 ${plan.order} 章没有挂任何知识点", ChapterStatus.FAILED)
+                return Result.failure(
+                    IllegalStateException(
+                        "第 ${plan.order} 章没有关联任何知识点，写了也过不了校验。" +
+                            "请在讲述路线里重新规划，让这一章带上知识点。",
+                    ),
+                )
+            }
+        }
         val chunks = if (modelKnowledge) emptyList() else loadChunksForNodes(projectId, nodes)
         // 片段的来源、页码、版本、法域要一起喂给模型（4A）
         loadSourceMeta(projectId)
@@ -1967,11 +2032,20 @@ class PipelineService(
             validChunkIds = validChunkIds,
             // 无资料模式没有片段可引，改由核验的待核实清单承担追溯责任（问题3）
             requireSourceRefs = !modelKnowledge,
-            requireNodeLinks = requireBlockNodeLinks(),
         ).getOrElse {
             failAttempt(planId, attempt, it.message ?: "章节内容不合要求", ChapterStatus.FAILED)
             return Result.failure(it)
         }
+        // 讲解段落一条都没关联上知识点（relink 也救不回的模型输出）：不再拒收整章。
+        // 正文已经写出来了，作废等于白扔上万 token——与「核验带问题发布」同一个
+        // 处理原则：照常发布、说明写进核验备注、标待复核，重生成还是换模型交给用户。
+        val knowledgeBlocks = output.blocks.filter {
+            it.type == BlockType.EXPLANATION ||
+                it.type == BlockType.FACT ||
+                it.type == BlockType.KEY_POINT
+        }
+        val nodeLinksMissing = knowledgeBlocks.isNotEmpty() &&
+            knowledgeBlocks.none { block -> block.knowledgeNodeTitles.any { it.trim() in titleToId } }
 
         val rawBlocks = output.blocks.mapIndexed { index, block ->
             ChapterBlock(
@@ -2006,6 +2080,9 @@ class PipelineService(
         val blocks = rawBlocks.map { block ->
             block.copy(sourceRefs = citations.resolvedByBlock[block.id].orEmpty())
         }
+        // 程序化文风预检（2026-09 文风修复）：免费、确定性，与核验模型的 style 问题互补。
+        // 两个发布分支都要带上——核验调用挂了不代表文风预检也作废。
+        val styleIssues = StoryQualityChecks.check(blocks)
         // 新正文写进新版本，旧版本的块一个都不删（第三阶段 3A）。
         // 这就是「重生成会覆盖已发布正文」这个风险的根治办法：两版正文挂在不同
         // versionId 上共存，阅读器只认 chapters.activeVersionId 指的那一版。
@@ -2048,11 +2125,29 @@ class PipelineService(
                     usedModelKnowledge = modelKnowledge,
                     verificationNote =
                         "核验没跑完（$reason）。正文先发布可读；" +
-                            "「更多 → 重新核验」只补检查、不会重写正文",
+                            "「更多 → 重新核验」只补检查、不会重写正文" +
+                            // 知识点全没关联上也要如实带出来，不能发布得像没事一样
+                            if (nodeLinksMissing) "；$NODE_LINK_MISSING_NOTE" else "",
                 ),
                 now = clock(),
             )
             attempt.published = true
+            // 核验没跑成，文风预检的结论照样要可见：它是程序算出来的，与核验无关
+            if (styleIssues.isNotEmpty()) {
+                val styleRecorded = IssueRecorder.record(
+                    projectId = projectId,
+                    chapterId = planId,
+                    versionId = version.id,
+                    issues = styleIssues,
+                    validBlockIds = blocks.map { it.id }.toSet(),
+                    now = clock(),
+                )
+                issueRepository.replaceForVersion(version.id, styleRecorded.issues)
+            }
+            // 知识点全没关联上：与核验问题同级的质量问题，标待复核而不是静默发布
+            if (nodeLinksMissing) {
+                chapterRepository.updateStatus(planId, ChapterStatus.NEEDS_REVIEW, NODE_LINK_MISSING_NOTE)
+            }
             // 记忆链照常推进：下一章要靠 coveredTitles/endingState 续写，
             // 断在这里会让一次网络抖动传染成整本书写不下去
             val fallbackTitles = output.coveredTitles.ifEmpty { nodes.map { it.title } }
@@ -2078,7 +2173,7 @@ class PipelineService(
             projectId = projectId,
             chapterId = planId,
             versionId = version.id,
-            issues = verified.issues,
+            issues = verified.issues + styleIssues,
             validBlockIds = blocks.map { it.id }.toSet(),
             now = clock(),
         )
@@ -2124,14 +2219,19 @@ class PipelineService(
                 // 记住这一版是在什么知识模式下写出来的（4A）。用户以后补了资料，
                 // 也不能让这一版看起来像是有出处的——它当时一条引用都引不到
                 usedModelKnowledge = modelKnowledge,
-                verificationNote = when {
-                    recorded.issues.isEmpty() -> if (unverified.isEmpty()) {
-                        ""
+                verificationNote = buildString {
+                    if (recorded.issues.isEmpty()) {
+                        if (unverified.isNotEmpty()) {
+                            append("有 ${unverified.size} 处内容建议你核对权威出处")
+                        }
                     } else {
-                        "有 ${unverified.size} 处内容建议你核对权威出处"
+                        // 带问题发布：说明直接写核验发现了什么，章节卡与阅读器都能看到
+                        append(issueSummary(recorded))
                     }
-                    // 带问题发布：说明直接写核验发现了什么，章节卡与阅读器都能看到
-                    else -> issueSummary(recorded)
+                    if (nodeLinksMissing) {
+                        if (isNotEmpty()) append("；")
+                        append(NODE_LINK_MISSING_NOTE)
+                    }
                 },
             ),
             now = clock(),
@@ -2147,41 +2247,49 @@ class PipelineService(
         // 原样保留，章节标 NEEDS_REVIEW 等用户在阅读器里逐条处理。
         var finalBlocks = blocks
         var finalVersionId = version.id
-        if (recorded.issues.isNotEmpty()) {
-            val repairTargets = autoRepairTargets(recorded)
-            if (repairTargets != null) {
-                val repaired = runRewrite(
-                    projectId = projectId,
-                    planId = planId,
-                    plan = plan,
-                    active = version,
-                    oldBlocks = blocks,
-                    targets = repairTargets.toSet(),
-                    onPhase = onPhase,
-                    onDraftCreated = {},
-                    // 出题挪到函数尾部统一做：无论修复成败，题都出在最终正文上
-                    regenerateQuiz = false,
-                )
-                if (repaired.isSuccess) {
-                    // 修复发布了一个新版本，随后的写回与出题都改认新版
-                    chapterRepository.getActiveVersion(planId)?.let { active ->
-                        finalVersionId = active.id
-                        chapterRepository.getBlocksByVersion(active.id)
-                            .takeIf { it.isNotEmpty() }
-                            ?.let { finalBlocks = it }
+        val autoRepair = autoRepairIssues(
+            projectId = projectId,
+            planId = planId,
+            plan = plan,
+            startVersion = version,
+            startBlocks = blocks,
+            startIssues = recorded.issues,
+            onPhase = onPhase,
+        )
+        finalVersionId = autoRepair.version.id
+        finalBlocks = autoRepair.blocks
+        val remainingIssues = autoRepair.openIssues
+        if (remainingIssues.isEmpty() && recorded.issues.isNotEmpty() && finalVersionId == version.id) {
+            // 一条新版本都没发布而问题清零：只可能是文风类问题被自动标记不用改。
+            // 把发布时写的「核验发现 N 个问题」旧说明换成收尾说明，别让旧账一直挂着
+            chapterRepository.updateStatus(planId, ChapterStatus.PUBLISHED, AUTO_STYLE_ACCEPTED_NOTE)
+        }
+        // 知识点关联在自动修复之后重算：逐段重写可能把关联补上了，
+        // 修好了就不该再拿旧标记压着章节状态
+        val finalKnowledgeBlocks = finalBlocks.filter {
+            it.blockType == BlockType.EXPLANATION ||
+                it.blockType == BlockType.FACT ||
+                it.blockType == BlockType.KEY_POINT
+        }
+        val linksStillMissing = finalKnowledgeBlocks.isNotEmpty() &&
+            finalKnowledgeBlocks.none { it.knowledgeNodeIds.isNotEmpty() }
+        if (linksStillMissing || remainingIssues.isNotEmpty()) {
+            // 还有事实类问题没修掉：正文可读、问题逐条挂在当前版本上，
+            // 状态标「待复核」，由用户逐条处理（接受 / 只重写该段）。
+            // 注意这里不能再走 failAttempt——版本已发布，作废它等于白写这一章。
+            chapterRepository.updateStatus(
+                planId,
+                ChapterStatus.NEEDS_REVIEW,
+                buildString {
+                    if (remainingIssues.isNotEmpty()) {
+                        append(issueSummary(IssueRecorder.Recorded(remainingIssues)))
                     }
-                }
-            }
-            if (finalVersionId == version.id) {
-                // 没修（不满足条件）或没修好：正文可读、问题逐条挂在当前版本上，
-                // 状态标「待复核」，由用户在阅读器里逐条处理（接受 / 只重写该段）。
-                // 注意这里不能再走 failAttempt——版本已发布，作废它等于白写这一章。
-                chapterRepository.updateStatus(
-                    planId,
-                    ChapterStatus.NEEDS_REVIEW,
-                    issueSummary(recorded),
-                )
-            }
+                    if (linksStillMissing) {
+                        if (isNotEmpty()) append("；")
+                        append(NODE_LINK_MISSING_NOTE)
+                    }
+                },
+            )
         }
         // 推进滚动记忆：runningState 被改写而不是追加，因此长度不随章数增长（问题5）。
         // 这三步都只依赖「正文已经发布」（带问题发布也算），与出题成败无关——
@@ -2242,7 +2350,8 @@ class PipelineService(
             projectId = projectId,
             chapterId = planId,
             versionId = active.id,
-            issues = verified.issues,
+            // 补核验也要带上程序化文风预检：同一版正文，检查口径必须一致
+            issues = verified.issues + StoryQualityChecks.check(blocks),
             validBlockIds = blocks.map { it.id }.toSet(),
             now = clock(),
         )
@@ -2254,25 +2363,31 @@ class PipelineService(
             return Result.success(Unit)
         }
 
-        // 与 runChapter 相同的护栏：只修定位得到段落的问题，超过上限留给用户逐条处理
-        val repairTargets = autoRepairTargets(recorded)
-        if (repairTargets != null) {
-            val repaired = runRewrite(
-                projectId = projectId,
-                planId = planId,
-                plan = plan,
-                active = active,
-                oldBlocks = blocks,
-                targets = repairTargets.toSet(),
-                onPhase = onPhase,
-                onDraftCreated = {},
-                // 出题不在这里做：补核验只对「核验缺失/待复核」负责，题已有独立入口
-                regenerateQuiz = false,
-            )
-            if (repaired.isSuccess) return Result.success(Unit)
+        // 与 runChapter 共用同一套自动处理：多轮局部重写 + 文风类问题自动接受
+        val outcome = autoRepairIssues(
+            projectId = projectId,
+            planId = planId,
+            plan = plan,
+            startVersion = active,
+            startBlocks = blocks,
+            startIssues = recorded.issues,
+            onPhase = onPhase,
+        )
+        if (outcome.openIssues.isEmpty()) {
+            if (outcome.version.id == active.id) {
+                // 没发布新版本而问题清零（典型：文风类问题已被自动标记不用改）：
+                // 翻回已发布并清掉旧说明
+                chapterRepository.updateStatus(planId, ChapterStatus.PUBLISHED, AUTO_STYLE_ACCEPTED_NOTE)
+            }
+            // 发布了新版本时 publishVersion 已把状态置为已发布、说明换成改动摘要，不再动
+            return Result.success(Unit)
         }
-        // 没修/没修好：正文可读、问题挂在当前版本上，标待复核由用户在阅读器里处理
-        chapterRepository.updateStatus(planId, ChapterStatus.NEEDS_REVIEW, issueSummary(recorded))
+        // 没修好：正文可读、剩余问题挂在当前版本上，标待复核由用户逐条处理
+        chapterRepository.updateStatus(
+            planId,
+            ChapterStatus.NEEDS_REVIEW,
+            issueSummary(IssueRecorder.Recorded(outcome.openIssues)),
+        )
         return Result.success(Unit)
     }
 
@@ -2495,7 +2610,10 @@ class PipelineService(
             projectId = projectId,
             chapterId = planId,
             versionId = draft.id,
-            issues = verified.issues,
+            // 文风预检只并入**定位到段落**的问题：重写一段修不掉的全章级问题
+            // （零对话、占比低）若也拦在这里，局部重写会永远无法发布——
+            // 那类问题属于整章重写或用户复核，不属于段落级修复的验收条件
+            issues = verified.issues + StoryQualityChecks.check(blocks).filter { it.blockId != null },
             validBlockIds = blocks.map { it.id }.toSet(),
             now = clock(),
         )
@@ -2634,6 +2752,78 @@ class PipelineService(
      * 否则用户会看到一堆说的是已经被替换掉的文字的问题）。也就是说，
      * 那种情况下这句说明是唯一能告诉用户「哪里不对」的地方。
      */
+    /** 自动处理收尾后的现场：最终生效的版本、它的正文块、以及仍然开放的问题 */
+    private class AutoRepairOutcome(
+        val version: ChapterVersion,
+        val blocks: List<ChapterBlock>,
+        val openIssues: List<VerificationIssue>,
+    )
+
+    /**
+     * 核验问题的自动处理：多轮局部重写 + 文风类问题自动收尾。
+     *
+     * 每轮与旧的单轮逻辑同一套护栏（[autoRepairTargets]：只修定位得到段落的问题、
+     * 涉及块数 ≤ [AUTO_REPAIR_MAX_BLOCKS]），轮与轮之间从**当前生效版本**重取
+     * 还开放的问题——上一轮修掉的不进下一轮；上一轮没修掉的（重写失败或重验
+     * 仍报）原样重试，重写温度不为 0，第二次尝试本来就可能改对。
+     *
+     * 重写轮结束后把剩余的 STYLE 类问题标记为不用改：它们是程序化文风预检
+     * 或核验员对表达方式的评价，不伤知识准确性，留在待复核清单里只会把真正
+     * 需要人看的事实问题淹没。事实类问题（资料不支持/矛盾/编造……）一条都不动。
+     *
+     * 仅当 [autoHandleIssues] 开启时才跑第二轮并做文风收尾；关闭时行为与
+     * 旧的单轮修复一致。
+     */
+    private suspend fun autoRepairIssues(
+        projectId: String,
+        planId: String,
+        plan: ChapterPlan,
+        startVersion: ChapterVersion,
+        startBlocks: List<ChapterBlock>,
+        startIssues: List<VerificationIssue>,
+        onPhase: ProgressReporter,
+    ): AutoRepairOutcome {
+        var version = startVersion
+        var blocks = startBlocks
+        var open = startIssues.filter { it.resolution.isOpen }
+        val rounds = if (autoHandleIssues()) AUTO_REPAIR_ROUNDS else 1
+        repeat(rounds) {
+            if (open.isEmpty()) return@repeat
+            val targets = autoRepairTargets(IssueRecorder.Recorded(open)) ?: return@repeat
+            val repaired = runRewrite(
+                projectId = projectId,
+                planId = planId,
+                plan = plan,
+                active = version,
+                oldBlocks = blocks,
+                targets = targets.toSet(),
+                onPhase = onPhase,
+                onDraftCreated = {},
+                // 出题由调用方在最终正文上统一做一次，这里不重复扣费
+                regenerateQuiz = false,
+            )
+            // 重写失败（模型调用挂了 / 重验仍有问题）时草稿已作废、当前版本没变：
+            // 下一轮拿同样的目标再试一次，仍失败就停
+            if (repaired.isFailure) return@repeat
+            val published = chapterRepository.getActiveVersion(planId)
+                ?.takeIf { it.id != version.id }
+                ?: return@repeat
+            val publishedBlocks = chapterRepository.getBlocksByVersion(published.id)
+            if (publishedBlocks.isEmpty()) return@repeat
+            version = published
+            blocks = publishedBlocks
+            open = issueRepository.getByVersion(published.id).filter { it.resolution.isOpen }
+        }
+        if (autoHandleIssues() && open.isNotEmpty()) {
+            val styleIds = open.filter { it.type == IssueType.STYLE }.map { it.id }.toSet()
+            if (styleIds.isNotEmpty()) {
+                open.filter { it.id in styleIds }.forEach { issueRepository.accept(it.id) }
+                open = open.filterNot { it.id in styleIds }
+            }
+        }
+        return AutoRepairOutcome(version, blocks, open)
+    }
+
     /**
      * 自动修复的目标块（内部可见，测试直接钉决策口径）。
      *
@@ -3426,6 +3616,25 @@ class PipelineService(
          */
         const val AUTO_REPAIR_MAX_BLOCKS = 6
 
+        /**
+         * 自动修复的轮数上限（自动处理开启时）。修不掉的问题下一轮原样重试：
+         * 重写温度不为 0，同一份问题第二次尝试有可能改对。每轮都受
+         * [AUTO_REPAIR_MAX_BLOCKS] 护栏约束，成本上限 = 轮数 ×（块数 + 1 次核验）。
+         */
+        const val AUTO_REPAIR_ROUNDS = 2
+
+        /** 文风类问题全部自动标记不用改、没有事实问题遗留时的章节说明 */
+        const val AUTO_STYLE_ACCEPTED_NOTE =
+            "文风类核验问题已自动标记不用改；没有需要你处理的事实问题。"
+
+        /**
+         * 讲解段落全没关联上知识点时的降级说明。校验层不再为此拒收整章（白扔
+         * 上万 token 的正文），改为带问题发布：说明挂核验备注、章节标待复核，
+         * 重生成还是换更稳的模型由用户决定。
+         */
+        const val NODE_LINK_MISSING_NOTE =
+            "讲解段落没有关联到任何既有知识点，建议重新生成本章或换更稳的模型"
+
         /** 生成中的状态。取消收尾只在章节仍停在这些状态时才动它。 */
         val IN_FLIGHT_STATUSES = listOf(
             ChapterStatus.RUNNING,
@@ -3465,8 +3674,12 @@ class PipelineService(
             "你是小说家，也是这门学科的讲述者。第一原则：一切通过具体的人、具体的场景、" +
                 "可感的细节展开——推演藏在人物的遭遇里，而不是旁白里。人物要有名有姓，" +
                 "场景要落地，关键处让人物开口或行动。读者是为故事往下翻的，读完却发现学会了一门学科：" +
-                "制度自己出现，而不是被告知名词。"
-        const val SYSTEM_VERIFY = "你是核验员。既查知识准确性，也查推演有没有跳步。"
+                "制度自己出现，而不是被告知名词。" +
+                "叙述用普通人说话的语言：句子短，多用具体名词和动词，少用书面大词；" +
+                "像在给朋友讲故事，不像在写论文。提示词里的句式是说明方向的，不是给你抄的台词。"
+        const val SYSTEM_VERIFY =
+            "你是核验员。既查知识准确性，也查推演有没有跳步；" +
+                "同时盯着文风——正文要是写成了讲义或独白，也要指出来。"
         const val SYSTEM_REWRITE =
             "你在修一整章里的一个段落。只解决指出的问题，其余保持原样，改完要能无缝接回原位。"
 

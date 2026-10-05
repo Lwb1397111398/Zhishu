@@ -119,6 +119,8 @@ fun ReaderScreen(
     onOpenSource: (String, String?) -> Unit = { _, _ -> },
     /** 打开全书未核实内容筛选（4C） */
     onOpenTrustCenter: (String) -> Unit = {},
+    /** 卷末入口（3.5）：章末「规划下一卷」跳到项目页的讲述路线 tab */
+    onOpenProject: (String) -> Unit = {},
 ) {
     val app = LocalContext.current.applicationContext as Application
     val vm: ReaderViewModel = rememberZhishuViewModel(key = "reader_$chapterId") {
@@ -131,6 +133,7 @@ fun ReaderScreen(
     val dense by vm.denseMode.collectAsStateWithLifecycle()
     val prevChapterId by vm.prevChapterId.collectAsStateWithLifecycle()
     val nextChapterId by vm.nextChapterId.collectAsStateWithLifecycle()
+    val nextVolumeUnplanned by vm.nextVolumeUnplanned.collectAsStateWithLifecycle()
     val savedAnchor by vm.savedAnchor.collectAsStateWithLifecycle()
     val quizCount by vm.quizCount.collectAsStateWithLifecycle()
     val bodyUpdatedNotice by vm.bodyUpdatedNotice.collectAsStateWithLifecycle()
@@ -524,6 +527,11 @@ fun ReaderScreen(
                                 onSelfTest = { onOpenQuiz(chapterId) },
                                 onNext = { nextChapterId?.let(onOpenChapter) },
                                 palette = palette,
+                                onPlanNextVolume = if (nextVolumeUnplanned) {
+                                    {
+                                        chapter?.projectId?.let(onOpenProject)
+                                    }
+                                } else null,
                             )
                         }
                     }
@@ -612,6 +620,11 @@ fun ReaderScreen(
                         onSelfTest = { onOpenQuiz(chapterId) },
                         onNext = { nextChapterId?.let(onOpenChapter) },
                         palette = palette,
+                        onPlanNextVolume = if (nextVolumeUnplanned) {
+                            {
+                                chapter?.projectId?.let(onOpenProject)
+                            }
+                        } else null,
                     )
                 }
             }
@@ -1182,6 +1195,8 @@ private fun ChapterFooter(
     onSelfTest: () -> Unit,
     onNext: () -> Unit,
     palette: ReaderPalette,
+    /** 卷末且下一卷未规划（3.5）：给「规划下一卷」出口，null = 不显示 */
+    onPlanNextVolume: (() -> Unit)? = null,
 ) {
     Column(Modifier.fillMaxWidth()) {
         Text(
@@ -1207,6 +1222,18 @@ private fun ChapterFooter(
             if (hasNext) {
                 Button(onClick = onNext) { Text("继续读下一章") }
             }
+        }
+        // 卷边界（3.5）：这是最后一章、下一卷还没规划。原来读到这里下面
+        // 什么都没有，用户分不清「讲完了」还是「还没写」——给个明确出口
+        if (!hasNext && onPlanNextVolume != null) {
+            Spacer(Modifier.height(12.dp))
+            Button(onClick = onPlanNextVolume) { Text("规划下一卷") }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "这一卷到这里讲完了。去项目页规划下一卷，故事接着往下走。",
+                style = MaterialTheme.typography.bodySmall,
+                color = palette.secondary,
+            )
         }
         if (quizCount > 0) {
             Spacer(Modifier.height(6.dp))
@@ -1473,11 +1500,15 @@ private fun BlockContent(
                 contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
             ) {
                 Text(
-                    // 有待处理问题时优先说这件事：它比「几处来源」更需要读者知道
-                    if (sourceSummary.openIssues.isNotEmpty()) {
-                        "${sourceSummary.label} · ${sourceSummary.openIssues.size} 项待核对"
-                    } else {
-                        sourceSummary.label
+                    // 有待处理问题时优先说这件事：它比「几处来源」更需要读者知道。
+                    // 安静模式再收一档：只留「待核对 N」，来源明细留给点开后的面板——
+                    // 这行小字出现的频率不低，长文案会把正文挤成锯齿
+                    when {
+                        sourceSummary.openIssues.isNotEmpty() && dense ->
+                            "${sourceSummary.label} · ${sourceSummary.openIssues.size} 项待核对"
+                        sourceSummary.openIssues.isNotEmpty() ->
+                            "待核对 ${sourceSummary.openIssues.size}"
+                        else -> sourceSummary.label
                     },
                     style = MaterialTheme.typography.labelMedium,
                     color = if (sourceSummary.deservesAttention) {

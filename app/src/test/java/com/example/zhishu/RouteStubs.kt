@@ -43,12 +43,31 @@ internal object RouteStubs {
     var outlineForcesUnknownKey: Boolean = false
 
     /**
+     * 大纲桩在第 N 章故意不挂任何编号（按章序，1 起）。
+     *
+     * 大纲校验只拦「清单外的编号」，不拦「一章零编号」——这正好是
+     * 「计划没挂知识点 → 正文校验白名单为空 → 必然拒收」死链的入口，
+     * 兜底链路（契约回填 / 生成时自愈）的测试都从这里进。
+     */
+    @Volatile
+    var outlineDropNodeKeysAtChapter: Int? = null
+
+    /**
      * 开场钩子文案（按章序取，取不到退回默认文案）。
      *
      * 「喂进正文提示词的是哪一段开场」只能靠文案比对，所以需要可指定。
      */
     @Volatile
     var openingHooks: List<String> = emptyList()
+
+    /**
+     * 大纲桩附带的故事脚手架 JSON 片段（2026-09 文风修复）。
+     *
+     * 形如 `,"world":"…","characters":["…"],"approach":"…"`（以逗号开头）。
+     * 置空 = 模拟旧模型输出不带这三个字段，验证兼容路径。
+     */
+    @Volatile
+    var outlineScaffolding: String = ""
 
     /**
      * 清空全部桩状态。
@@ -61,7 +80,9 @@ internal object RouteStubs {
         outlineChapterCount = null
         contractViolationAtChapter = null
         outlineForcesUnknownKey = false
+        outlineDropNodeKeysAtChapter = null
         openingHooks = emptyList()
+        outlineScaffolding = ""
     }
 
     /**
@@ -81,7 +102,12 @@ internal object RouteStubs {
             val nodeKeys = keys.takeIf { it.isNotEmpty() }?.let {
                 listOf(it[index % it.size])
             }.orEmpty()
-            val rendered = if (outlineForcesUnknownKey) listOf("nk-does-not-exist") else nodeKeys
+            val rendered = when {
+                outlineForcesUnknownKey -> listOf("nk-does-not-exist")
+                // 第 N 章一个编号都不挂：复现「一章零知识点」的计划
+                outlineDropNodeKeysAtChapter == order -> emptyList()
+                else -> nodeKeys
+            }
             """{"order":$order,"title":"第${order}章",""" +
                 """"derivationChain":"从既有规则出发 → 撞上它解决不了的问题 → 长出新的规则",""" +
                 """"plotGoal":"走完第${order}段推演","learningGoals":["这一章想通什么？"],""" +
@@ -90,7 +116,7 @@ internal object RouteStubs {
                 """"openingHook":"${openingHooks.getOrElse(index) { "第${order}章的开场处境" }}",""" +
                 """"closingHook":"第${order}章留下的口子"}"""
         }
-        return """{"volumeTitle":"第一卷","volumeGoal":"把这门学科讲通","chapters":[$chapters]}"""
+        return """{"volumeTitle":"第一卷","volumeGoal":"把这门学科讲通"$outlineScaffolding,"chapters":[$chapters]}"""
     }
 
     /**

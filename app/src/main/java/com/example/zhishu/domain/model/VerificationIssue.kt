@@ -52,6 +52,16 @@ enum class IssueType {
     /** 人物行动/判断了但没有可观察的结果或后续（行动悬空，第二轮 P1-3） */
     MISSING_RESULT,
 
+    /**
+     * 文风问题：不像小说、读着费劲（2026-09 文风修复）。
+     *
+     * 典型形态：通篇无名「他」/「你」的推理独白、全章零对话、
+     * 模板句复读、说理连篇。它不伤知识准确性，但正是用户抱怨
+     * 「云里雾里」的直接来源——没有这一类，文风劣化没有任何反馈回路，
+     * 自动修复永远不会朝「更好读」的方向修。
+     */
+    STYLE,
+
     /** 认不出来的类型。原样保留 rawType，不丢 */
     OTHER,
     ;
@@ -68,6 +78,7 @@ enum class IssueType {
             MISSING -> "没讲透"
             NO_APPLICATION -> "没应用起来"
             MISSING_RESULT -> "行动没有结果"
+            STYLE -> "文风问题"
             OTHER -> "其他问题"
         }
 
@@ -103,6 +114,11 @@ enum class IssueType {
                 normalized.contains("noapplication") || raw.contains("没有应用") ||
                     raw.contains("没用起来") || raw.contains("没应用") ->
                     NO_APPLICATION
+                // 文风类关键词与上面各组无重叠；「像散文」「说教」是模型描述文风问题的常用语
+                normalized.contains("style") || raw.contains("文风") || raw.contains("生硬") ||
+                    raw.contains("散文") || raw.contains("独白") || raw.contains("说教") ||
+                    raw.contains("复读") || raw.contains("不像小说") ->
+                    STYLE
                 normalized.contains("missing") || raw.contains("没讲") || raw.contains("未回答") ->
                     MISSING
                 else -> OTHER

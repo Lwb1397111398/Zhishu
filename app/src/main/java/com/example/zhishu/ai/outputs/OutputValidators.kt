@@ -315,30 +315,20 @@ object OutputValidators {
         knownNodeTitles: Set<String>,
         validChunkIds: Set<String>,
         requireSourceRefs: Boolean = true,
-        /**
-         * 是否强制知识讲解段落关联既有知识点（生产 true）。
-         * 批次 B 样本发现部分模型（如 doubao-seed）正文块不填 knowledgeNodeTitles，
-         * 全空会拦截整章——样本运行器传 false 让链路跑通以评估其余环节，
-         * 该质量问题作为样本发现记录，不改变生产默认。
-         */
-        requireNodeLinks: Boolean = true,
     ): Result<ChapterOutput> {
         val blocks = output.blocks.filter { it.text.isNotBlank() }
         if (blocks.isEmpty()) {
             return Result.failure(ModelError.Invalid("章节正文为空"))
         }
-        val knowledgeBlocks = blocks.filter {
-            it.type == BlockType.EXPLANATION ||
-                it.type == BlockType.FACT ||
-                it.type == BlockType.KEY_POINT
-        }
-        // 讲解与事实段落必须落在既有知识点上，否则等于凭空讲知识
-        val unmapped = knowledgeBlocks.filter { block ->
-            block.knowledgeNodeTitles.none { it.trim() in knownNodeTitles }
-        }
-        if (requireNodeLinks && knowledgeBlocks.isNotEmpty() && unmapped.size == knowledgeBlocks.size) {
-            return Result.failure(ModelError.Invalid("章节的知识讲解段落没有关联到任何既有知识点"))
-        }
+        // 先把模型回传的标题对齐到本章真实标题（变体归位 + 文内取证），
+        // 对齐是确定性修复，见 relinkKnowledgeNodeTitles。归位后的标题随校验通过
+        // 流回调用方（runChapter 按标题反解成节点 ID），真实落库。
+        //
+        // 对齐后讲解段落**全部**没有关联上知识点时，这里不再拒收：拒收等于把
+        // 一次上万 token 的正文整个作废（2026-09-14 实测「生成没有完成」死循环）。
+        // 降级交给流水线——正文照常发布、说明写进核验备注、章节标待复核，
+        // 与「核验带问题发布」同一个处理原则。
+        val relinked = relinkKnowledgeNodeTitles(blocks, knownNodeTitles)
         // 引用不在这里过滤（4A）。
         //
         // 原来这一步会把对不上片段的引用静默丢掉：问题随之消失，正文里那句
@@ -354,8 +344,81 @@ object OutputValidators {
                 return Result.failure(ModelError.Invalid("原始事实段落缺少可追溯的资料引用"))
             }
         }
-        return Result.success(output.copy(blocks = blocks))
+        return Result.success(output.copy(blocks = relinked))
     }
+
+    /**
+     * 把正文块回传的知识点标题对齐到本章真实标题（确定性修复，泛化自 [canonicalNodeKey] 的思路）。
+     *
+     * 线上反复出现同一类问题：正文本身写得没问题，但 `knowledgeNodeTitles` 要么整段
+     * 留空（批次 B 样本实测部分模型从不填），要么抄成了标题的变体——标点全半角不同、
+     * 夹了空格、多了引号或书名号。按精确比对落库时这些块就全都不带知识点 ID：
+     * 阅读器的知识点角标、节点回写、复习清单全都拿不到；对齐不上时流水线还会
+     * 把整章降级成待复核（2026-09 实测「生成没有完成」的直接原因）。
+     *
+     * 这类修复是确定性的字符串对齐，不需要模型判断力；回炉让模型重写既慢又贵，
+     * 还会顺手改坏别处（ContractIntroducedFix 的注释里有完整账）。两步，都只动标题、不动正文：
+     *
+     * 1. **变体归位**：归一化（只保留文字与数字）后与真实标题一致的，替换回真实标题；
+     *    对不上的原样保留，不静默丢弃。
+     * 2. **文内取证**：归位后仍没有任何有效关联的讲解段落，回正文里找——哪个真实
+     *    标题（归一化后）出现在这段文字里，就关联哪个。这是有证据的关联：标题确实是
+     *    这段话在讲的概念，不是凭空贴标签；STORY 块不参与（它们不承担讲解责任）。
+     *    取证也找不到就不硬造，原样交回调用方——由流水线按「全未关联」降级处理。
+     *
+     * 归位后的标题会随校验通过流回调用方（`runChapter` 按标题反解成节点 ID），
+     * 所以这里补上的关联会真实落库，而不只是让校验放行。
+     */
+    private fun relinkKnowledgeNodeTitles(
+        blocks: List<BlockDto>,
+        knownNodeTitles: Set<String>,
+    ): List<BlockDto> {
+        if (knownNodeTitles.isEmpty()) return blocks
+        val byNormalized = knownNodeTitles
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .associateBy { normalizeTitle(it) }
+        if (byNormalized.isEmpty()) return blocks
+        return blocks.map { block ->
+            // 第一步：变体归位——模型抄写的标题哪怕带上了多余标点也能对回真实标题
+            val canonical = block.knowledgeNodeTitles.map { raw ->
+                val trimmed = raw.trim()
+                byNormalized[normalizeTitle(trimmed)] ?: trimmed
+            }.filter { it.isNotEmpty() }.distinct()
+            val linked =
+                if (canonical.any { it in knownNodeTitles } || !isKnowledgeType(block.type)) {
+                    canonical
+                } else {
+                    // 第二步：文内取证——只对承担讲解责任的段落兜底
+                    val textNorm = normalizeTitle(block.text)
+                    val found = byNormalized.entries
+                        .map { it.value to it.key }
+                        .filter { (_, norm) -> norm.length >= MIN_FALLBACK_TITLE_LENGTH && textNorm.contains(norm) }
+                        .sortedByDescending { (_, norm) -> norm.length }
+                        .take(FALLBACK_LINK_LIMIT)
+                        .map { it.first }
+                    (canonical + found).distinct()
+                }
+            if (linked == block.knowledgeNodeTitles) {
+                block
+            } else {
+                block.copy(knowledgeNodeTitles = linked)
+            }
+        }
+    }
+
+    /** 标题归一化：只保留文字与数字——标点、空格、全半角差异一律抹平 */
+    private fun normalizeTitle(raw: String): String = raw.filter { it.isLetterOrDigit() }
+
+    /** 承担讲解责任的段落类型，文内取证只对它们兜底 */
+    private fun isKnowledgeType(type: BlockType): Boolean =
+        type == BlockType.EXPLANATION || type == BlockType.FACT || type == BlockType.KEY_POINT
+
+    /** 文内取证兜底：单段最多关联几个知识点（防止把一整串标题都贴上去） */
+    private const val FALLBACK_LINK_LIMIT = 4
+
+    /** 标题归一化后短于这个长度的（如单字标题）不做文内子串匹配——太容易误命中 */
+    private const val MIN_FALLBACK_TITLE_LENGTH = 2
 
     fun validateQuizSet(
         output: QuizSetOutput,

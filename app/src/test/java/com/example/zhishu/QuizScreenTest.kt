@@ -91,6 +91,8 @@ class QuizScreenTest {
             ZhishuTheme { QuizScreen(chapterId = chapterId, onBack = {}) }
         }
 
+        // 题目来自 Room Flow 的异步首发射，Robolectric 上偶发晚于断言——显式等待出现
+        waitForQuizLoaded()
         composeRule.onNodeWithText("继承从什么时候开始？").assertIsDisplayed()
         composeRule.onNodeWithText("被继承人死亡时").performClick()
         composeRule.onNodeWithText("提交答案").performClick()
@@ -108,10 +110,20 @@ class QuizScreenTest {
             ZhishuTheme { QuizScreen(chapterId = chapterId, onBack = {}) }
         }
 
+        waitForQuizLoaded()
         composeRule.onNodeWithText("立遗嘱时").performClick()
         composeRule.onNodeWithText("提交答案").performClick()
         composeRule.waitForIdle()
 
         composeRule.onNodeWithText("答错了").assertIsDisplayed()
+    }
+
+    /** 等题目真正渲染出来（Room Flow 首发射是异步的，直接断言会撞时序） */
+    private fun waitForQuizLoaded() {
+        composeRule.waitUntil(10_000) {
+            composeRule.onAllNodesWithText("继承从什么时候开始？")
+                .fetchSemanticsNodes()
+                .isNotEmpty()
+        }
     }
 }

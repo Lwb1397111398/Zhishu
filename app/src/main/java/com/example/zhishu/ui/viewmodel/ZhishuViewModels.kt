@@ -49,6 +49,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -120,6 +121,9 @@ internal suspend fun deleteProjectCompletely(container: AppContainer, projectId:
     }
 }
 
+/** 备份提醒的间隔（3.3）：超过两周没导出且已有成稿，书架顶部温和提醒一次 */
+private const val BACKUP_REMINDER_INTERVAL_MILLIS = 14L * 24 * 60 * 60 * 1000
+
 class HomeViewModel(app: Application) : ZhishuViewModel(app) {
 
     data class ContinueEntry(
@@ -188,6 +192,27 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
     private val _knowledgeStats = MutableStateFlow<Map<String, Int>>(emptyMap())
     val knowledgeStats: StateFlow<Map<String, Int>> = _knowledgeStats
 
+    /**
+     * 三个模型环节是否都已配好。没配好时空书架/创建页要提前告诉用户
+     * 「还差一步配置」，别等书开了一半才发现生成不了。
+     */
+    private val _configReady = MutableStateFlow(true)
+    val configReady: StateFlow<Boolean> = _configReady
+
+    /** 超过两周没备份且已有写完的章节（3.3）。与「用户已关掉」组合成最终提醒 */
+    private val _backupOverdue = MutableStateFlow(false)
+
+    private val _backupDismissed = MutableStateFlow(false)
+
+    /** 书架顶部那条可关闭的备份提醒。关掉后本次运行不再弹，完成备份自然消失 */
+    val backupReminder: StateFlow<Boolean> = combine(_backupOverdue, _backupDismissed) { overdue, dismissed ->
+        overdue && !dismissed
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
+    fun dismissBackupReminder() {
+        _backupDismissed.value = true
+    }
+
     init {
         refresh()
     }
@@ -197,6 +222,9 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
             // 知识页的统计条要显示待复习数，所以这里无条件算；
             // 首页「今日复习」卡片是否出现仍由 reviewEnabled 决定，逻辑不变
             _dueCount.value = container.reviewRepository.getDue(now()).size
+            _configReady.value = runCatching {
+                container.settingsRepository.missingModelRoles().isEmpty()
+            }.getOrDefault(true)
             val all = container.projectRepository.observeAll().first()
             val stats = mutableMapOf<String, BookStat>()
             val nodeCounts = mutableMapOf<String, Int>()
@@ -231,6 +259,12 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
             _knowledgeStats.value = nodeCounts
             _continueEntry.value = entries.maxByOrNull { it.progress.updatedAt }
             _weekReadCount.value = stats.values.count { it.lastReadAt >= weekAgo }
+            // 备份提醒（3.3）：写过东西、又超两周没导出，才温和提一次。
+            // 从未备份（时间戳 0）且已有成稿的书同样算超期——内容越多越该备份
+            val lastBackupAt = container.learningPrefs.lastBackupAt.value
+            val published = stats.values.sumOf { it.publishedChapters }
+            _backupOverdue.value = published > 0 &&
+                now() - lastBackupAt > BACKUP_REMINDER_INTERVAL_MILLIS
         }
     }
 
@@ -290,6 +324,21 @@ class CreateProjectViewModel(app: Application) : ZhishuViewModel(app) {
 
     private val _creating = MutableStateFlow(false)
     val creating: StateFlow<Boolean> = _creating
+
+    /**
+     * 三个模型环节是否都已配好。建项目本身不需要模型，但建完第一步
+     * 「一键开讲」就需要——在这里提前提示，别让用户建完书才发现写不了。
+     */
+    private val _configReady = MutableStateFlow(true)
+    val configReady: StateFlow<Boolean> = _configReady
+
+    init {
+        viewModelScope.launch {
+            _configReady.value = runCatching {
+                container.settingsRepository.missingModelRoles().isEmpty()
+            }.getOrDefault(true)
+        }
+    }
 
     /** 无资料模式下只要填了主题就能建项目并直接开讲 */
     val canSubmit: Boolean
@@ -724,6 +773,13 @@ class ProjectDetailViewModel(
     val message: StateFlow<String?> = _message
 
     /**
+     * 当前这条 [message] 可带的动作文字（如「去配置」）。Snackbar 显示出来，
+     * 用户点了动作就执行对应跳转。每条消息默认无动作。
+     */
+    private val _messageAction = MutableStateFlow<String?>(null)
+    val messageAction: StateFlow<String?> = _messageAction
+
+    /**
      * 自动生成总开关（默认开）。「一键开讲 / 继续」按钮的副标题文案据此联动，
      * 点击时同样按它决定是否在链尾挂 ADVANCE。读 getter 即可——文案在下次进入资料 Tab
      * 时刷新就够，不值得为它多一路订阅（开关改动是低频操作）。
@@ -733,6 +789,24 @@ class ProjectDetailViewModel(
 
     fun consumeMessage() {
         _message.value = null
+        _messageAction.value = null
+    }
+
+    /**
+     * 生成前的前置检查：这条链要用的模型环节还没配好时，直接告诉用户缺什么
+     * 并给「去配置」动作，而不是等入队后由 Worker 报错——那时用户只看到一条
+     * 失败横幅，还得自己琢磨下一步。返回 true 表示已拦截、调用方不要再入队。
+     */
+    private suspend fun blockOnMissingRoles(required: List<ModelRole>): Boolean {
+        val missing = runCatching {
+            container.settingsRepository.missingModelRoles().filter { it in required }
+        }.getOrDefault(emptyList())
+        if (missing.isEmpty()) return false
+        _message.value =
+            "还没有为以下环节选择 API 配置方案：${missing.joinToString("、") { it.displayName }}。" +
+                "先去配好，再回来点这一步。"
+        _messageAction.value = "去配置"
+        return true
     }
     // PLACEHOLDER_PROJECT_DETAIL
 
@@ -895,13 +969,16 @@ class ProjectDetailViewModel(
      * SKELETON 只出骨架（首次生成先看结构再决定）；NEXT_CHAIN 单步推一条链。
      */
     fun enqueueKnowledgeMap(mode: KnowledgeMapMode = KnowledgeMapMode.FULL) {
-        val message = when (mode) {
-            KnowledgeMapMode.FULL -> "已开始梳理知识主干（需要网络）"
-            KnowledgeMapMode.SKELETON -> "已开始梳理骨架，完成后可逐条或全部展开（需要网络）"
-            KnowledgeMapMode.NEXT_CHAIN -> "已开始展开下一条演进链（需要网络）"
-        }
-        launchEnqueue(message) {
-            GenerationEnqueuer.knowledgeMap(getApplication(), projectId, mode)
+        viewModelScope.launch {
+            if (blockOnMissingRoles(listOf(ModelRole.FAST))) return@launch
+            val message = when (mode) {
+                KnowledgeMapMode.FULL -> "已开始梳理知识主干（需要网络）"
+                KnowledgeMapMode.SKELETON -> "已开始梳理骨架，完成后可逐条或全部展开（需要网络）"
+                KnowledgeMapMode.NEXT_CHAIN -> "已开始展开下一条演进链（需要网络）"
+            }
+            launchEnqueue(message) {
+                GenerationEnqueuer.knowledgeMap(getApplication(), projectId, mode)
+            }
         }
     }
 
@@ -935,18 +1012,24 @@ class ProjectDetailViewModel(
     }
 
     fun enqueueStoryBible() {
-        launchEnqueue("已开始规划讲述路线（需要网络）") {
-            GenerationEnqueuer.storyBible(getApplication(), projectId)
+        viewModelScope.launch {
+            if (blockOnMissingRoles(listOf(ModelRole.STORY))) return@launch
+            launchEnqueue("已开始规划讲述路线（需要网络）") {
+                GenerationEnqueuer.storyBible(getApplication(), projectId)
+            }
         }
     }
 
     fun enqueueChapters() {
-        launchEnqueue("已开始生成未完成的章节（需要网络）") {
-            GenerationEnqueuer.chapters(
-                context = getApplication(),
-                projectId = projectId,
-                plans = container.chapterRepository.getPlans(projectId),
-            )
+        viewModelScope.launch {
+            if (blockOnMissingRoles(listOf(ModelRole.STORY, ModelRole.VERIFY))) return@launch
+            launchEnqueue("已开始生成未完成的章节（需要网络）") {
+                GenerationEnqueuer.chapters(
+                    context = getApplication(),
+                    projectId = projectId,
+                    plans = container.chapterRepository.getPlans(projectId),
+                )
+            }
         }
     }
 
@@ -964,6 +1047,13 @@ class ProjectDetailViewModel(
             val needsMap = mapIncomplete || container.knowledgeRepository.getByProject(projectId).isEmpty()
             val plans = container.chapterRepository.getPlans(projectId)
             val needsBible = plans.isEmpty()
+            // 配置前置检查：一键链会用到哪些环节就查哪些，缺了直接引导去配置
+            val required = buildList {
+                if (needsMap) add(ModelRole.FAST)
+                add(ModelRole.STORY)
+                add(ModelRole.VERIFY)
+            }
+            if (blockOnMissingRoles(required)) return@launch
             // 提示语按这条链**实际**会跑的步骤拼：失败横幅的重试、批量失败后的续写
             // 多半两步都不需要，照抄「依次完成知识梳理、路线规划」会让用户白等两个大阶段
             val steps = buildList {
@@ -1062,27 +1152,33 @@ class ProjectDetailViewModel(
 
     /** 单章生成 / 重试，明确指定阶段与章节（B5/B3） */
     fun enqueueChapter(planId: String) {
-        launchEnqueue("已开始生成该章节（需要网络）") {
-            GenerationEnqueuer.singleChapter(
-                context = getApplication(),
-                projectId = projectId,
-                chapterId = planId,
-                chapterLabel = container.chapterRepository.getPlan(planId)
-                    ?.let { "第 ${it.order} 章" }
-                    .orEmpty(),
-            )
+        viewModelScope.launch {
+            if (blockOnMissingRoles(listOf(ModelRole.STORY, ModelRole.VERIFY))) return@launch
+            launchEnqueue("已开始生成该章节（需要网络）") {
+                GenerationEnqueuer.singleChapter(
+                    context = getApplication(),
+                    projectId = projectId,
+                    chapterId = planId,
+                    chapterLabel = container.chapterRepository.getPlan(planId)
+                        ?.let { "第 ${it.order} 章" }
+                        .orEmpty(),
+                )
+            }
         }
     }
 
     /** 重新核验并重生成待复核章节（B3） */
     fun retryNeedsReview() {
-        launchEnqueue("已开始重新生成待复核章节") {
-            GenerationEnqueuer.chapters(
-                context = getApplication(),
-                projectId = projectId,
-                plans = container.chapterRepository.getPlans(projectId),
-                includeNeedsReview = true,
-            )
+        viewModelScope.launch {
+            if (blockOnMissingRoles(listOf(ModelRole.STORY, ModelRole.VERIFY))) return@launch
+            launchEnqueue("已开始重新生成待复核章节") {
+                GenerationEnqueuer.chapters(
+                    context = getApplication(),
+                    projectId = projectId,
+                    plans = container.chapterRepository.getPlans(projectId),
+                    includeNeedsReview = true,
+                )
+            }
         }
     }
 
@@ -1254,6 +1350,10 @@ class ReaderViewModel(
     val prevChapterId = MutableStateFlow<String?>(null)
     val nextChapterId = MutableStateFlow<String?>(null)
 
+    /** 章末「规划下一卷」入口的显示条件（3.5）：当前卷已到末章且下一卷未规划 */
+    private val _nextVolumeUnplanned = MutableStateFlow(false)
+    val nextVolumeUnplanned: StateFlow<Boolean> = _nextVolumeUnplanned
+
     /** 全书章节（按 order 排好）：阅读器内的「全书目录」直接用，不用回项目页 */
     val allPlans = MutableStateFlow<List<ChapterPlan>>(emptyList())
 
@@ -1406,6 +1506,13 @@ class ReaderViewModel(
             val index = plans.indexOfFirst { it.id == chapterId }
             prevChapterId.value = plans.getOrNull(index - 1)?.id
             nextChapterId.value = plans.getOrNull(index + 1)?.id
+            // 卷边界（3.5）：本章已是所在卷的最后一章、且下一卷一部章都没规划时，
+            // 章末给出「规划下一卷」入口。原来读到这里下面空空如也——
+            // 用户分不清「讲完了」还是「还没写」，更不知道去哪能接着往下
+            val current = plans.getOrNull(index)
+            _nextVolumeUnplanned.value = current != null &&
+                plans.filter { it.volumeIndex == current.volumeIndex }.lastOrNull()?.id == chapterId &&
+                plans.none { it.volumeIndex == current.volumeIndex + 1 }
             // 只有保存的进度确实属于当前章节时才恢复（B7）
             val saved = container.progressRepository.get(plan.projectId)
             _savedAnchor.value = if (saved?.chapterId == chapterId) {
@@ -1727,6 +1834,14 @@ class SettingsViewModel(app: Application) : ZhishuViewModel(app) {
 
     fun setGenerationAutoAdvance(enabled: Boolean) {
         container.learningPrefs.setGenerationAutoAdvance(enabled)
+    }
+
+    /** 核验问题自动处理开关（默认开）：自动重写两轮 + 文风类问题自动放过 */
+    val autoHandleIssues: StateFlow<Boolean> =
+        container.learningPrefs.autoHandleIssues
+
+    fun setAutoHandleIssues(enabled: Boolean) {
+        container.learningPrefs.setAutoHandleIssues(enabled)
     }
 
     init { load() }

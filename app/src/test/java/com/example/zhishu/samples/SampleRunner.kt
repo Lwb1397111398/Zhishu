@@ -405,8 +405,8 @@ class SampleRunner {
             reviewRepository = DefaultReviewRepository(db.reviewItemDao()),
             spacedReviewEnabled = { false },
             requireChapterContracts = { requireContracts },
-            // 样本发现 doubao 正文块不填 knowledgeNodeTitles，放宽让链路跑通（生产默认严格）
-            requireBlockNodeLinks = { false },
+            // 其余开关走生产默认。doubao 正文块不填 knowledgeNodeTitles 的样本发现
+            // 不再需要放宽：校验层已不为此拒收，流水线降级为带问题发布（2026-09-14）
             // RouteAudit 软指标落盘（批次 B 报告需要）
             routeAuditSink = { issues ->
                 File(SAMPLES_ROOT, "runs").listFiles()?.maxByOrNull { it.name }?.let { latest ->

@@ -6,11 +6,14 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.example.zhishu.ZhishuApp
 import com.example.zhishu.ai.GenerationLog
+import com.example.zhishu.ai.UsageAccumulator
+import com.example.zhishu.ai.UsageTrackerElement
 import com.example.zhishu.ai.pipeline.ChapterPhase
 import com.example.zhishu.ai.pipeline.KnowledgeMapMode
 import com.example.zhishu.ai.pipeline.NextVolumeAvailability
 import com.example.zhishu.di.AppContainer
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withContext
 
 /**
  * 单一阶段的生成 Worker（第二阶段）。
@@ -43,6 +46,15 @@ class GenerationWorker(
     private val unitsTotal: Int get() = inputData.getInt(KEY_UNITS_TOTAL, 0)
 
     /**
+     * 本 Worker（通常是「写一章」）累计的 token 用量（3.2）。
+     *
+     * 每个阶段一个 Worker 实例，这个数就是本阶段的消耗；进度条文字带上它，
+     * 用户看着数字涨就知道钱花在哪一步。会话总量在链尾 [summarize] 从
+     * AppContainer 的会话账本里取（每个阶段结束时往账本里加一笔）。
+     */
+    private val usage = UsageAccumulator()
+
+    /**
      * 整段收在同一个 try 里（含读项目、查配置、链尾收尾）。
      *
      * 原来这些前置步骤在 try 之外：它们一旦抛异常，WorkManager 只收得到一个
@@ -66,7 +78,15 @@ class GenerationWorker(
             // 检查的角色按本阶段实际要用的算，不再无条件要求三样齐全。
             missingRoles(stage)?.let { return Result.failure(workDataOf(KEY_ERROR to it)) }
 
-            runStage(stage, project.title)
+            val result = runStage(stage, project.title)
+            // 本阶段用量记进会话账本（进程内内存）：链尾总结好报总账。
+            // 进程被系统收走后账本清零——通知里说「约」，不假装精确
+            inputData.getString(KEY_SESSION)?.let { session ->
+                if (usage.totalTokens > 0) {
+                    container.sessionTokenUsage.merge(session, usage.totalTokens, Long::plus)
+                }
+            }
+            return result
         } catch (e: CancellationException) {
             // 协程取消必须原样抛出：包装成业务失败会让 WorkManager 以为该重试，
             // 用户按了取消反而又开始扣费（B4）
@@ -92,16 +112,18 @@ class GenerationWorker(
                     ?.let { name -> runCatching { KnowledgeMapMode.valueOf(name) }.getOrNull() }
                     ?: KnowledgeMapMode.FULL
                 var done = 0
-                container.pipeline.generateKnowledgeMap(projectId, mapMode) { progress ->
-                    // 知识地图整链路只占 1 个工作单元（一键开讲的百分比以章节为准），
-                    // 骨架/逐链/审计的细分进度用地图自己的单元数并进 UI 百分比：
-                    // 骨架 =1、每条链 =1、审计 =1，用户能看到「正在展开第 3/8 条链」确实在动，
-                    // 而不是卡在 0/1 上像没反应（B3）。
-                    val text = progress.label.ifBlank { stage.label }
-                    val completed = unitsBefore + progress.completed
-                    val total = unitsBefore + progress.total.coerceAtLeast(progress.completed + 1)
-                    report(text, completed, projectTitle, total)
-                    done = progress.completed
+                withContext(UsageTrackerElement(usage)) {
+                    container.pipeline.generateKnowledgeMap(projectId, mapMode) { progress ->
+                        // 知识地图整链路只占 1 个工作单元（一键开讲的百分比以章节为准），
+                        // 骨架/逐链/审计的细分进度用地图自己的单元数并进 UI 百分比：
+                        // 骨架 =1、每条链 =1、审计 =1，用户能看到「正在展开第 3/8 条链」确实在动，
+                        // 而不是卡在 0/1 上像没反应（B3）。
+                        val text = progress.label.ifBlank { stage.label }
+                        val completed = unitsBefore + progress.completed
+                        val total = unitsBefore + progress.total.coerceAtLeast(progress.completed + 1)
+                        report(text, completed, projectTitle, total)
+                        done = progress.completed
+                    }
                 }.getOrThrow()
                 // 审计完成、gap 已落库：开自动时把 actionable 的漏知识点补上（成本护栏 10 条）。
                 // 只认 FULL——SKELETON/NEXT_CHAIN 是用户明确要「先看结构再决定」的节奏，
@@ -110,7 +132,9 @@ class GenerationWorker(
                 if (mapMode == KnowledgeMapMode.FULL &&
                     container.learningPrefs.generationAutoAdvance.value
                 ) {
-                    val n = container.pipeline.autoResolveGaps(projectId)
+                    val n = withContext(UsageTrackerElement(usage)) {
+                        container.pipeline.autoResolveGaps(projectId)
+                    }
                     if (n > 0) {
                         report("已自动补上 $n 个漏掉的知识点", unitsBefore + done, projectTitle)
                     }
@@ -123,14 +147,16 @@ class GenerationWorker(
                 // 前台通知随之刷新——这既是让用户看到进展，也是在向系统证明
                 // 这个任务还活着（长任务的存活就靠这条通知）。
                 var done = 0
-                container.pipeline.generateStoryBible(projectId) { progress ->
-                    val text = progress.label.ifBlank { stage.label }
-                    val completed = unitsBefore + progress.completed
-                    val total = (unitsBefore + progress.total)
-                        .coerceAtLeast(unitsTotal)
-                        .coerceAtLeast(completed + 1)
-                    report(text, completed, projectTitle, total)
-                    done = progress.completed
+                withContext(UsageTrackerElement(usage)) {
+                    container.pipeline.generateStoryBible(projectId) { progress ->
+                        val text = progress.label.ifBlank { stage.label }
+                        val completed = unitsBefore + progress.completed
+                        val total = (unitsBefore + progress.total)
+                            .coerceAtLeast(unitsTotal)
+                            .coerceAtLeast(completed + 1)
+                        report(text, completed, projectTitle, total)
+                        done = progress.completed
+                    }
                 }.getOrThrow()
                 report(stage.label, unitsBefore + 1, projectTitle)
             }
@@ -147,11 +173,14 @@ class GenerationWorker(
             GenerationStage.PLAN_NEXT_VOLUME -> {
                 // 规划下一卷：一次模型调用，append-only（只往后加章节，已发布的一字不改）。
                 // 失败即本阶段失败，走 WorkManager 退避重试；重试耗尽停链给可读原因。
-                container.pipeline.generateNextVolume(projectId).getOrThrow()
+                withContext(UsageTrackerElement(usage)) {
+                    container.pipeline.generateNextVolume(projectId)
+                }.getOrThrow()
                 report(stage.label, unitsBefore + 1, projectTitle)
             }
         }
-        return Result.success()
+        // 本阶段的 token 消耗随成功一起上报（诊断用；进度文字里已实时显示）
+        return Result.success(workDataOf(KEY_TOKENS to usage.totalTokens))
     }
 
     /** 生成一章。FIRST_CHAPTER 现查「第一个需要写的章节」，不依赖入队时的快照。 */
@@ -176,10 +205,12 @@ class GenerationWorker(
             }
         }
         var done = 0
-        container.pipeline.generateChapter(projectId, chapterId) { phase ->
-            val text = if (label.isBlank()) phase.label else "$label · ${phase.label}"
-            report(text, unitsBefore + done, projectTitle)
-            done += 1
+        withContext(UsageTrackerElement(usage)) {
+            container.pipeline.generateChapter(projectId, chapterId) { phase ->
+                val text = if (label.isBlank()) phase.label else "$label · ${phase.label}"
+                report(text, unitsBefore + done, projectTitle)
+                done += 1
+            }
         }.getOrThrow()
         report(ChapterPhase.QUIZ.label, unitsBefore + ChapterPhase.UNITS_PER_CHAPTER, projectTitle)
     }
@@ -195,15 +226,31 @@ class GenerationWorker(
         val readable = plans.count { it.status.isReadable }
         // 带问题发布（核验挑出问题、自动修复没修干净）的章：正文可读，状态停在待复核。
         // 不算进「已完成」也不能装作不存在——通知里如实说，用户才知道去哪处理。
-        val needsReview =
-            plans.count { it.status == com.example.zhishu.domain.model.ChapterStatus.NEEDS_REVIEW }
+        val needsReviewPlans = plans.filter {
+            it.status == com.example.zhishu.domain.model.ChapterStatus.NEEDS_REVIEW
+        }
         val missingQuiz = plans.count { it.quizState == com.example.zhishu.domain.model.QuizState.FAILED }
+        // 剩余问题只数待复核章上的：已发布的章要么没有问题、要么问题已被处理完
+        val openIssues = runCatching {
+            needsReviewPlans.sumOf { container.issueRepository.countActiveOpen(it.id) }
+        }.getOrDefault(0)
+        val autoHandleOn = container.learningPrefs.autoHandleIssues.value
         val detail = buildString {
             append("已完成 $readable/${plans.size} 章，可以开始读了。")
-            if (needsReview > 0) {
-                append("其中 $needsReview 章有待确认的核验问题，正文可读，进章节可逐条处理。")
+            if (needsReviewPlans.isNotEmpty()) {
+                append("其中 ${needsReviewPlans.size} 章还有 $openIssues 个核验问题没修掉")
+                if (autoHandleOn) append("（文风类已自动放过）")
+                append("，正文可读，点开章节可逐条查看。")
             }
             if (missingQuiz > 0) append("其中 $missingQuiz 章的自测题没生成，正文不受影响。")
+            // 会话总账：每个阶段的 Worker 结束时往账本里加了一笔（3.2）。
+            // 账本在内存里，进程中途被杀就取不到——取不到就不写这句，不编数字
+            val sessionTokens = inputData.getString(KEY_SESSION)
+                ?.let { container.sessionTokenUsage[it] }
+                ?: 0L
+            if (sessionTokens > 0) {
+                append("本次生成共消耗约 ${formatTokens(sessionTokens)} tokens。")
+            }
         }
         GenerationNotifier.notifyOutcome(
             context = applicationContext,
@@ -347,15 +394,19 @@ class GenerationWorker(
      * 刷新只发生在阶段边界（正文写完、核验过、题出好），不是每个正文块一次。
      */
     private suspend fun report(text: String, completed: Int, projectTitle: String, totalOverride: Int = unitsTotal) {
+        // 已消耗的 token 挂在阶段文字后面：这是本次生成最直接的「花费」，
+        // 数字在涨说明模型确实在工作，也让人对成本心里有数（3.2）
+        val used = usage.totalTokens
+        val shownText = if (used > 0) "$text · 已用 ${formatTokens(used)} tokens" else text
         // 缓存最新进度，给 ForegroundKeeper 的重试用（重试时要用当下最新内容重建通知）
         lastProjectTitle = projectTitle
-        lastStageText = text
+        lastStageText = shownText
         lastCompleted = completed
         lastTotal = totalOverride
         runCatching {
             setProgress(
                 workDataOf(
-                    KEY_PROGRESS to text,
+                    KEY_PROGRESS to shownText,
                     KEY_PROGRESS_COMPLETED to completed,
                     KEY_PROGRESS_TOTAL to totalOverride,
                     KEY_SESSION to inputData.getString(KEY_SESSION),
@@ -373,7 +424,7 @@ class GenerationWorker(
                     context = applicationContext,
                     projectId = projectId,
                     projectTitle = projectTitle,
-                    stageText = text,
+                    stageText = shownText,
                     completed = completed,
                     total = totalOverride,
                 ),
@@ -384,6 +435,13 @@ class GenerationWorker(
                 GenerationLog.recordFailure(applicationContext, "FOREGROUND", it)
                 foregroundKeeper.start()
             }
+    }
+
+    /** 1 万以下直接报数，往上报「x.x 万」——进度条小字里塞不下长数字 */
+    private fun formatTokens(tokens: Long): String = if (tokens >= 10_000) {
+        String.format(java.util.Locale.CHINA, "%.1f 万", tokens / 10_000.0)
+    } else {
+        tokens.toString()
     }
 
     /** 最近一次上报的进度快照：前台化重试时按它重建通知 */
@@ -410,10 +468,11 @@ class GenerationWorker(
     )
 
     private suspend fun missingRoles(stage: GenerationStage): String? {
-        val missing = stage.requiredRoles.filter { role ->
-            val profile = container.settingsRepository.getAssignedProfile(role)
-            profile == null || profile.baseUrl.isBlank() || profile.modelName.isBlank()
-        }
+        // 判据统一放在 SettingsRepository.missingModelRoles()：UI 生成前的前置引导
+        // 和这里的失败判定必须看到同一个「缺什么」，否则会出现界面说配好了、
+        // Worker 还是报缺配置（或反过来）的裂缝
+        val missing = container.settingsRepository.missingModelRoles()
+            .filter { it in stage.requiredRoles }
         if (missing.isEmpty()) return null
         return "还没有为以下环节选择 API 配置方案：${missing.joinToString("、") { it.displayName }}。" +
             "请到「我的」页新增配置方案，并在「各环节使用的方案」里选择。"
@@ -437,6 +496,9 @@ class GenerationWorker(
         const val KEY_PROGRESS = "progress"
         const val KEY_PROGRESS_COMPLETED = "progressCompleted"
         const val KEY_PROGRESS_TOTAL = "progressTotal"
+
+        /** 本 WorkRequest（通常是一章）累计消耗的 token 数（3.2） */
+        const val KEY_TOKENS = "tokensUsed"
 
         /** 会话标识。UI 靠它把当前会话与上一次失败的 WorkInfo 分开（第二阶段） */
         const val KEY_SESSION = "sessionId"

@@ -57,6 +57,13 @@ class GenerationTest {
     /** 间隔复习开关（默认关，和产品默认一致），个别测试里改成 true 验证排复习 */
     private var spacedReview = false
 
+    /**
+     * 核验自动处理开关。本文件默认关：这里大量测试锁定的是逐条问题的
+     * 「人工处理」路径（待复核、说明文案），默认开会让风格问题被自动放过。
+     * 开关开着的行为在 generateChapter_styleIssues_autoAcceptedWhenAutoHandleOn 里单独锁。
+     */
+    private var autoHandle = false
+
     @Before
     fun setUp() {
         db = Room.inMemoryDatabaseBuilder(
@@ -67,6 +74,7 @@ class GenerationTest {
         fakeRouter = FakeRouter()
         idCounter = 0
         spacedReview = false
+        autoHandle = false
         pipeline = PipelineService(
             router = fakeRouter,
             prompts = MapPromptProvider(),
@@ -87,6 +95,7 @@ class GenerationTest {
             quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
             reviewRepository = DefaultReviewRepository(db.reviewItemDao()),
             spacedReviewEnabled = { spacedReview },
+            autoHandleIssues = { autoHandle },
             idFactory = { "id-${idCounter++}" },
         )
     }
@@ -310,6 +319,161 @@ class GenerationTest {
         assertEquals(ProjectStatus.READY, db.projectDao().getById("p-1")?.status)
     }
 
+    /** 大纲产出的故事脚手架必须回填进故事圣经（2026-09 文风修复）。
+     *  三段式刚上线时这三个槽永远是空的，正文只能写成无名独白——用测试钉住回填 */
+    @Test
+    fun generateStoryBible_backfillsScaffoldingFromOutline() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        RouteStubs.outlineScaffolding =
+            ",\"world\":\"九十年代末的江南小城\",\"characters\":[" +
+                "\"沈青禾：旧书店老板娘，好奇心重，总爱打破砂锅问到底\"," +
+                "\"周叙：退休物理教师，讲故事的人\"]," +
+                "\"approach\":\"跟着旧书店老板娘的日常，让物理问题自己找上门\""
+        try {
+            assertTrue(pipeline.generateStoryBible("p-1").isSuccess)
+        } finally {
+            RouteStubs.outlineScaffolding = ""
+        }
+        val bible = db.storyBibleDao().get("p-1")!!
+        assertEquals("九十年代末的江南小城", bible.world)
+        assertEquals(2, bible.characters.size)
+        assertTrue(bible.characters.first().startsWith("沈青禾"))
+        assertEquals("跟着旧书店老板娘的日常，让物理问题自己找上门", bible.approach)
+        // 载体理由同时作为正文调用的「风格」上下文，不再只能靠 effectiveGenre 兜底
+        assertEquals("跟着旧书店老板娘的日常，让物理问题自己找上门", bible.style)
+    }
+
+    /** 旧模型输出不带脚手架字段时退回原占位文案，兼容行为不变 */
+    @Test
+    fun generateStoryBible_withoutScaffolding_keepsLegacyFallback() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        assertTrue(pipeline.generateStoryBible("p-1").isSuccess)
+        val bible = db.storyBibleDao().get("p-1")!!
+        assertEquals("（讲述路线按知识演进编排，未设定故事舞台）", bible.world)
+        assertTrue(bible.characters.isEmpty())
+        assertEquals("", bible.style)
+        assertEquals("", bible.approach)
+    }
+
+    /** 人物表必须真的喂进正文调用的 {characters} 槽，正文才知道该写谁 */
+    @Test
+    fun generateChapter_receivesScaffoldingInPrompt() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        RouteStubs.outlineChapterCount = 1
+        RouteStubs.outlineScaffolding =
+            ",\"world\":\"九十年代末的江南小城\",\"characters\":[" +
+                "\"沈青禾：旧书店老板娘，好奇心重\"]," +
+                "\"approach\":\"跟着老板娘的日常往前走\""
+        try {
+            assertTrue(pipeline.generateStoryBible("p-1").isSuccess)
+            val plan = db.chapterPlanDao().getByProject("p-1").first()
+            assertTrue(pipeline.generateChapter("p-1", plan.id).isSuccess)
+        } finally {
+            RouteStubs.outlineScaffolding = ""
+        }
+        assertTrue(fakeRouter.chapterPromptCapture.orEmpty().contains("沈青禾"))
+    }
+
+    /**
+     * 全章零对话 + 说理淹没故事：程序化预检报 STYLE（全章级）并把章节标待复核。
+     *
+     * 本文件 autoHandle 默认关——这是「用户关掉自动处理」时的行为锁定：
+     * 一切问题都留给用户逐条处理，章节停在待复核。
+     */
+    @Test
+    fun generateChapter_styleIssuesRecorded_marksChapterForReview() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        pipeline.generateStoryBible("p-1")
+        fakeRouter.chapterJson = styleBaitChapterJson()
+        val plan = db.chapterPlanDao().getByProject("p-1").first()
+        val result = pipeline.generateChapter("p-1", plan.id)
+        assertTrue(result.isSuccess)
+        val issues = db.verificationIssueDao().getAllVersionsByProject("p-1")
+        assertTrue(issues.any { it.type == IssueType.STYLE && it.blockId == null })
+        assertEquals(ChapterStatus.NEEDS_REVIEW, db.chapterPlanDao().getById(plan.id)?.status)
+    }
+
+    /**
+     * 自动处理开着（产品默认）：全章级 STYLE 问题重写无从下手（章级问题进不了
+     * 修复轮），但程序化文风预检的结论不值得打扰用户——自动标记「不用改」，
+     * 章节保持已发布，说明换成收尾文案。问题记录保留为 ACCEPTED，可追溯不删除。
+     */
+    @Test
+    fun generateChapter_styleIssues_autoAcceptedWhenAutoHandleOn() = runBlocking {
+        autoHandle = true
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        pipeline.generateStoryBible("p-1")
+        fakeRouter.chapterJson = styleBaitChapterJson()
+        val plan = db.chapterPlanDao().getByProject("p-1").first()
+        assertTrue(pipeline.generateChapter("p-1", plan.id).isSuccess)
+
+        // 章节已发布，说明是「文风类已自动放过」而不是待复核
+        val after = db.chapterPlanDao().getById(plan.id)!!
+        assertEquals(ChapterStatus.PUBLISHED, after.status)
+        assertTrue(after.verificationNote.contains("文风类核验问题已自动标记不用改"))
+
+        // STYLE 问题留在表里但已接受——用户以后还能在可信度中心看到，不是被删掉
+        val version = db.chapterVersionDao().getActive(plan.id)!!
+        val issues = db.verificationIssueDao().getByVersion(version.id)
+        val style = issues.filter { it.type == IssueType.STYLE }
+        assertTrue(style.isNotEmpty())
+        assertTrue(style.all { it.resolution == com.example.zhishu.domain.model.IssueResolution.ACCEPTED })
+    }
+
+    /** 核验调用挂掉时正文照常发布，但文风预检的结论照样要落库可见 */
+    @Test
+    fun generateChapter_verifyDown_styleIssuesStillVisible() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        pipeline.generateStoryBible("p-1")
+        fakeRouter.chapterJson = styleBaitChapterJson()
+        fakeRouter.verifyJson = "不是 JSON"
+        val plan = db.chapterPlanDao().getByProject("p-1").first()
+        val result = pipeline.generateChapter("p-1", plan.id)
+        assertTrue(result.isSuccess)
+        assertEquals(ChapterStatus.PUBLISHED, db.chapterPlanDao().getById(plan.id)?.status)
+        val issues = db.verificationIssueDao().getAllVersionsByProject("p-1")
+        assertTrue(issues.any { it.type == IssueType.STYLE })
+    }
+
+    /** 全章零对话 + STORY 只占三分之一：程序化文风预检的确定性诱饵 */
+    private fun styleBaitChapterJson(): String {
+        val story = buildString {
+            var i = 0
+            while (length < 400) {
+                i++
+                append("林默把卷宗摊开在桌面上，逐行对照协议里的措辞与签名S$i。")
+            }
+        }
+        val a = buildString {
+            var i = 0
+            while (length < 400) {
+                i++
+                append("意思表示必须真的表达出去才算成立，只放在心里不算数S$i。")
+            }
+        }
+        val b = buildString {
+            var i = 0
+            while (length < 400) {
+                i++
+                append("遗嘱的效力要看立遗嘱的人当时真正的想法是什么S$i。")
+            }
+        }
+        return "{\"title\":\"第一章 遗嘱风波\",\"summary\":\"围绕遗嘱效力的第一次碰撞\"," +
+            "\"blocks\":[" +
+            "{\"type\":\"STORY\",\"text\":\"$story\",\"knowledgeNodeTitles\":[\"意思表示\"],\"sourceRefs\":[\"c-1\"]}," +
+            "{\"type\":\"EXPLANATION\",\"text\":\"$a\",\"knowledgeNodeTitles\":[\"意思表示\"],\"sourceRefs\":[\"c-1\"]}," +
+            "{\"type\":\"EXPLANATION\",\"text\":\"$b\",\"knowledgeNodeTitles\":[\"意思表示\"],\"sourceRefs\":[]}]," +
+            "\"endingState\":\"林默合上卷宗，决定去查代签的那个人。\"," +
+            "\"coveredTitles\":[\"意思表示\"],\"openThreads\":[\"代签的人是谁\"]," +
+            "\"runningStateUpdate\":\"林默接手遗嘱纠纷，发现协议上有代签的痕迹。\"}"
+    }
+
     /** 用户在设置里打开间隔复习后，发布章节才排首次复习（B2） */
     @Test
     fun generateChapter_withSpacedReviewEnabled_schedulesReviews() = runBlocking {
@@ -417,6 +581,97 @@ class GenerationTest {
         assertTrue(note.contains("1 个问题"))
         assertTrue(note.contains("与资料矛盾"))
         assertFalse(note.contains("contradiction"))
+    }
+
+    /**
+     * 大纲允许一章不挂编号（只拦「清单外的编号」）；契约校验的白名单又是
+     * 「本章 ∪ 已学」，APPLY / REVIEW 章引用前面章节的节点照样 DONE。
+     * 契约落库时必须把引用的节点并进 nodeIds——不并的话这一章正文校验的
+     * 白名单是空的，模型写得再对也会被「没有关联到任何既有知识点」拒收，
+     * 每次生成都整章作废（2026-09-14 实测「生成没有完成」死循环）。
+     */
+    @Test
+    fun generateStoryBible_contractBackfillsNodeIdsForNodelessChapter() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        // 第 2 章（APPLY）大纲里一个编号都不挂
+        RouteStubs.outlineDropNodeKeysAtChapter = 2
+        assertTrue(pipeline.generateStoryBible("p-1").isSuccess)
+        val chapter2 = db.chapterPlanDao().getByProject("p-1").first { it.order == 2 }
+        assertTrue("第 2 章 nodeIds 应被契约回填，实际 ${chapter2.nodeIds}", chapter2.nodeIds.isNotEmpty())
+        // 回填的必须是真实存在的节点
+        chapter2.nodeIds.forEach { id ->
+            assertNotNull(db.knowledgeNodeDao().getById(id))
+        }
+    }
+
+    /** 存量坏数据：计划没挂节点但契约可用 → 生成时从契约自愈并回填，不再必然拒收 */
+    @Test
+    fun generateChapter_nodeIdsEmpty_healsFromContract() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        RouteStubs.outlineChapterCount = 1
+        pipeline.generateStoryBible("p-1")
+        // 模拟存量数据：规划正常、契约 DONE，但 nodeIds 丢了
+        val plan = db.chapterPlanDao().getByProject("p-1").first()
+        db.chapterPlanDao().upsert(plan.copy(nodeIds = emptyList()))
+
+        val result = pipeline.generateChapter("p-1", plan.id)
+        assertTrue(result.exceptionOrNull()?.message.orEmpty(), result.isSuccess)
+        // 契约节点被回填进计划，下一次生成不必再自愈
+        val healed = db.chapterPlanDao().getById(plan.id)!!
+        assertTrue(healed.nodeIds.isNotEmpty())
+        // 讲解段落真实关联上了知识点：正常发布，而不是降级待复核
+        assertEquals(ChapterStatus.PUBLISHED, healed.status)
+    }
+
+    /** 计划与契约都拿不出节点：调模型之前就失败，不白扔一次上万 token 的正文调用 */
+    @Test
+    fun generateChapter_noNodesAnywhere_failsBeforeModelCall() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        RouteStubs.outlineChapterCount = 1
+        pipeline.generateStoryBible("p-1")
+        val plan = db.chapterPlanDao().getByProject("p-1").first()
+        // nodeIds 与契约一起清空：模拟「规划数据不完整」的终态
+        db.chapterPlanDao().upsert(plan.copy(nodeIds = emptyList(), contractJson = ""))
+
+        val result = pipeline.generateChapter("p-1", plan.id)
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("没有关联任何知识点"))
+        // 没有烧模型调用：正文一次都没请求过
+        assertNull(fakeRouter.chapterRole)
+        assertEquals(ChapterStatus.FAILED, db.chapterPlanDao().getById(plan.id)?.status)
+    }
+
+    /**
+     * 讲解段落一条都没关联上知识点（relink 也救不回的模型输出）：
+     * 不再拒收整章——正文照常发布、说明写进核验备注、标待复核，
+     * 与「核验带问题发布」同一个处理原则（2026-09-14）。
+     */
+    @Test
+    fun generateChapter_allKnowledgeBlocksUnlinked_publishesWithReviewFlag() = runBlocking {
+        seedProjectWithChunk()
+        pipeline.generateKnowledgeMap("p-1")
+        RouteStubs.outlineChapterCount = 1
+        pipeline.generateStoryBible("p-1")
+        // 模型回传的标题全对不上、正文里也没出现知识点标题
+        fakeRouter.chapterJson = """
+            {"title":"第一章","summary":"老人立下遗嘱后引发纠纷","blocks":[
+              {"type":"STORY","text":"故事往前推了一步。","knowledgeNodeTitles":["幽灵知识点"],"sourceRefs":[]},
+              {"type":"EXPLANATION","text":"这里停下来分辨一处容易混的地方。","knowledgeNodeTitles":["幽灵知识点"],"sourceRefs":[]}
+            ]}
+        """.trimIndent()
+        val plan = db.chapterPlanDao().getByProject("p-1").first()
+
+        val result = pipeline.generateChapter("p-1", plan.id)
+        assertTrue(result.isSuccess)
+        val loaded = db.chapterPlanDao().getById(plan.id)!!
+        assertEquals(ChapterStatus.NEEDS_REVIEW, loaded.status)
+        assertTrue(loaded.verificationNote.orEmpty().contains("没有关联到任何既有知识点"))
+        // 正文可读：已发布成 active 版本，块都在
+        assertTrue(db.chapterVersionDao().getActive(plan.id) != null)
+        assertFalse(db.chapterBlockDao().getAllVersionsByChapter(plan.id).isEmpty())
     }
 
     /** 自动修复：问题定位到真实块时，发布后立刻按既有逐段重写管线修一轮（4B 延伸） */
@@ -628,7 +883,7 @@ class GenerationTest {
             "story_bible" to "[[BIBLE]]",
             "route_outline" to RouteStubs.OUTLINE_TEMPLATE,
             "chapter_contract" to RouteStubs.CONTRACT_TEMPLATE,
-            "chapter" to "[[CHAPTER]]",
+            "chapter" to "[[CHAPTER]] 人物={characters} 设定={world}",
             "verify" to "[[VERIFY]]",
             "verify_model" to "[[VERIFY]]",
             "quiz" to "[[QUIZ]]",
@@ -661,6 +916,9 @@ class GenerationTest {
         var quizRole: ModelRole? = null
         var storyBibleCalls: Int = 0
 
+        /** 最近一次正文调用的完整 user prompt（验证脚手架是否真的喂了进去） */
+        var chapterPromptCapture: String? = null
+
         /** 置 true 时正文生成返回失败，用于验证重写失败的收尾不动旧正文 */
         var failChapterBody: Boolean = false
 
@@ -689,7 +947,7 @@ class GenerationTest {
                     storyBibleJson
                 }
                 request.user.contains("[[CHAPTER]]") -> {
-                    chapterRole = role; chapterJson
+                    chapterRole = role; chapterPromptCapture = request.user; chapterJson
                 }
                 request.user.contains("[[VERIFY]]") -> {
                     verifyRole = role; verifyJson

@@ -41,6 +41,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -87,6 +88,8 @@ private val minuteOptions = listOf(15, 30, 60, 90)
 fun CreateProjectScreen(
     onBack: () -> Unit,
     onCreated: (String) -> Unit,
+    /** 模型还没配置时引导去「我的」页（配置前置引导，别等生成失败才知道） */
+    onGoSettings: () -> Unit = {},
 ) {
     val app = LocalContext.current.applicationContext as Application
     val vm: CreateProjectViewModel = rememberZhishuViewModel { CreateProjectViewModel(app) }
@@ -95,6 +98,7 @@ fun CreateProjectScreen(
     val topic by vm.topic.collectAsStateWithLifecycle()
     val learningGoal by vm.learningGoal.collectAsStateWithLifecycle()
     val sourceMode by vm.sourceMode.collectAsStateWithLifecycle()
+    val configReady by vm.configReady.collectAsStateWithLifecycle()
 
     var showMore by remember { mutableStateOf(false) }
     var showTextDialog by remember { mutableStateOf(false) }
@@ -155,6 +159,35 @@ fun CreateProjectScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp),
         ) {
+            // 建完项目第一步就是调模型开讲；模型还没配就先亮出来，
+            // 配好了这张卡自动消失（比生成失败后再引导少走一趟弯路）
+            if (!configReady) {
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    shape = MaterialTheme.shapes.medium,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "还差一步：配置模型",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                "创建后开始生成需要 API 配置方案，先去「我的」页配好。",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        TextButton(onClick = onGoSettings) { Text("去配置") }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
             // 唯一的必填项
             OutlinedTextField(
                 value = topic,

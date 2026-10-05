@@ -260,6 +260,19 @@ data class VolumeOutlineOutput(
     val volumeTitle: String = "",
     val volumeGoal: String = "",
     val chapters: List<ChapterPlanDto> = emptyList(),
+    /**
+     * 故事舞台（正文脚手架，2026-09 文风修复）。
+     *
+     * 三段式改造后大纲成了故事设定的唯一来源，但原来只出章节计划——
+     * 正文调用里 {world}/{characters}/{style} 三个槽全是空的，模型没有人物可用，
+     * 只能写成无名「他」或「你」的推理独白（samples/20260905 全部如此）。
+     * 三个字段都带默认值：旧模型输出或解码失败时为空，走原有降级文案，不会炸。
+     */
+    val world: String = "",
+    /** 每项一个角色的单行描述：「姓名：身份，性格动机，与这门学科的关系」 */
+    val characters: List<String> = emptyList(),
+    /** 叙事载体的选择理由（风格指令要求模型写，此前模板没给输出位，写了一直被丢掉） */
+    val approach: String = "",
 )
 
 /**

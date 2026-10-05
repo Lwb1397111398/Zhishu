@@ -11,6 +11,7 @@ import com.example.zhishu.search.SourceInput
 import com.example.zhishu.search.WebFetcher
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import java.nio.charset.Charset
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -175,6 +176,41 @@ class ParserTest {
         )
         // 非 PDF 资料没有页码，不假装有
         assertEquals(null, result.chunks.single().pageNumber)
+    }
+
+    /**
+     * GBK/GB18030 编码的文本文件不再乱码（网上下载的中文资料很常见）。
+     *
+     * 原来 `String(bytes, UTF_8)` 的默认替换解码会把整篇变成 U+FFFD 乱码，
+     * 导入「成功」了但正文全是问号。现在 UTF-8 严格解码失败时回退 GB18030，
+     * 正文原样可读。
+     */
+    @Test
+    fun txtFile_gb18030Encoding_fallsBackToReadableText() = runBlocking {
+        val parser = ParserServiceImpl(webFetcher = NoopFetcher())
+        val text = "《民法典》继承编：遗嘱的效力要看立遗嘱的人当时真正的想法。".repeat(20)
+        val gbBytes = text.toByteArray(Charset.forName("GB18030"))
+        val result = parser.parse(
+            projectId = "p-1",
+            input = SourceInput.FileBytes("讲义", "讲义.txt", gbBytes, SourceKind.TEXT),
+        )
+        assertEquals(ParseStatus.PARSED, result.source.parseStatus)
+        assertTrue(result.chunks.first().text.contains("遗嘱的效力"))
+        // 替换符一个都不能有——有就说明走了替换解码而不是兜底
+        assertFalse(result.chunks.any { it.text.contains('\uFFFD') })
+    }
+
+    /** UTF-8 文件不受影响：严格解码路径原样通过，一个字不改 */
+    @Test
+    fun txtFile_utf8_stillDecodesAsBefore() = runBlocking {
+        val parser = ParserServiceImpl(webFetcher = NoopFetcher())
+        val text = "要约是希望与他人订立合同的意思表示。\n".repeat(30)
+        val result = parser.parse(
+            projectId = "p-1",
+            input = SourceInput.FileBytes("讲义", "讲义.txt", text.toByteArray(Charsets.UTF_8), SourceKind.TEXT),
+        )
+        assertEquals(ParseStatus.PARSED, result.source.parseStatus)
+        assertTrue(result.chunks.first().text.contains("要约是希望与他人订立合同"))
     }
 
     /**

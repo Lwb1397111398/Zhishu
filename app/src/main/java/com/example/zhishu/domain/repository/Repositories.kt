@@ -435,4 +435,16 @@ interface SettingsRepository {
 
     /** 一站式取用：该档当前生效的方案，未配置或方案已被删时为 null */
     suspend fun getAssignedProfile(role: ModelRole): ApiProfile?
+
+    /**
+     * 还没配好的模型环节（未选方案，或所选方案的地址/模型名为空）。
+     *
+     * 生成前的前置引导与 Worker 里的失败判定共用同一份判据：
+     * 用户点按钮时就被告知缺什么，而不是等入队后吃一条冷冰冰的失败横幅。
+     */
+    suspend fun missingModelRoles(): List<ModelRole> =
+        ModelRole.entries.filter { role ->
+            val profile = getAssignedProfile(role)
+            profile == null || profile.baseUrl.isBlank() || profile.modelName.isBlank()
+        }
 }

@@ -159,6 +159,21 @@ class OpenAiModelProvider(
      * 引擎的阻塞读，试过，白等）。超时后降级为非流式重发，代价只是重来一次。
      */
     private val firstTokenTimeoutMillis: Long = 90_000,
+
+    /**
+     * 流式请求的「正文硬超时」：距上一条**正文数据**（delta.content /
+     * reasoning_content，SSE 心跳、注释行不算）超过这个时长就放弃这条流。
+     *
+     * 为什么 [firstTokenTimeoutMillis] 管不住它：首字超时靠 OkHttp readTimeout 实现，
+     * 触发条件是「readTimeout 内没有任何字节」；而限流排队的中转站常按固定间隔发
+     * 心跳/注释行（`: keep-alive` 之类）——字节一直在来，readTimeout 永不触发。
+     * 流式客户端又刻意不装总超时（见 defaultStreamClient 注释），这条连接就能
+     * 无限挂下去：界面停在「正在写正文」几十分钟，诊断日志一行都不会落
+     * （调用没返回就没记录）。取 10 分钟：单章正文 1-3 分钟 + 退避重试都在内，
+     * 正常生成不会误伤（正文数据持续在吐就不断清零计时）；真排到队的流通常
+     * 几分钟内开始吐正文。
+     */
+    private val bodyStallHardTimeoutMillis: Long = 10 * 60_000,
     /**
      * 关闭推理模型的思考（Ark thinking:disabled）。样本运行器用：
      * 把 doubao-seed 等推理模型当普通对话模型，避免长思考导致超时与高成本。
@@ -175,6 +190,7 @@ class OpenAiModelProvider(
     init {
         require(socketTimeoutMillis > 0 && requestTimeoutMillis > 0) { "超时必须是正数" }
         require(firstTokenTimeoutMillis > 0) { "首字超时必须是正数" }
+        require(bodyStallHardTimeoutMillis > 0) { "正文硬超时必须是正数" }
     }
 
     private val client: HttpClient = clientOverride ?: defaultClient(socketTimeoutMillis, requestTimeoutMillis)
@@ -399,9 +415,26 @@ class OpenAiModelProvider(
         var usage: UsageDto? = null
         val raw = StringBuilder()
         val dataLines = mutableListOf<String>()
+        // 正文硬超时（见 bodyStallHardTimeoutMillis 注释）：距上一条**正文数据**的
+        // 时长。心跳/注释行不清零它——只收心跳不吐正文的流照样按期判死。
+        // 流式客户端没有总超时（刻意的），这道检查是这类连接唯一的退场机制。
+        val streamStartAt = System.currentTimeMillis()
+        var lastBodyDataAt = streamStartAt
         try {
             while (!channel.isClosedForRead) {
                 val line = channel.readUTF8Line() ?: break
+                // 距上一条正文数据超过硬超时 = 这条流只剩心跳在吊命。检查必须在
+                // 任何 continue 之前做：注释行（: keep-alive）和空 choices 的数据行
+                // 都不算正文，若先 continue 再查，这些行就永远绕过检查。
+                if (System.currentTimeMillis() - lastBodyDataAt > bodyStallHardTimeoutMillis) {
+                    // 心跳一直在来（readTimeout 因此不触发）、正文却迟迟不吐：
+                    // 这不是能等出结果的流，立即降级非流式，不再无限挂着。
+                    onRawResponse(raw.toString())
+                    throw StreamFallback(
+                        "流式连接 ${(bodyStallHardTimeoutMillis / 1000).coerceAtLeast(1)} 秒没有收到任何正文内容" +
+                            "（只有心跳，通常在限流排队），已放弃该连接。",
+                    )
+                }
                 raw.appendLine(line)
                 if (!line.startsWith("data:")) continue
                 val payload = line.removePrefix("data:").trim()
@@ -413,6 +446,9 @@ class OpenAiModelProvider(
                 choice.finishReason?.let { finishReason = it }
                 choice.delta?.content?.let { content.append(it) }
                 choice.delta?.reasoningContent?.let { reasoning.append(it) }
+                if (choice.delta?.content != null || choice.delta?.reasoningContent != null) {
+                    lastBodyDataAt = System.currentTimeMillis()
+                }
             }
         } catch (e: StreamFallback) {
             onRawResponse(raw.toString())

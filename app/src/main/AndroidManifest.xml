@@ -23,6 +23,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- Android 13 起发通知需要它。被拒绝时生成照常进行，只是收不到通知（第二阶段） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 应用自更新：覆盖安装下载好的新 APK 需要声明；首次安装时系统会让用户确认 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name=".ZhishuApp"
@@ -55,6 +57,27 @@
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
+
+        <!--
+          生成会话的保活前台服务：入队时（用户还在前台）就建立保护，
+          整条会话期间进程都持有前台服务，链上后续 Worker 在后台不再裸奔。
+          与 WorkManager 自带前台服务同一类型（dataSync），权限复用上面两条。
+        -->
+        <service
+            android:name=".worker.GenerationKeeperService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 应用自更新：把下载到 cacheDir/updates/ 的安装包以 content:// 给系统安装器 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.update"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_file_paths" />
+        </provider>
     </application>
 
 </manifest>

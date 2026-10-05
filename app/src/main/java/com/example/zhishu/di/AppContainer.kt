@@ -102,9 +102,17 @@ class AppContainer(context: Context) {
         quizRepository = quizRepository,
         reviewRepository = reviewRepository,
         spacedReviewEnabled = { learningPrefs.spacedReviewEnabled.value },
+        autoHandleIssues = { learningPrefs.autoHandleIssues.value },
     )
 
     val transfer: TransferManager = TransferManager(this)
+
+    /**
+     * 生成会话的 token 总账（3.2）。链上每个阶段的 Worker 结束时往自己的
+     * session 键里加一笔，链尾总结读出来报总账。只在进程内存里——进程被杀
+     * 账就没了，通知里相应说「约」；不值得为它落库。
+     */
+    val sessionTokenUsage = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     fun encryptApiKey(plain: String): String =
         keyCipher.encrypt(ConfiguredModelRouter.KEY_ALIAS, plain)

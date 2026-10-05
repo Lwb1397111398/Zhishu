@@ -5,6 +5,7 @@ import com.example.zhishu.domain.model.ApiProfile
 import com.example.zhishu.domain.model.ModelRole
 import com.example.zhishu.domain.repository.SettingsRepository
 import com.example.zhishu.security.KeyCipher
+import kotlin.coroutines.coroutineContext
 
 /**
  * 按「角色 → 分配的配置方案」读取用户配置后构造 Provider。
@@ -49,6 +50,9 @@ class ConfiguredModelRouter(
                 onAttempt(attempt)
             },
         )
+        // 挂了用量追踪器的调用方（生成 Worker）会在进度条与完成通知里显示累计值。
+        // 没挂就什么都不发生——列表查询、连通性测试这些调用方零改动
+        coroutineContext[UsageTrackerElement]?.accumulator?.add(totalUsage.totalTokens)
         logOutcome(role, request, result, totalUsage, System.currentTimeMillis() - startedAt)
         return result
     }

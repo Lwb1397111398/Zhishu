@@ -55,6 +55,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
@@ -175,7 +176,10 @@ fun ProjectDetailScreen(
 
     LaunchedEffect(message) {
         message?.let {
-            snackbarHostState.showSnackbar(it)
+            // 带动作的消息（如配置引导的「去配置」）点了直接跳转
+            val action = vm.messageAction.value
+            val result = snackbarHostState.showSnackbar(it, actionLabel = action)
+            if (result == SnackbarResult.ActionPerformed) onOpenSettings()
             vm.consumeMessage()
         }
     }
@@ -261,6 +265,7 @@ fun ProjectDetailScreen(
                         bible = bible,
                         onOpenReader = onOpenReader,
                         onOpenQuiz = onOpenQuiz,
+                        onOpenTrustCenter = { onOpenTrustCenter(projectId) },
                     )
                 }
             }
@@ -1370,6 +1375,7 @@ private fun OutlineTab(
     bible: StoryBible?,
     onOpenReader: (String, String?) -> Unit,
     onOpenQuiz: (String) -> Unit,
+    onOpenTrustCenter: () -> Unit = {},
 ) {
     var editPlan by remember { mutableStateOf<ChapterPlan?>(null) }
     var showGenre by remember { mutableStateOf(false) }
@@ -1399,6 +1405,8 @@ private fun OutlineTab(
     // 进度按「正文可读」算，不因为缺自测题就少算一章
     val published = plans.count { it.isReadable }
     val needsAttention = plans.count { it.status == ChapterStatus.NEEDS_REVIEW }
+    // 全书当前正文上还没处理的问题总数。已接受/已修的不算——那两种都已有结论（4B）
+    val openIssueTotal = issues.values.sumOf { list -> list.count { it.resolution.isOpen } }
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         if (plans.isEmpty()) {
@@ -1442,25 +1450,29 @@ private fun OutlineTab(
             }
             if (needsAttention > 0) {
                 Spacer(Modifier.height(8.dp))
-                Card(
-                    colors = androidx.compose.material3.CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer,
-                    ),
+                // 一行中性摘要替代整块红卡：待复核不该霸占整页视线。
+                // 问题的全书明细在可信度中心（「查看」），批量入口保留但降为小字
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth(),
                 ) {
                     Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
+                        Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         // needsAttention 只数待复核章（正文可读、等逐条确认），
                         // 缺自测题的章不在此列，也别提「补测验」误导用户点整章重写
                         Text(
-                            "有 $needsAttention 章待复核（正文可读，进章节逐条处理）",
+                            buildString {
+                                append("$needsAttention 章待复核")
+                                if (openIssueTotal > 0) append(" · $openIssueTotal 个问题")
+                            },
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.weight(1f),
                         )
+                        TextButton(onClick = onOpenTrustCenter) { Text("查看") }
                         TextButton(onClick = { showRetryAllConfirm = true }) { Text("全部重写") }
                     }
                 }
@@ -1976,41 +1988,63 @@ private fun ChapterPlanCard(
                     )
                 }
             }
-            // 展示核验说明，用户才知道为什么待复核（B3）
+            // 展示核验说明（B3）。还有待处理问题时收敛成下面那行可点摘要——
+            // 整段红字把讲述路线页糊成一面墙，明细本来就在问题清单里。
+            // 说明只在「核验没跑完」这类没有问题清单可看的场景保留，
+            // 且改用中性底色：核验没跑完不是正文出错，问题清单被处理完之后
+            // 遗留的旧摘要也不该继续红着。
             // 核验说明只讲正文的问题。出题失败的原因单独放在 quizNote 里，
             // 免得「测验没出来」被当成「正文有问题」
-            if (plan.verificationNote.isNotBlank()) {
+            if (openIssues.isEmpty() &&
+                plan.verificationNote.isNotBlank() &&
+                !plan.verificationNote.startsWith("核验发现")
+            ) {
                 Spacer(Modifier.height(6.dp))
                 Surface(
-                    color = MaterialTheme.colorScheme.errorContainer,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = MaterialTheme.shapes.small,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
                         plan.verificationNote,
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(8.dp),
                     )
                 }
             }
-            // 逐条的问题记录（4B）。这里只给一句概览，详情在问题列表里。
+            // 逐条的问题记录（4B）：一行摘要，点开进逐条处理面板。
             // 关键是把「能不能只改那几段」说出来——它决定用户点哪个按钮
             if (openIssues.isNotEmpty()) {
                 val located = openIssues.count { it.isBlockScoped }
                 Spacer(Modifier.height(6.dp))
-                Text(
-                    buildString {
-                        append("核验待处理 ${openIssues.size} 条")
-                        if (located > 0) {
-                            append("，其中 $located 条能定位到具体段落，可只重写这几段")
-                        } else {
-                            append("，都没能定位到具体段落，只能整章重新生成")
-                        }
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.tertiary,
-                )
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        Modifier
+                            .clickable(onClick = onOpenIssues)
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            buildString {
+                                append("核验待处理 ${openIssues.size} 条")
+                                if (located > 0) append(" · 可只重写涉及的段落")
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            "逐条处理",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
             }
             // 重新生成没成功时如实说一句：正文还是原来那一版（第三阶段 3A）。
             // 用中性底色而不是错误红——这一章本身好着呢，只是新写的那一版没通过

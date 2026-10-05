@@ -12,13 +12,12 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -67,10 +66,13 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.zhishu.domain.model.Project
 import com.example.zhishu.domain.model.ProjectStatus
 import com.example.zhishu.domain.model.ReviewItem
@@ -100,17 +102,42 @@ private fun projectStatusLine(status: ProjectStatus): String = when (status) {
     ProjectStatus.READY -> "可阅读"
 }
 
-/** 空书架上的一本简化小书：渐变封面 + 右侧圆角书脊，tilted 时斜靠 */
+/**
+ * 迷你书封：书脊 + 衬线首字，与书架大封面同一套设计语言。
+ * 继续阅读横幅、知识页卡片、空书架插画三处共用，保证一眼认出「这就是那本书」。
+ */
 @Composable
-private fun SimpleBook(width: androidx.compose.ui.unit.Dp, height: androidx.compose.ui.unit.Dp, top: Color, bottom: Color, tilted: Boolean = false) {
+private fun MiniBookCover(
+    palette: CoverPalette,
+    width: Dp,
+    height: Dp,
+    title: String,
+    spine: Dp,
+    modifier: Modifier = Modifier,
+) {
     Box(
-        Modifier
+        modifier
             .width(width)
             .height(height)
-            .rotate(if (tilted) 10f else 0f)
-            .clip(RoundedCornerShape(topEnd = 4.dp, bottomEnd = 4.dp, topStart = 1.dp, bottomStart = 1.dp))
-            .background(Brush.verticalGradient(listOf(top, bottom))),
-    )
+            .shadow(2.dp, RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(4.dp))
+            .background(Brush.verticalGradient(listOf(palette.top, palette.bottom))),
+    ) {
+        SpineBar(palette, spine)
+        if (title.isNotEmpty()) {
+            Text(
+                title.take(1),
+                fontFamily = FontFamily.Serif,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+                // 往右让开书脊：首字在可见封面区里居中，而不是整本书的几何中心
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(start = spine),
+            )
+        }
+    }
 }
 
 /** 程序化封面配色：书名哈希稳定选一组，同一本书重开不变样 */
@@ -135,6 +162,8 @@ fun HomeScreen(
     onCreateProject: () -> Unit,
     onOpenReader: (String, String?) -> Unit,
     onGoReview: () -> Unit,
+    /** 模型还没配置时引导去「我的」页（空书架的配置前置引导） */
+    onGoSettings: () -> Unit = {},
 ) {
     val app = LocalContext.current.applicationContext as Application
     val vm: HomeViewModel = rememberZhishuViewModel { HomeViewModel(app) }
@@ -144,6 +173,8 @@ fun HomeScreen(
     val reviewEnabled by vm.spacedReviewEnabled.collectAsStateWithLifecycle()
     val bookStats by vm.bookStats.collectAsStateWithLifecycle()
     val weekReadCount by vm.weekReadCount.collectAsStateWithLifecycle()
+    val configReady by vm.configReady.collectAsStateWithLifecycle()
+    val backupReminder by vm.backupReminder.collectAsStateWithLifecycle()
     var deleteTarget by remember { mutableStateOf<Project?>(null) }
 
     // 每次回到书架都刷新阅读统计：点书直读靠它找「上次读到的章」，
@@ -178,11 +209,21 @@ fun HomeScreen(
                 verticalArrangement = Arrangement.Center,
             ) {
                 Row(verticalAlignment = Alignment.Bottom) {
-                    SimpleBook(30.dp, 46.dp, Color(0xFF44617B), Color(0xFF24384A))
+                    MiniBookCover(
+                        CoverPalette(Color(0xFF44617B), Color(0xFF24384A)),
+                        30.dp, 46.dp, "", spine = 5.dp,
+                    )
                     Spacer(Modifier.width(6.dp))
-                    SimpleBook(34.dp, 54.dp, Color(0xFFD84315), Color(0xFF7E2A0B))
+                    MiniBookCover(
+                        CoverPalette(Color(0xFFD84315), Color(0xFF7E2A0B)),
+                        34.dp, 54.dp, "", spine = 5.dp,
+                    )
                     Spacer(Modifier.width(6.dp))
-                    SimpleBook(30.dp, 48.dp, Color(0xFF8A6D3B), Color(0xFF54401F), tilted = true)
+                    MiniBookCover(
+                        CoverPalette(Color(0xFF8A6D3B), Color(0xFF54401F)),
+                        30.dp, 48.dp, "", spine = 5.dp,
+                        modifier = Modifier.rotate(10f),
+                    )
                 }
                 Spacer(Modifier.height(28.dp))
                 Text(
@@ -206,12 +247,40 @@ fun HomeScreen(
                 TextButton(onClick = { vm.seedDemo() }) {
                     Text("先看个示例（民法继承案）")
                 }
+                // 配置前置引导：开始之前先把模型配好，别等生成失败才发现
+                if (!configReady) {
+                    Spacer(Modifier.height(20.dp))
+                    Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        shape = MaterialTheme.shapes.medium,
+                    ) {
+                        Column(
+                            Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text(
+                                "还差一步：先配置模型",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                "生成书籍需要 API 配置方案（模型 + Key）。",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            TextButton(onClick = onGoSettings) { Text("去配置") }
+                        }
+                    }
+                }
             }
         } else {
-            // 书架：继续阅读/复习横幅各占整行，书卡自适应列宽（手机 2 列、平板 3-4 列），
-            // 点封面直读、长按管理
+            // 书架：继续阅读/复习横幅各占整行，书卡竖排（手机 3 列、平板更多列），
+            // 点封面直读、长按管理。minSize 100dp 是为了在 360dp 宽的机器上
+            // 也能排出 3 列——108dp 只能排出 2 列
             LazyVerticalGrid(
-                columns = GridCells.Adaptive(minSize = 150.dp),
+                columns = GridCells.Adaptive(minSize = 100.dp),
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding),
@@ -219,8 +288,39 @@ fun HomeScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
+                // 备份提醒（3.3）：写了章却超两周没导出。温和一条，可关，
+                // 关掉后本次运行不再弹；完成备份后条件自然不再成立
+                if (backupReminder) {
+                    item(key = "__backup__", span = { GridItemSpan(maxLineSpan) }) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                            shape = MaterialTheme.shapes.medium,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Row(
+                                Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "该备份一下了",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        "已经写了些内容但超过两周没有导出。备份一份，换手机或误删也不怕。",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
+                                TextButton(onClick = onGoSettings) { Text("去备份") }
+                                TextButton(onClick = { vm.dismissBackupReminder() }) { Text("知道了") }
+                            }
+                        }
+                    }
+                }
                 continueEntry?.let { entry ->
-                    item(key = "__continue__", span = { GridItemSpan(2) }) {
+                    item(key = "__continue__", span = { GridItemSpan(maxLineSpan) }) {
                         ContinueReadingCard(
                             entry = entry,
                             stat = bookStats[entry.project.id],
@@ -231,7 +331,7 @@ fun HomeScreen(
                 // 「今日复习」只在用户主动开启间隔复习后出现，
                 // 默认不给阅读加一层待办感（复习页仍可从「我的」进入）
                 if (reviewEnabled) {
-                    item(key = "__review__", span = { GridItemSpan(2) }) {
+                    item(key = "__review__", span = { GridItemSpan(maxLineSpan) }) {
                         Card(
                             onClick = onGoReview,
                             colors = CardDefaults.cardColors(
@@ -266,7 +366,7 @@ fun HomeScreen(
                         }
                     }
                 }
-                item(key = "__shelf_title__", span = { GridItemSpan(2) }) {
+                item(key = "__shelf_title__", span = { GridItemSpan(maxLineSpan) }) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         SectionTitle("我的书架", modifier = Modifier.weight(1f))
                         if (weekReadCount > 0) {
@@ -290,7 +390,7 @@ fun HomeScreen(
                         onDelete = { deleteTarget = project },
                     )
                 }
-                item(key = "__bottom__", span = { GridItemSpan(2) }) {
+                item(key = "__bottom__", span = { GridItemSpan(maxLineSpan) }) {
                     Spacer(Modifier.height(80.dp))
                 }
             }
@@ -326,23 +426,14 @@ private fun ContinueReadingCard(
             .padding(14.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            // 迷你书封：带书脊，与书架封面同一套配色，一眼认出是哪本书
-            Box(
-                Modifier
-                    .width(46.dp)
-                    .height(64.dp)
-                    .clip(RoundedCornerShape(5.dp))
-                    .background(Brush.verticalGradient(listOf(palette.top, palette.bottom))),
-            ) {
-                SpineBar(palette, 9.dp)
-                Text(
-                    entry.project.title.take(1),
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White,
-                    modifier = Modifier.align(Alignment.Center),
-                )
-            }
+            // 迷你书封：带书脊、衬线首字，与书架封面同一套设计
+            MiniBookCover(
+                palette = palette,
+                width = 46.dp,
+                height = 64.dp,
+                title = entry.project.title,
+                spine = 9.dp,
+            )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(
@@ -451,10 +542,12 @@ private fun BookCard(
         Box {
             Box(
                 Modifier
+                    // 标准书比例 2:3：原来的「宽度撑满 + 高度写死 170dp」把封面拉成
+                    // 近方形，是「书太宽」的根源；竖开的书才有书的样子
                     .fillMaxWidth()
-                    .height(170.dp)
-                    .shadow(3.dp, RoundedCornerShape(8.dp))
-                    .clip(RoundedCornerShape(8.dp))
+                    .aspectRatio(2f / 3f)
+                    .shadow(3.dp, RoundedCornerShape(6.dp))
+                    .clip(RoundedCornerShape(6.dp))
                     .background(Brush.verticalGradient(listOf(palette.top, palette.bottom)))
                     .combinedClickable(
                         onClick = {
@@ -463,71 +556,93 @@ private fun BookCard(
                         onLongClick = { menuExpanded = true },
                     ),
             ) {
-                // 实体书脊（方案 A）：深色条 + 右缘高光，像一本立着的真书
-                SpineBar(palette, 14.dp)
-                // 右下角两道圆弧纹样：半透明细圆，给渐变底一点层次，不抢书名
+                // 书脊收窄：比例更接近真书
+                SpineBar(palette, 10.dp)
+                // 经典书装内框双线（避开书脊），替代原来右下角的圆弧纹样
                 Box(
                     Modifier
-                        .align(Alignment.BottomEnd)
-                        .offset(x = 34.dp, y = 34.dp)
-                        .size(120.dp)
-                        .border(2.dp, Color.White.copy(alpha = 0.12f), CircleShape),
-                )
-                Box(
-                    Modifier
-                        .align(Alignment.BottomEnd)
-                        .offset(x = 10.dp, y = 10.dp)
-                        .size(72.dp)
-                        .border(1.5.dp, Color.White.copy(alpha = 0.10f), CircleShape),
+                        .fillMaxSize()
+                        .padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
+                        .border(1.dp, Color.White.copy(alpha = 0.32f))
+                        .padding(2.dp)
+                        .border(1.dp, Color.White.copy(alpha = 0.14f)),
                 )
                 Column(
-                    Modifier.padding(
-                        start = 26.dp, // 避开书脊
-                        end = 14.dp,
-                        top = 14.dp,
-                        bottom = 14.dp,
-                    ),
+                    Modifier
+                        .fillMaxSize()
+                        .padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
+                        .padding(horizontal = 7.dp, vertical = 9.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
+                    // 牌记：顶部居中 + 宽字距，像丛书的出版社标记
                     Text(
-                        "知述",
+                        "知 述",
                         style = MaterialTheme.typography.labelSmall,
-                        color = Color.White.copy(alpha = 0.65f),
+                        letterSpacing = 2.sp,
+                        color = Color.White.copy(alpha = 0.6f),
                     )
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.weight(1f))
+                    // 书名：衬线体置上三分之一，像一册正经的书
                     Text(
                         project.title,
-                        style = MaterialTheme.typography.titleMedium,
+                        fontFamily = FontFamily.Serif,
+                        style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center,
+                        lineHeight = 20.sp,
                         color = Color.White,
-                        maxLines = 3,
+                        maxLines = 4,
                         overflow = TextOverflow.Ellipsis,
                     )
                     if (project.topic.isNotBlank() && project.topic != project.title) {
                         Spacer(Modifier.height(4.dp))
                         Text(
                             project.topic,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color.White.copy(alpha = 0.85f),
+                            style = MaterialTheme.typography.labelSmall,
+                            textAlign = TextAlign.Center,
+                            color = Color.White.copy(alpha = 0.75f),
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    Spacer(Modifier.weight(1f))
-                    // 底部细线 + 讲法：扉页题字的收法
+                    Spacer(Modifier.weight(1.3f))
+                    // 扉页题字收法：细线 + 讲法
                     Box(
                         Modifier
                             .fillMaxWidth()
                             .height(1.dp)
                             .background(Color.White.copy(alpha = 0.3f)),
                     )
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(5.dp))
                     Text(
                         project.effectiveGenre,
                         style = MaterialTheme.typography.labelSmall,
                         color = Color.White.copy(alpha = 0.8f),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
                     )
+                    // 底边进度条：写到哪读到哪一眼可见；还没开写的书不画，保持纯封面
+                    val progressFraction = stat
+                        ?.takeIf { it.totalChapters > 0 }
+                        ?.let { it.publishedChapters.toFloat() / it.totalChapters }
+                    if (progressFraction != null) {
+                        Spacer(Modifier.height(5.dp))
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .height(3.dp)
+                                .clip(RoundedCornerShape(1.5.dp))
+                                .background(Color.White.copy(alpha = 0.22f)),
+                        ) {
+                            Box(
+                                Modifier
+                                    .fillMaxWidth(progressFraction.coerceIn(0.03f, 1f))
+                                    .fillMaxHeight()
+                                    .background(Color.White),
+                            )
+                        }
+                    }
                 }
             }
             DropdownMenu(
@@ -560,7 +675,8 @@ private fun BookCard(
             }
         }
         Spacer(Modifier.height(6.dp))
-        // 进度/状态行：有章节讲进度，没章节讲状态；更新时间收敛在这行小字里
+        // 进度/状态行：有章节讲进度，没章节讲状态；更新时间收敛在这行小字里。
+        // 3 列书卡比较窄，允许折两行，时间不丢
         Text(
             buildString {
                 if (stat != null && stat.totalChapters > 0) {
@@ -573,7 +689,7 @@ private fun BookCard(
             },
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
+            maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
     }
@@ -736,25 +852,16 @@ private fun KnowledgeProjectCard(
                 .padding(14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // 迷你书封（带书脊）：与书架封面同一套配色——一眼认出「这就是那本书」，
+            // 迷你书封（带书脊 + 衬线首字）：与书架封面同一套设计——一眼认出「这就是那本书」，
             // 替掉原来那个学校图标；右侧也不再挂「N 个知识点」——
             // 数数字给人「好多要学」的压力，读书的人不需要它
-            Box(
-                Modifier
-                    .width(40.dp)
-                    .height(54.dp)
-                    .clip(RoundedCornerShape(5.dp))
-                    .background(Brush.verticalGradient(listOf(palette.top, palette.bottom))),
-            ) {
-                SpineBar(palette, 8.dp)
-                Text(
-                    project.title.take(1),
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White,
-                    modifier = Modifier.align(Alignment.Center),
-                )
-            }
+            MiniBookCover(
+                palette = palette,
+                width = 40.dp,
+                height = 54.dp,
+                title = project.title,
+                spine = 8.dp,
+            )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(

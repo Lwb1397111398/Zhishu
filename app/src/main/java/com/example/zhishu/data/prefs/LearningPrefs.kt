@@ -52,6 +52,44 @@ class LearningPrefs(context: Context) {
         _generationAutoAdvance.value = enabled
     }
 
+    /**
+     * 核验问题自动处理开关（默认**开**）。
+     *
+     * 开启后核验发现的问题不再停在「等人逐条确认」：自动局部重写最多
+     * 两轮（每轮仍受块数护栏约束），修不掉的「文风类」问题自动标记不用改——
+     * 它们是程序自检出来的表达问题，不伤知识准确性，留在待复核清单里只会
+     * 把真正要人看的事实问题淹没。事实类问题（资料不支持/矛盾/编造……）
+     * 无论开关如何都保留，绝不替用户做「不用改」的决定。
+     *
+     * 关闭后回到旧行为：只自动重写一轮，修不掉就全部留给用户逐条处理。
+     */
+    private val _autoHandleIssues =
+        MutableStateFlow(prefs.getBoolean(KEY_AUTO_HANDLE_ISSUES, DEFAULT_AUTO_HANDLE_ISSUES))
+
+    val autoHandleIssues: StateFlow<Boolean> = _autoHandleIssues.asStateFlow()
+
+    fun setAutoHandleIssues(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_AUTO_HANDLE_ISSUES, enabled).apply()
+        _autoHandleIssues.value = enabled
+    }
+
+    // --- 备份提醒（3.3）---
+
+    /**
+     * 上次成功导出备份的时间戳；0 表示从未备份过。
+     *
+     * 导出成功时由设置页写入。书架据此判断「写了东西却很久没备份」，
+     * 温和地提醒一次（可关，本次运行不再弹）。
+     */
+    private val _lastBackupAt = MutableStateFlow(prefs.getLong(KEY_LAST_BACKUP_AT, 0L))
+
+    val lastBackupAt: StateFlow<Long> = _lastBackupAt.asStateFlow()
+
+    fun setLastBackupAt(timestamp: Long) {
+        prefs.edit().putLong(KEY_LAST_BACKUP_AT, timestamp).apply()
+        _lastBackupAt.value = timestamp
+    }
+
     // --- 阅读器偏好（小说模式）。三项都记住，下次打开还是用户自己的习惯 ---
 
     private val _readerMode = MutableStateFlow(
@@ -106,9 +144,36 @@ class LearningPrefs(context: Context) {
         _readerSerif.value = serif
     }
 
+    // --- 应用自更新 ---
+
+    /**
+     * 启动时自动检查更新（默认**开**）。
+     *
+     * 打开后 App 启动会静默查一次 GitHub Releases（24 小时节流），
+     * 有新版本才弹窗；出错一律安静，不打扰阅读。
+     */
+    private val _updateAutoCheck =
+        MutableStateFlow(prefs.getBoolean(KEY_UPDATE_AUTO_CHECK, DEFAULT_UPDATE_AUTO_CHECK))
+
+    val updateAutoCheck: StateFlow<Boolean> = _updateAutoCheck.asStateFlow()
+
+    fun setUpdateAutoCheck(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_UPDATE_AUTO_CHECK, enabled).apply()
+        _updateAutoCheck.value = enabled
+    }
+
+    /** 上一次真正联网检查更新的时间戳；0 表示从未检查过 */
+    fun updateLastCheckedMs(): Long = prefs.getLong(KEY_UPDATE_LAST_CHECKED, 0L)
+
+    fun markUpdateChecked() {
+        prefs.edit().putLong(KEY_UPDATE_LAST_CHECKED, System.currentTimeMillis()).apply()
+    }
+
     companion object {
         const val DEFAULT_SPACED_REVIEW = false
         const val DEFAULT_AUTO_ADVANCE = true
+        const val DEFAULT_AUTO_HANDLE_ISSUES = true
+        const val DEFAULT_UPDATE_AUTO_CHECK = true
         val DEFAULT_READER_MODE = ReaderMode.PAGER
         const val DEFAULT_FONT_INDEX = 1
         val DEFAULT_READER_PAPER = ReaderPaper.CREAM
@@ -116,10 +181,14 @@ class LearningPrefs(context: Context) {
         private const val PREFS_NAME = "zhishu_learning_prefs"
         private const val KEY_SPACED_REVIEW = "spaced_review_enabled"
         private const val KEY_AUTO_ADVANCE = "generation_auto_advance"
+        private const val KEY_AUTO_HANDLE_ISSUES = "auto_handle_issues"
+        private const val KEY_LAST_BACKUP_AT = "last_backup_at"
         private const val KEY_READER_MODE = "reader_mode"
         private const val KEY_READER_FONT = "reader_font_size"
         private const val KEY_READER_PAPER = "reader_paper"
         private const val KEY_READER_SERIF = "reader_serif"
+        private const val KEY_UPDATE_AUTO_CHECK = "update_auto_check"
+        private const val KEY_UPDATE_LAST_CHECKED = "update_last_checked_ms"
     }
 }
 

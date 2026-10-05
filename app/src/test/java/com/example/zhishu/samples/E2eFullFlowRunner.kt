@@ -181,7 +181,7 @@ class E2eFullFlowRunner {
                     quizRepository = DefaultQuizRepository(db.quizDao(), db.answerRecordDao()),
                     reviewRepository = DefaultReviewRepository(db.reviewItemDao()),
                     spacedReviewEnabled = { false },
-                    // 其余开关全部走生产默认：requireChapterContracts={true}、requireBlockNodeLinks={true}
+                    // 其余开关全部走生产默认：requireChapterContracts={true}
                 )
 
                 // ---- 步骤 1：知识主干（骨架→逐链→全局审计）----
@@ -242,7 +242,10 @@ class E2eFullFlowRunner {
                     val chMillis = System.currentTimeMillis() - t0
                     // 含被废弃版本：自动修复失败的草稿会被 abandon，正文仍在库里
                     val blocks = db.chapterBlockDao().getAllVersionsByChapter(plan.id)
-                    val wordCount = blocks.filter { it.blockType.name == "PROSE" }.sumOf { it.text.length }
+                    // 所有块（STORY/EXPLANATION/KEY_POINT/FACT…）都是正文文字。
+                    // 原来过滤 blockType == "PROSE"——这个类型根本不存在，
+                    // 字数恒为 0，样章质量报告一直失真
+                    val wordCount = blocks.sumOf { it.text.length }
                     // 核验发现问题 = 正文已发布（可读）、问题已落库，章节标待复核——
                     // 设计内的降级路径，不算流程失败；修没修干净由最终章节状态表达
                     val chError = chResult.exceptionOrNull()?.message.orEmpty()
