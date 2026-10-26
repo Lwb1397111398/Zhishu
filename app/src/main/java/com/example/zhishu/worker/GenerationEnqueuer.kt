@@ -69,7 +69,7 @@ object GenerationEnqueuer {
     /** 取消整条项目级链，包括还没轮到的章节 */
     fun cancel(context: Context, projectId: String) {
         GenerationScheduler.cancel(context, projectId)
-        GenerationNotifier.clearProgress(context)
+        GenerationNotifier.clearProgress(context, projectId)
     }
 
     /**

@@ -37,22 +37,29 @@ import com.example.zhishu.ai.GenerationLog
  *
  * ## 退场
  *
- * 盯着项目唯一链的 WorkInfo：链上**全部**工作都进入终态（成功 / 失败 / 取消）才
- * stopSelf。自动续订（appendAutoChunk / appendVolumePlan）会先挂上新工作再结束当前
+ * 每个在保项目各挂一个观察器盯着它的项目唯一链：某条链上**全部**工作都进入终态
+ * （成功 / 失败 / 取消）就撤掉那条观察；所有项目的链都收尾了才 stopSelf。
+ * 两本书同时生成是合法状态，任何一条链收尾都不能提前停掉还在跑的另一条。
+ * 自动续订（appendAutoChunk / appendVolumePlan）会先挂上新工作再结束当前
  * Worker，所以观察器看到的链不会在续订间隙「暂时全完成」。这样成功收尾、失败、
  * 用户取消每条路都会退场，不需要各出口记得叫停；再加一条与 dataSync 前台服务
  * 时长上限对齐的看门狗兜底，防止观察器失效导致服务滞留。
  */
 class GenerationKeeperService : Service() {
 
-    private var projectId: String = ""
-    private var workObserver: Observer<List<WorkInfo>>? = null
+    /**
+     * 每个在保项目的观察器：项目 ID → 它唯一链的 WorkInfo 观察者。
+     * 两本书同时生成是合法状态（各自的项目级唯一链互不冲突），服务必须
+     * 同时保住两条链——单一 projectId 变量的旧设计会被第二个项目覆盖，
+     * 旧链收尾时 stopSelf 会把还在跑的新项目的前台保护一起收掉。
+     */
+    private val watchers = mutableMapOf<String, Observer<List<WorkInfo>>>()
     private val watchdog = Handler(Looper.getMainLooper())
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        projectId = intent?.getStringExtra(GenerationNotifier.EXTRA_PROJECT_ID).orEmpty()
+        val projectId = intent?.getStringExtra(GenerationNotifier.EXTRA_PROJECT_ID).orEmpty()
         if (projectId.isBlank()) {
             stopSelf()
             return START_NOT_STICKY
@@ -62,26 +69,28 @@ class GenerationKeeperService : Service() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ServiceCompat.startForeground(
                     this,
-                    GenerationNotifier.NOTIFICATION_ID_KEEPER,
+                    GenerationNotifier.keeperNotificationId(projectId),
                     notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
                 )
             } else {
-                startForeground(GenerationNotifier.NOTIFICATION_ID_KEEPER, notification)
+                startForeground(GenerationNotifier.keeperNotificationId(projectId), notification)
             }
         }
-        watchUniqueWork()
+        watchUniqueWork(projectId)
+        // 看门狗按「最后一次入队」重算：每次新会话开始都是新的一轮 6 小时
+        watchdog.removeCallbacksAndMessages(null)
         watchdog.postDelayed({ stopSelf() }, WATCHDOG_MILLIS)
         return START_NOT_STICKY
     }
 
-    /** 链上全部工作终态即退场；顺带把运行中 Worker 上报的进度映到通知上 */
-    private fun watchUniqueWork() {
+    /** 链上全部工作终态即撤掉该项目的观察；所有项目的链都收尾了才退场 */
+    private fun watchUniqueWork(projectId: String) {
         val name = GenerationWorker.uniqueWorkName(projectId)
         val observer = Observer<List<WorkInfo>> { infos ->
             if (infos.isEmpty()) return@Observer
             if (infos.all { it.state.isFinished }) {
-                stopSelf()
+                finishWatching(projectId)
                 return@Observer
             }
             val running = infos.firstOrNull { it.state == WorkInfo.State.RUNNING }
@@ -94,7 +103,14 @@ class GenerationKeeperService : Service() {
                 total = progress?.getInt(GenerationWorker.KEY_PROGRESS_TOTAL, 0) ?: 0,
             )
         }
-        workObserver = observer
+        watchers.put(projectId, observer)?.let { stale ->
+            // 同项目重复挂观察（理论上 KEEP 策略挡住了，防御式处理）：先撤旧的
+            runCatching {
+                WorkManager.getInstance(this)
+                    .getWorkInfosForUniqueWorkLiveData(name)
+                    .removeObserver(stale)
+            }
+        }
         runCatching {
             WorkManager.getInstance(this)
                 .getWorkInfosForUniqueWorkLiveData(name)
@@ -106,16 +122,30 @@ class GenerationKeeperService : Service() {
         }
     }
 
+    /** 一个项目的链收尾：撤观察；观察表清空说明没有任何要保的链，服务退场 */
+    private fun finishWatching(projectId: String) {
+        val observer = watchers.remove(projectId) ?: return
+        runCatching {
+            WorkManager.getInstance(this)
+                .getWorkInfosForUniqueWorkLiveData(GenerationWorker.uniqueWorkName(projectId))
+                .removeObserver(observer)
+        }
+        if (watchers.isEmpty()) stopSelf()
+    }
+
     override fun onDestroy() {
         watchdog.removeCallbacksAndMessages(null)
-        workObserver?.let { observer ->
-            runCatching {
-                WorkManager.getInstance(this)
-                    .getWorkInfosForUniqueWorkLiveData(GenerationWorker.uniqueWorkName(projectId))
-                    .removeObserver(observer)
+        val workManager = runCatching { WorkManager.getInstance(this) }.getOrNull()
+        watchers.forEach { (projectId, observer) ->
+            workManager?.let {
+                runCatching {
+                    it.getWorkInfosForUniqueWorkLiveData(
+                        GenerationWorker.uniqueWorkName(projectId),
+                    ).removeObserver(observer)
+                }
             }
         }
-        workObserver = null
+        watchers.clear()
         super.onDestroy()
     }
 

@@ -171,7 +171,7 @@ class GenerationUiStateTest {
             outcome = GenerationOutcome.COMPLETED,
             detail = "已完成 3/3 章",
         )
-        GenerationNotifier.clearProgress(context)
+        GenerationNotifier.clearProgress(context, "p-1")
         GenerationNotifier.ensureChannels(context)
     }
 

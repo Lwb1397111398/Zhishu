@@ -37,20 +37,31 @@ internal object GenerationNotifier {
     /** 结果通知渠道。默认优先级，用户会看到一条可点开的总结。 */
     private const val CHANNEL_RESULT = "generation_result"
 
-    /** 前台通知固定用这个 ID，多章串行时复用同一条，不会堆一屏 */
-    private const val NOTIFICATION_ID_PROGRESS = 4101
+    /*
+     * 通知 ID 按项目分配：三类各占一段互不重叠的区间，段内用项目 ID 的哈希
+     * 取 8192 个槽。固定 ID 在单项目时代是「多章串行只刷一条」的手段，但
+     * 两本书同时生成时会互相覆盖——更糟的是前台服务结束撤通知是按 ID 撤的，
+     * 会把另一个项目的前台通知一起撤掉，令那个前台服务「无通知可显示」。
+     * 槽位碰撞的概率约 0.01%（1/8192 每对），碰撞后果也只是两条通知互盖，无害。
+     */
+    private const val ID_SPAN = 0x1FFF
+    private const val PROGRESS_ID_BASE = 410_100
+    private const val KEEPER_ID_BASE = 420_100
+    private const val RESULT_ID_BASE = 430_100
+
+    /** 正在生成的前台通知 ID：同项目多章串行复用同一条，不同项目互不干扰 */
+    fun progressNotificationId(projectId: String): Int =
+        PROGRESS_ID_BASE + (projectId.hashCode() and ID_SPAN)
 
     /**
-     * 保活服务（[GenerationKeeperService]）的前台通知 ID。
+     * 保活服务（[GenerationKeeperService]）的前台通知 ID，按项目分配。
      *
      * 与进度通知分开：两者可能同时存在（Worker 前台化成功 + 保活服务还在），
      * 共用 ID 会互相覆盖——Worker 结束时 WorkManager 撤通知会把保活服务的
      * 通知一起撤掉，前台服务却没有通知可显示。
      */
-    const val NOTIFICATION_ID_KEEPER = 4102
-
-    /** 结果通知按项目分配 ID，不同项目的结果不互相覆盖 */
-    private const val NOTIFICATION_ID_RESULT_BASE = 4200
+    fun keeperNotificationId(projectId: String): Int =
+        KEEPER_ID_BASE + (projectId.hashCode() and ID_SPAN)
 
     fun ensureChannels(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -86,7 +97,7 @@ internal object GenerationNotifier {
     ): ForegroundInfo {
         ensureChannels(context)
         return foregroundInfo(
-            NOTIFICATION_ID_PROGRESS,
+            progressNotificationId(projectId),
             progressBuilder(context, projectId, projectTitle, stageText, completed, total).build(),
         )
     }
@@ -160,7 +171,7 @@ internal object GenerationNotifier {
         if (!canPostNotifications(context)) return
         runCatching {
             NotificationManagerCompat.from(context).notify(
-                NOTIFICATION_ID_KEEPER,
+                keeperNotificationId(projectId),
                 keeperNotification(context, projectId, stageText, completed, total),
             )
         }
@@ -212,8 +223,11 @@ internal object GenerationNotifier {
     }
 
     /** 前台通知随任务结束一起消失，不要留一条「正在生成」在栏里 */
-    fun clearProgress(context: Context) {
-        runCatching { NotificationManagerCompat.from(context).cancel(NOTIFICATION_ID_PROGRESS) }
+    fun clearProgress(context: Context, projectId: String) {
+        runCatching {
+            NotificationManagerCompat.from(context)
+                .cancel(progressNotificationId(projectId))
+        }
     }
 
     /**
@@ -258,7 +272,7 @@ internal object GenerationNotifier {
     }
 
     private fun resultNotificationId(projectId: String): Int =
-        NOTIFICATION_ID_RESULT_BASE + (projectId.hashCode() and 0xFF)
+        RESULT_ID_BASE + (projectId.hashCode() and ID_SPAN)
 
     const val EXTRA_PROJECT_ID = "com.example.zhishu.PROJECT_ID"
 }

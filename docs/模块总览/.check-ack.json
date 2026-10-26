@@ -1,0 +1,11 @@
+{
+ "acks": {
+  "章节生成模块总览.md": {
+   "app/src/main/java/com/example/zhishu/worker/GenerationWorker.kt": {
+    "sha1": "75911d46497f4a6b04a446d576d6f8ce5ed50790",
+    "note": "GenerationWorker 仅适配 clearProgress 新签名（6处加projectId参数，通知层按项目撤条），正文/核验/发布职能零改动；调度职责已由新建的生成调度模块总览承接",
+    "acked_at": "2026-10-27 01:04:24"
+   }
+  }
+ }
+}

@@ -90,7 +90,7 @@ class GenerationWorker(
         } catch (e: CancellationException) {
             // 协程取消必须原样抛出：包装成业务失败会让 WorkManager 以为该重试，
             // 用户按了取消反而又开始扣费（B4）
-            GenerationNotifier.clearProgress(applicationContext)
+            GenerationNotifier.clearProgress(applicationContext, projectId)
             throw e
         } catch (t: Throwable) {
             // 接 Throwable 而不是 Exception：Error 冒出去时同样丢掉全部原因。
@@ -259,7 +259,7 @@ class GenerationWorker(
             outcome = GenerationOutcome.COMPLETED,
             detail = detail,
         )
-        GenerationNotifier.clearProgress(applicationContext)
+        GenerationNotifier.clearProgress(applicationContext, projectId)
         return Result.success(workDataOf(KEY_OUTCOME to GenerationOutcome.COMPLETED.name))
     }
 
@@ -297,7 +297,7 @@ class GenerationWorker(
             AdvanceDecision.StoppedBySwitch -> {
                 // 关开关不是一种「结果」，不发通知——用户没要求停，只是不要求继续。
                 // 进度条该收掉，不然界面永远挂着一条「正在推进下一步」。
-                GenerationNotifier.clearProgress(applicationContext)
+                GenerationNotifier.clearProgress(applicationContext, projectId)
             }
 
             AdvanceDecision.ContinueCurrentVolume -> GenerationEnqueuer.appendAutoChunk(
@@ -321,7 +321,7 @@ class GenerationWorker(
                     detail = "自动停在第 ${currentVolume + 1} 卷：剩下的章节因果契约还没生成，" +
                         "不能凭空写正文。到「讲述路线」逐章点「重试契约」后再点「继续」。",
                 )
-                GenerationNotifier.clearProgress(applicationContext)
+                GenerationNotifier.clearProgress(applicationContext, projectId)
             }
 
             AdvanceDecision.MainLineDone -> {
@@ -332,7 +332,7 @@ class GenerationWorker(
                     detail = "主线讲完了：知识主干上的知识点都已安排进章节并写完。" +
                         "想再读可在「讲述路线」点「扩展阅读」另起一卷。",
                 )
-                GenerationNotifier.clearProgress(applicationContext)
+                GenerationNotifier.clearProgress(applicationContext, projectId)
             }
         }
         return Result.success()
@@ -377,7 +377,7 @@ class GenerationWorker(
                 },
             )
         }
-        GenerationNotifier.clearProgress(applicationContext)
+        GenerationNotifier.clearProgress(applicationContext, projectId)
         return Result.failure(
             workDataOf(
                 KEY_ERROR to detail,

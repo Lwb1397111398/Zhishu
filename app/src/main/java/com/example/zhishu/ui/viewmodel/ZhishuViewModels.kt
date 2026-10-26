@@ -43,6 +43,9 @@ import com.example.zhishu.worker.GenerationWorker
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -226,38 +229,19 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
                 container.settingsRepository.missingModelRoles().isEmpty()
             }.getOrDefault(true)
             val all = container.projectRepository.observeAll().first()
-            val stats = mutableMapOf<String, BookStat>()
-            val nodeCounts = mutableMapOf<String, Int>()
-            val entries = mutableListOf<ContinueEntry>()
             val weekAgo = now() - 7 * 24 * 60 * 60 * 1000L
-            all.forEach { project ->
-                val plans = container.chapterRepository.getPlans(project.id).sortedBy { it.order }
-                val progress = container.progressRepository.get(project.id)
-                stats[project.id] = BookStat(
-                    totalChapters = plans.size,
-                    publishedChapters = plans.count { it.isReadable },
-                    lastReadAt = progress?.updatedAt ?: 0L,
-                    readingChapterId = progress?.chapterId?.takeIf { id ->
-                        // 与项目页章节卡 canRead 同口径：待复核但有正文的章也能读
-                        plans.any { it.id == id && it.openableInReader }
-                    },
-                    firstReadableChapterId = plans
-                        .firstOrNull { it.openableInReader }
-                        ?.id,
-                )
-                nodeCounts[project.id] = container.knowledgeRepository.getByProject(project.id).size
-                if (progress != null) {
-                    val chapter = plans.firstOrNull { it.id == progress.chapterId }
-                    if (chapter != null) {
-                        entries += ContinueEntry(
-                            project, progress, chapter.title, chapter.order, plans.size,
-                        )
-                    }
-                }
+            // 每本书的统计并行查（原来逐本串行三连查，书越多首页越慢）；
+            // 各书查询互不依赖，awaitAll 保序，结果按项目顺序归位
+            val perBook = coroutineScope {
+                all.map { project -> async { aggregateBook(project) } }.awaitAll()
             }
+            val stats = perBook.associate { it.id to it.stat }
+            val nodeCounts = perBook.associate { it.id to it.nodeCount }
             _bookStats.value = stats
             _knowledgeStats.value = nodeCounts
-            _continueEntry.value = entries.maxByOrNull { it.progress.updatedAt }
+            _continueEntry.value = perBook
+                .mapNotNull { it.entry }
+                .maxByOrNull { it.progress.updatedAt }
             _weekReadCount.value = stats.values.count { it.lastReadAt >= weekAgo }
             // 备份提醒（3.3）：写过东西、又超两周没导出，才温和提一次。
             // 从未备份（时间戳 0）且已有成稿的书同样算超期——内容越多越该备份
@@ -266,6 +250,33 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
             _backupOverdue.value = published > 0 &&
                 now() - lastBackupAt > BACKUP_REMINDER_INTERVAL_MILLIS
         }
+    }
+
+    /** 一本书的书架统计：章节数、阅读进度、知识点数，以及「继续阅读」入口（可能没有） */
+    private suspend fun aggregateBook(project: Project): BookAggregate {
+        val plans = container.chapterRepository.getPlans(project.id).sortedBy { it.order }
+        val progress = container.progressRepository.get(project.id)
+        val stat = BookStat(
+            totalChapters = plans.size,
+            publishedChapters = plans.count { it.isReadable },
+            lastReadAt = progress?.updatedAt ?: 0L,
+            readingChapterId = progress?.chapterId?.takeIf { id ->
+                // 与项目页章节卡 canRead 同口径：待复核但有正文的章也能读
+                plans.any { it.id == id && it.openableInReader }
+            },
+            firstReadableChapterId = plans
+                .firstOrNull { it.openableInReader }
+                ?.id,
+        )
+        val nodeCount = container.knowledgeRepository.getByProject(project.id).size
+        val entry = progress?.let { p ->
+            plans.firstOrNull { it.id == p.chapterId }?.let { chapter ->
+                ContinueEntry(
+                    project, p, chapter.title, chapter.order, plans.size,
+                )
+            }
+        }
+        return BookAggregate(project.id, stat, nodeCount, entry)
     }
 
     fun deleteProject(projectId: String) {
@@ -287,6 +298,14 @@ class HomeViewModel(app: Application) : ZhishuViewModel(app) {
         const val SUBSCRIBE_RETRIES = 3
         const val SUBSCRIBE_RETRY_DELAY_MS = 800L
     }
+
+    /** 一本书的聚合结果：BookStat 与知识点数按项目 ID 归位，「继续阅读」入口可能没有 */
+    private data class BookAggregate(
+        val id: String,
+        val stat: BookStat,
+        val nodeCount: Int,
+        val entry: ContinueEntry?,
+    )
 }
 
 data class PendingSource(

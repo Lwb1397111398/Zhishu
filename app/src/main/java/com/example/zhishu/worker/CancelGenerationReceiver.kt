@@ -15,7 +15,7 @@ class CancelGenerationReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val projectId = intent.getStringExtra(GenerationNotifier.EXTRA_PROJECT_ID) ?: return
         GenerationScheduler.cancel(context, projectId)
-        GenerationNotifier.clearProgress(context)
+        GenerationNotifier.clearProgress(context, projectId)
     }
 }
 
