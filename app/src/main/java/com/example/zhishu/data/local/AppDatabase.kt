@@ -784,11 +784,15 @@ abstract class AppDatabase : RoomDatabase() {
                     "CREATE INDEX IF NOT EXISTS `index_knowledge_map_batches_projectId` " +
                         "ON `knowledge_map_batches` (`projectId`)",
                 )
-                // 单链回填按 nodeKey 匹配，走索引而不是扫全表
-                db.execSQL(
-                    "CREATE INDEX IF NOT EXISTS `index_knowledge_nodes_projectId_nodeKey` " +
-                        "ON `knowledge_nodes` (`projectId`, `nodeKey`)",
-                )
+                // 注意：这里不能建 @Entity 未声明的索引（曾经想给 (projectId, nodeKey)
+                // 建复合索引，被移除）——Room 迁移后按 TableInfo 全等比对库结构与实体
+                // 声明，实体外的索引会让校验抛「Migration didn't properly handle」，
+                // 任何从 v12 之前升级的路径都打不开库。单项目节点量小（数十个），
+                // nodeKey 匹配走 projectId 单列索引后内存过滤即可。
+                // 存量提醒：2026-08~10 的版本建过这个索引，老设备升级上来的库可能
+                // 还带着它——下次升数据库版本时在迁移里 DROP 这两个实体外索引
+                // （knowledge_nodes 的 projectId_nodeKey、knowledge_gaps 的
+                // projectId_status，后者同理见 MIGRATION_16_17），把库拉回与实体一致。
             }
         }
 
@@ -895,10 +899,8 @@ abstract class AppDatabase : RoomDatabase() {
                 db.execSQL("ALTER TABLE knowledge_gaps ADD COLUMN status TEXT NOT NULL DEFAULT ''")
                 db.execSQL("ALTER TABLE knowledge_gaps ADD COLUMN anchorNodeId TEXT NOT NULL DEFAULT ''")
                 db.execSQL("ALTER TABLE knowledge_gaps ADD COLUMN suggestedTitle TEXT NOT NULL DEFAULT ''")
-                db.execSQL(
-                    "CREATE INDEX IF NOT EXISTS `index_knowledge_gaps_projectId_status` " +
-                        "ON `knowledge_gaps` (`projectId`, `status`)",
-                )
+                // 注意：不能建 @Entity 未声明的索引（曾经想给 (projectId, status)
+                // 建复合索引，被移除）——原因同 MIGRATION_12_13 的注释。
                 db.execSQL("ALTER TABLE knowledge_conflicts ADD COLUMN status TEXT NOT NULL DEFAULT ''")
             }
         }
