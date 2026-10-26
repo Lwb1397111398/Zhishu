@@ -83,6 +83,15 @@ android {
         // 本机物理内存紧张时，全量单测请用命令行限并行：
         // ./gradlew.bat testDebugUnitTest --max-workers=1
         unitTests.all { it.maxHeapSize = "1024m" }
+        // 失败用例把完整异常堆栈打到控制台：CI 上没有本地测试报告可翻，
+        // Gradle 默认单行摘要（如「IllegalStateException at MigrationTest.kt:52」）
+        // 查不了根因，FULL 格式让 gh log 直接可读
+        unitTests.all {
+            it.testLogging {
+                events("failed")
+                exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+            }
+        }
         // 批次 B（B.0-7）：真实模型运行器 SampleRunner 不混入常规测试统计。
         // 只排除 SampleRunner 类（离线分析测试 SampleSecondaryAnalysisTest 仍参与常规回归）；
         // 真实调用走专门 task :app:runQualitySamples。

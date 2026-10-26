@@ -34,6 +34,16 @@ jobs:
       - name: 单元测试
         run: ./gradlew testDebugUnitTest --no-daemon
 
+      # 失败时把 XML 测试结果（含完整堆栈）留档，方便从本机 gh artifact 下载取证
+      - name: 留档测试结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: app/build/test-results/testDebugUnitTest/
+          retention-days: 14
+          if-no-files-found: ignore
+
   release:
     needs: test
     runs-on: ubuntu-latest
